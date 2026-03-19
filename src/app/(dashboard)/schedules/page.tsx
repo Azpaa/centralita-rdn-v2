@@ -1,20 +1,33 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/api/client';
 import type { Schedule } from '@/lib/types/database';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
-  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
 } from '@/components/ui/table';
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
 } from '@/components/ui/dialog';
 import { Plus, Pencil, Trash2, PlusCircle, X } from 'lucide-react';
 import {
-  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
 } from '@/components/ui/select';
 import { toast } from 'sonner';
 
@@ -29,6 +42,18 @@ interface ScheduleWithSlots extends Schedule {
 }
 
 const DAYS = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+
+function normalizeTime(value: string) {
+  return value.slice(0, 5);
+}
+
+function normalizeSlots(slots: Slot[]) {
+  return slots.map((slot) => ({
+    ...slot,
+    start_time: normalizeTime(slot.start_time),
+    end_time: normalizeTime(slot.end_time),
+  }));
+}
 
 export default function SchedulesPage() {
   const [schedules, setSchedules] = useState<Schedule[]>([]);
@@ -48,7 +73,17 @@ export default function SchedulesPage() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    let active = true;
+    api.get<Schedule[]>('/schedules?limit=100').then((res) => {
+      if (!active) return;
+      if (res.ok) setSchedules(res.data);
+      setLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   function openCreate() {
     setEditing(null);
@@ -64,54 +99,70 @@ export default function SchedulesPage() {
     setDialogOpen(true);
   }
 
-  async function openEdit(s: Schedule) {
-    const res = await api.get<ScheduleWithSlots>(`/schedules/${s.id}`);
+  async function openEdit(schedule: Schedule) {
+    const res = await api.get<ScheduleWithSlots>(`/schedules/${schedule.id}`);
     if (res.ok) {
       setEditing(res.data);
       setFormName(res.data.name);
       setFormTimezone(res.data.timezone);
-      setFormSlots(res.data.slots || []);
+      setFormSlots(normalizeSlots(res.data.slots || []));
     }
     setDialogOpen(true);
   }
 
   function addSlot() {
-    setFormSlots([...formSlots, { day_of_week: 1, start_time: '09:00', end_time: '18:00' }]);
+    setFormSlots((prev) => [...prev, { day_of_week: 1, start_time: '09:00', end_time: '18:00' }]);
   }
 
-  function removeSlot(idx: number) {
-    setFormSlots(formSlots.filter((_, i) => i !== idx));
+  function removeSlot(index: number) {
+    setFormSlots((prev) => prev.filter((_, i) => i !== index));
   }
 
-  function updateSlot(idx: number, field: keyof Slot, value: string | number) {
-    setFormSlots(formSlots.map((s, i) => (i === idx ? { ...s, [field]: value } : s)));
+  function updateSlot(index: number, field: keyof Slot, value: string | number) {
+    setFormSlots((prev) => prev.map((slot, i) => (i === index ? { ...slot, [field]: value } : slot)));
   }
 
   async function handleSave() {
     setSaving(true);
+
     const body = {
       name: formName,
       timezone: formTimezone,
-      slots: formSlots,
+      slots: normalizeSlots(formSlots),
     };
 
     if (editing) {
       const res = await api.put(`/schedules/${editing.id}`, body);
-      if (res.ok) { toast.success('Horario actualizado'); setDialogOpen(false); load(); }
-      else toast.error(res.error || 'Error al actualizar');
+      if (res.ok) {
+        toast.success('Horario actualizado');
+        setDialogOpen(false);
+        await load();
+      } else {
+        toast.error(res.error || 'Error al actualizar');
+      }
     } else {
       const res = await api.post('/schedules', body);
-      if (res.ok) { toast.success('Horario creado'); setDialogOpen(false); load(); }
-      else toast.error(res.error || 'Error al crear');
+      if (res.ok) {
+        toast.success('Horario creado');
+        setDialogOpen(false);
+        await load();
+      } else {
+        toast.error(res.error || 'Error al crear');
+      }
     }
+
     setSaving(false);
   }
 
-  async function handleDelete(s: Schedule) {
-    if (!confirm(`¿Eliminar horario "${s.name}"?`)) return;
-    const res = await api.delete(`/schedules/${s.id}`);
-    if (res.ok) { toast.success('Horario eliminado'); load(); }
-    else toast.error(res.error || 'Error al eliminar');
+  async function handleDelete(schedule: Schedule) {
+    if (!confirm(`¿Eliminar horario "${schedule.name}"?`)) return;
+    const res = await api.delete(`/schedules/${schedule.id}`);
+    if (res.ok) {
+      toast.success('Horario eliminado');
+      await load();
+    } else {
+      toast.error(res.error || 'Error al eliminar');
+    }
   }
 
   return (
@@ -139,24 +190,28 @@ export default function SchedulesPage() {
           <TableBody>
             {loading ? (
               <TableRow>
-                <TableCell colSpan={4} className="text-center py-8 text-muted-foreground">Cargando...</TableCell>
+                <TableCell colSpan={4} className="py-8 text-center text-muted-foreground">
+                  Cargando...
+                </TableCell>
               </TableRow>
             ) : schedules.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={4} className="text-center py-8 text-muted-foreground">No hay horarios</TableCell>
+                <TableCell colSpan={4} className="py-8 text-center text-muted-foreground">
+                  No hay horarios
+                </TableCell>
               </TableRow>
             ) : (
-              schedules.map((s) => (
-                <TableRow key={s.id}>
-                  <TableCell className="font-medium">{s.name}</TableCell>
-                  <TableCell>{s.timezone}</TableCell>
-                  <TableCell>{new Date(s.created_at).toLocaleDateString('es-ES')}</TableCell>
+              schedules.map((schedule) => (
+                <TableRow key={schedule.id}>
+                  <TableCell className="font-medium">{schedule.name}</TableCell>
+                  <TableCell>{schedule.timezone}</TableCell>
+                  <TableCell>{new Date(schedule.created_at).toLocaleDateString('es-ES')}</TableCell>
                   <TableCell>
                     <div className="flex gap-1">
-                      <Button variant="ghost" size="icon" onClick={() => openEdit(s)}>
+                      <Button variant="ghost" size="icon" onClick={() => openEdit(schedule)}>
                         <Pencil className="h-4 w-4" />
                       </Button>
-                      <Button variant="ghost" size="icon" onClick={() => handleDelete(s)}>
+                      <Button variant="ghost" size="icon" onClick={() => handleDelete(schedule)}>
                         <Trash2 className="h-4 w-4 text-destructive" />
                       </Button>
                     </div>
@@ -169,12 +224,13 @@ export default function SchedulesPage() {
       </div>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="max-w-xl max-h-[80vh] overflow-y-auto">
+        <DialogContent className="w-[95vw] max-w-4xl max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{editing ? 'Editar horario' : 'Nuevo horario'}</DialogTitle>
           </DialogHeader>
+
           <div className="space-y-4 py-2">
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label>Nombre</Label>
                 <Input value={formName} onChange={(e) => setFormName(e.target.value)} />
@@ -192,42 +248,59 @@ export default function SchedulesPage() {
                   <PlusCircle className="mr-1 h-3 w-3" /> Añadir
                 </Button>
               </div>
+
               {formSlots.map((slot, idx) => (
-                <div key={idx} className="flex items-center gap-2 rounded-md border p-2">
+                <div key={idx} className="grid gap-2 rounded-md border p-2 sm:grid-cols-12 sm:items-center">
                   <Select
                     value={String(slot.day_of_week)}
-                    onValueChange={(v) => updateSlot(idx, 'day_of_week', Number(v))}
+                    onValueChange={(value) => updateSlot(idx, 'day_of_week', Number(value))}
                   >
-                    <SelectTrigger className="w-32"><SelectValue /></SelectTrigger>
+                    <SelectTrigger className="w-full sm:col-span-4">
+                      <SelectValue />
+                    </SelectTrigger>
                     <SelectContent>
-                      {DAYS.map((d, i) => (
-                        <SelectItem key={i} value={String(i)}>{d}</SelectItem>
+                      {DAYS.map((day, i) => (
+                        <SelectItem key={i} value={String(i)}>
+                          {day}
+                        </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
+
                   <Input
                     type="time"
-                    className="w-28"
+                    className="w-full sm:col-span-3"
                     value={slot.start_time}
                     onChange={(e) => updateSlot(idx, 'start_time', e.target.value)}
                   />
-                  <span className="text-muted-foreground">a</span>
+
+                  <span className="hidden text-center text-muted-foreground sm:col-span-1 sm:block">a</span>
+
                   <Input
                     type="time"
-                    className="w-28"
+                    className="w-full sm:col-span-3"
                     value={slot.end_time}
                     onChange={(e) => updateSlot(idx, 'end_time', e.target.value)}
                   />
-                  <Button variant="ghost" size="icon" onClick={() => removeSlot(idx)}>
+
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="justify-self-end sm:col-span-1"
+                    onClick={() => removeSlot(idx)}
+                  >
                     <X className="h-4 w-4" />
                   </Button>
                 </div>
               ))}
             </div>
           </div>
+
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancelar</Button>
-            <Button onClick={handleSave} disabled={saving || !formName}>
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>
+              Cancelar
+            </Button>
+            <Button onClick={handleSave} disabled={saving || !formName.trim()}>
               {saving ? 'Guardando...' : 'Guardar'}
             </Button>
           </DialogFooter>

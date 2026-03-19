@@ -18,6 +18,7 @@ import {
 } from '@/components/ui/dialog';
 import { Search, ChevronLeft, ChevronRight, PhoneOutgoing } from 'lucide-react';
 import { toast } from 'sonner';
+import { useCall } from '@/contexts/call-context';
 
 const STATUS_COLORS: Record<string, 'default' | 'secondary' | 'outline' | 'destructive'> = {
   completed: 'default',
@@ -64,8 +65,10 @@ export default function CallsPage() {
   const [dialOpen, setDialOpen] = useState(false);
   const [dialNumber, setDialNumber] = useState('');
   const [dialFromNumber, setDialFromNumber] = useState('');
-  const [dialing, setDialing] = useState(false);
   const [activeNumbers, setActiveNumbers] = useState<PhoneNumber[]>([]);
+
+  // Call context — routes calls through Voice SDK (WebRTC) for browser audio
+  const { dial } = useCall();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -117,21 +120,13 @@ export default function CallsPage() {
       formattedNumber = `+34${formattedNumber}`;
     }
 
-    setDialing(true);
-    const res = await api.post('/calls/dial', {
-      destination_number: formattedNumber,
-      from_number: dialFromNumber,
-    });
-    if (res.ok) {
-      toast.success('Llamada iniciada al ' + formattedNumber);
-      setDialOpen(false);
-      setDialNumber('');
-      // Refrescar la lista después de un breve delay para que el registro aparezca
-      setTimeout(() => load(), 2000);
-    } else {
-      toast.error(res.error || 'Error al iniciar llamada');
-    }
-    setDialing(false);
+    // Route through Voice SDK (WebRTC) via CallWidget for real browser audio
+    dial(formattedNumber, dialFromNumber);
+    toast.success('Llamada iniciada al ' + formattedNumber);
+    setDialOpen(false);
+    setDialNumber('');
+    // Refrescar la lista después de un breve delay para que el registro aparezca
+    setTimeout(() => load(), 3000);
   }
 
   function formatDuration(seconds: number | null): string {
@@ -374,8 +369,8 @@ export default function CallsPage() {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setDialOpen(false)}>Cancelar</Button>
-            <Button onClick={handleDial} disabled={dialing || !dialNumber || !dialFromNumber}>
-              {dialing ? 'Llamando...' : 'Llamar'}
+            <Button onClick={handleDial} disabled={!dialNumber || !dialFromNumber}>
+              Llamar
             </Button>
           </DialogFooter>
         </DialogContent>

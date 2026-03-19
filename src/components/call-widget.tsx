@@ -28,6 +28,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useCall } from '@/contexts/call-context';
 import type { PhoneNumber } from '@/lib/types/database';
 
 type WidgetState =
@@ -58,6 +59,9 @@ export function CallWidget() {
 
   // Identity
   const [identity, setIdentity] = useState('');
+
+  // Call context — allows other pages (e.g. Calls page) to trigger calls via Voice SDK
+  const { registerDialHandler } = useCall();
 
   // Initialize Twilio Device
   const initDevice = useCallback(async () => {
@@ -243,6 +247,49 @@ export function CallWidget() {
       setState('idle');
     }
   }, [dialNumber, fromNumber, identity, setupCallHandlers]);
+
+  // External dial — triggered by other components via CallContext
+  // This bypasses the internal dialpad state and dials directly via Voice SDK
+  const externalDial = useCallback(async (number: string, from?: string) => {
+    if (!deviceRef.current) {
+      setError('Dispositivo de voz no conectado. Espera a que aparezca "Conectado".');
+      return;
+    }
+
+    let formattedNumber = number.trim();
+    if (!formattedNumber.startsWith('+')) {
+      formattedNumber = `+34${formattedNumber}`;
+    }
+
+    const callerIdToUse = from || fromNumber;
+
+    setState('connecting');
+    setCallerInfo(formattedNumber);
+    setCallDirection('outbound');
+    setShowDialpad(false);
+
+    try {
+      const call = await deviceRef.current.connect({
+        params: {
+          To: formattedNumber,
+          CallerId: callerIdToUse,
+          UserId: identity,
+        },
+      });
+
+      activeCallRef.current = call;
+      setupCallHandlers(call);
+    } catch (err) {
+      console.error('[CallWidget] External dial error:', err);
+      setError('Error al iniciar llamada');
+      setState('idle');
+    }
+  }, [fromNumber, identity, setupCallHandlers]);
+
+  // Register the external dial handler with the CallContext
+  useEffect(() => {
+    registerDialHandler(externalDial);
+  }, [registerDialHandler, externalDial]);
 
   // Load active numbers for outbound
   useEffect(() => {

@@ -54,8 +54,14 @@ export const assignQueueUserSchema = z.object({
 
 export const scheduleSlotSchema = z.object({
   day_of_week: z.number().int().min(0).max(6),
-  start_time: z.string().regex(/^\d{2}:\d{2}$/, 'Formato HH:mm'),
-  end_time: z.string().regex(/^\d{2}:\d{2}$/, 'Formato HH:mm'),
+  start_time: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/, 'Formato HH:mm')
+    .transform((value) => value.slice(0, 5)),
+  end_time: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/, 'Formato HH:mm')
+    .transform((value) => value.slice(0, 5)),
 });
 
 export const createScheduleSchema = z.object({
