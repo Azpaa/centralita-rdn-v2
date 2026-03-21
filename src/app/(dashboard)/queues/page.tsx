@@ -72,7 +72,35 @@ export default function QueuesPage() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    let active = true;
+
+    (async () => {
+      const res = await api.get<Queue[]>('/queues?limit=100');
+      if (!active) return;
+
+      if (res.ok) {
+        setQueues(res.data);
+
+        const counts: Record<string, number> = {};
+        await Promise.all(
+          res.data.map(async (q) => {
+            const detail = await api.get<QueueDetail>(`/queues/${q.id}`);
+            if (detail.ok) counts[q.id] = detail.data.users?.length || 0;
+          })
+        );
+
+        if (!active) return;
+        setMemberCounts(counts);
+      }
+
+      setLoading(false);
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Cargar todos los usuarios activos
   useEffect(() => {
@@ -332,7 +360,7 @@ export default function QueuesPage() {
 
       {/* Dialog gestion de miembros */}
       <Dialog open={membersOpen} onOpenChange={setMembersOpen}>
-        <DialogContent className="max-w-lg">
+        <DialogContent className="!w-[96vw] !max-w-[96vw] sm:!max-w-4xl max-h-[88vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>
               Miembros de &quot;{membersQueue?.name}&quot;
@@ -355,7 +383,7 @@ export default function QueuesPage() {
                     {membersQueue.users.map((qu) => (
                       <div
                         key={qu.id}
-                        className="flex items-center justify-between gap-3 rounded-md border px-3 py-2"
+                        className="grid gap-2 rounded-md border px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
                       >
                         <div className="flex items-center gap-3 min-w-0">
                           <div className="min-w-0">
@@ -368,7 +396,7 @@ export default function QueuesPage() {
                             </p>
                           </div>
                         </div>
-                        <div className="flex items-center gap-2 shrink-0">
+                        <div className="flex flex-wrap items-center gap-2 shrink-0 sm:justify-end">
                           <Badge variant="outline" className="text-xs">
                             Prioridad {qu.priority}
                           </Badge>
@@ -396,7 +424,7 @@ export default function QueuesPage() {
               {/* Formulario para añadir miembro */}
               <div className="border-t pt-4">
                 <Label className="text-sm font-medium">Añadir operador</Label>
-                <div className="mt-2 flex gap-2">
+                <div className="mt-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_6.5rem_auto]">
                   <div className="flex-1">
                     <Select value={addingUserId || '_placeholder'} onValueChange={(v) => setAddingUserId(v === '_placeholder' ? '' : (v ?? ''))}>
                       <SelectTrigger>
@@ -418,7 +446,7 @@ export default function QueuesPage() {
                       </SelectContent>
                     </Select>
                   </div>
-                  <div className="w-24">
+                  <div className="sm:w-[6.5rem]">
                     <Input
                       type="number"
                       min={0}
@@ -430,6 +458,7 @@ export default function QueuesPage() {
                   </div>
                   <Button
                     size="icon"
+                    className="justify-self-start"
                     onClick={handleAddMember}
                     disabled={addingMember || !addingUserId}
                     title="Añadir"

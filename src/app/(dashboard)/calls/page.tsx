@@ -31,16 +31,28 @@ const STATUS_COLORS: Record<string, 'default' | 'secondary' | 'outline' | 'destr
   canceled: 'outline',
 };
 
-const STATUS_LABELS: Record<string, string> = {
+// Labels base (para estados que no dependen de la dirección)
+const STATUS_LABELS_BASE: Record<string, string> = {
   ringing: 'Sonando',
   in_queue: 'En cola',
   in_progress: 'En curso',
   completed: 'Completada',
-  no_answer: 'Sin respuesta',
   busy: 'Ocupado',
   failed: 'Fallida',
   canceled: 'Cancelada',
 };
+
+/**
+ * Label contextual según dirección:
+ * - no_answer + outbound → "Rechazada" (no nos respondieron)
+ * - no_answer + inbound  → "No atendida" (no cogimos nosotros)
+ */
+function getStatusLabel(status: string, direction?: string): string {
+  if (status === 'no_answer') {
+    return direction === 'outbound' ? 'Rechazada' : 'No atendida';
+  }
+  return STATUS_LABELS_BASE[status] || status;
+}
 
 interface CallDetail extends CallRecord {
   recordings?: Array<{ id: string; url: string; duration: number | null; status: string }>;
@@ -166,7 +178,7 @@ export default function CallsPage() {
             <SelectContent>
               <SelectItem value="all">Todos</SelectItem>
               <SelectItem value="completed">Completada</SelectItem>
-              <SelectItem value="no_answer">Sin respuesta</SelectItem>
+              <SelectItem value="no_answer">Rechazada / No atendida</SelectItem>
               <SelectItem value="failed">Fallida</SelectItem>
               <SelectItem value="in_progress">En curso</SelectItem>
             </SelectContent>
@@ -220,7 +232,7 @@ export default function CallsPage() {
                   <TableCell className="font-mono text-sm">{call.to_number}</TableCell>
                   <TableCell>
                     <Badge variant={STATUS_COLORS[call.status] || 'outline'}>
-                      {STATUS_LABELS[call.status] || call.status}
+                      {getStatusLabel(call.status, call.direction)}
                     </Badge>
                   </TableCell>
                   <TableCell>{formatDuration(call.duration)}</TableCell>
@@ -269,7 +281,7 @@ export default function CallsPage() {
                 </div>
                 <div>
                   <Label className="text-muted-foreground">Estado</Label>
-                  <p><Badge variant={STATUS_COLORS[detail.status]}>{STATUS_LABELS[detail.status]}</Badge></p>
+                  <p><Badge variant={STATUS_COLORS[detail.status]}>{getStatusLabel(detail.status, detail.direction)}</Badge></p>
                 </div>
                 <div>
                   <Label className="text-muted-foreground">Desde</Label>

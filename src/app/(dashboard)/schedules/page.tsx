@@ -224,7 +224,7 @@ export default function SchedulesPage() {
       </div>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="w-[95vw] max-w-4xl max-h-[85vh] overflow-y-auto">
+        <DialogContent className="!w-[96vw] !max-w-[96vw] sm:!max-w-5xl max-h-[88vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{editing ? 'Editar horario' : 'Nuevo horario'}</DialogTitle>
           </DialogHeader>

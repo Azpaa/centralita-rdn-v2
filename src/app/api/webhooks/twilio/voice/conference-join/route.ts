@@ -1,0 +1,37 @@
+import { NextRequest, NextResponse } from 'next/server';
+import twilio from 'twilio';
+
+/**
+ * POST /api/webhooks/twilio/voice/conference-join
+ * TwiML que mete a un participante en una conferencia.
+ *
+ * Query params:
+ * - room: nombre de la conferencia
+ * - role: "moderator" o "participant"
+ */
+export async function POST(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const room = searchParams.get('room') || 'default-room';
+  const role = searchParams.get('role') || 'participant';
+
+  console.log(`[CONFERENCE-JOIN] Room=${room} Role=${role}`);
+
+  const twiml = new twilio.twiml.VoiceResponse();
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+
+  const dial = twiml.dial();
+  dial.conference(
+    {
+      startConferenceOnEnter: true,
+      endConferenceOnExit: role === 'moderator', // Si el moderador sale, termina la conferencia
+      waitUrl: 'http://com.twilio.music.classical.s3.amazonaws.com/ith_chopin-702702.mp3',
+      statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+      statusCallbackEvent: ['start', 'end', 'join', 'leave'],
+    },
+    room
+  );
+
+  return new NextResponse(twiml.toString(), {
+    headers: { 'Content-Type': 'text/xml' },
+  });
+}
