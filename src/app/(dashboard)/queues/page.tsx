@@ -16,7 +16,7 @@ import {
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
-import { Plus, Pencil, Trash2, Users, UserPlus, X } from 'lucide-react';
+import { Plus, Pencil, Trash2, Users, UserPlus, X, AlertCircle } from 'lucide-react';
 import { toast } from 'sonner';
 
 // Tipos para la respuesta del detalle de cola
@@ -31,6 +31,7 @@ type QueueDetail = Queue & {
 export default function QueuesPage() {
   const [queues, setQueues] = useState<Queue[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [memberCounts, setMemberCounts] = useState<Record<string, number>>({});
 
   // Dialog crear/editar cola
@@ -54,6 +55,7 @@ export default function QueuesPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setError(null);
     const res = await api.get<Queue[]>('/queues?limit=100');
     if (res.ok) {
       setQueues(res.data);
@@ -68,39 +70,13 @@ export default function QueuesPage() {
         })
       );
       setMemberCounts(counts);
+    } else {
+      setError(res.error || 'Error al cargar colas');
     }
     setLoading(false);
   }, []);
 
-  useEffect(() => {
-    let active = true;
-
-    (async () => {
-      const res = await api.get<Queue[]>('/queues?limit=100');
-      if (!active) return;
-
-      if (res.ok) {
-        setQueues(res.data);
-
-        const counts: Record<string, number> = {};
-        await Promise.all(
-          res.data.map(async (q) => {
-            const detail = await api.get<QueueDetail>(`/queues/${q.id}`);
-            if (detail.ok) counts[q.id] = detail.data.users?.length || 0;
-          })
-        );
-
-        if (!active) return;
-        setMemberCounts(counts);
-      }
-
-      setLoading(false);
-    })();
-
-    return () => {
-      active = false;
-    };
-  }, []);
+  useEffect(() => { load(); }, [load]);
 
   // Cargar todos los usuarios activos
   useEffect(() => {
@@ -244,6 +220,13 @@ export default function QueuesPage() {
           <Plus className="mr-2 h-4 w-4" /> Nueva cola
         </Button>
       </div>
+
+      {error && (
+        <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/5 p-3 text-destructive text-sm">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          {error}
+        </div>
+      )}
 
       <div className="rounded-md border bg-card">
         <Table>

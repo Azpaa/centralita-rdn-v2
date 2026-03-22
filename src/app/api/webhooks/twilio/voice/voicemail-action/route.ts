@@ -1,6 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
-import { parseTwilioBody } from '@/lib/api/twilio-auth';
+import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 
 /**
  * POST /api/webhooks/twilio/voice/voicemail-action
@@ -8,8 +8,10 @@ import { parseTwilioBody } from '@/lib/api/twilio-auth';
  * La grabación se procesa por el webhook de recording/status.
  */
 export async function POST(req: NextRequest) {
-  const body = await req.text();
-  const params = parseTwilioBody(body);
+  // Validar firma + parsear body
+  const webhook = await validateAndParseTwilioWebhook(req);
+  if (!webhook.ok) return webhook.response;
+  const params = webhook.params;
 
   console.log(`[VOICEMAIL] CallSid=${params.CallSid} RecordingSid=${params.RecordingSid}`);
 
@@ -20,7 +22,5 @@ export async function POST(req: NextRequest) {
   );
   twiml.hangup();
 
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
+  return twimlResponse(twiml);
 }

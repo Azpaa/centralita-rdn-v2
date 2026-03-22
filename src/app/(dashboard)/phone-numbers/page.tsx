@@ -17,7 +17,7 @@ import {
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
-import { Pencil, RefreshCw } from 'lucide-react';
+import { Pencil, RefreshCw, AlertCircle } from 'lucide-react';
 import { toast } from 'sonner';
 
 export default function PhoneNumbersPage() {
@@ -25,6 +25,7 @@ export default function PhoneNumbersPage() {
   const [queues, setQueues] = useState<Queue[]>([]);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<PhoneNumber | null>(null);
@@ -41,6 +42,7 @@ export default function PhoneNumbersPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setError(null);
     const [numRes, qRes, sRes] = await Promise.all([
       api.get<PhoneNumber[]>('/phone-numbers?limit=100'),
       api.get<Queue[]>('/queues?limit=100'),
@@ -49,6 +51,8 @@ export default function PhoneNumbersPage() {
     if (numRes.ok) setNumbers(numRes.data);
     if (qRes.ok) setQueues(qRes.data);
     if (sRes.ok) setSchedules(sRes.data);
+    const errors = [numRes, qRes, sRes].filter((r) => !r.ok);
+    if (errors.length) setError('Error al cargar datos');
     setLoading(false);
   }, []);
 
@@ -109,6 +113,13 @@ export default function PhoneNumbersPage() {
           {syncing ? 'Sincronizando...' : 'Sincronizar Twilio'}
         </Button>
       </div>
+
+      {error && (
+        <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/5 p-3 text-destructive text-sm">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          {error}
+        </div>
+      )}
 
       <div className="rounded-md border bg-card">
         <Table>

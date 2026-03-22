@@ -1,15 +1,17 @@
-import { NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
+import { validateTwilioWebhookLight, twimlResponse } from '@/lib/api/twilio-auth';
 
 /**
  * POST /api/webhooks/twilio/voice/hold-music
  * TwiML que reproduce música de espera en bucle.
  * Se usa cuando se pone una llamada en hold.
- *
- * Query params:
- * - unhold: si es "true", devuelve TwiML vacío para que la llamada siga
  */
 export async function POST(req: NextRequest) {
+  // Validar firma de Twilio
+  const validation = await validateTwilioWebhookLight(req);
+  if (validation !== true) return validation;
+
   const { searchParams } = new URL(req.url);
   const unhold = searchParams.get('unhold') === 'true';
 
@@ -35,7 +37,5 @@ export async function POST(req: NextRequest) {
     }, 'http://com.twilio.music.classical.s3.amazonaws.com/ith_chopin-702702.mp3');
   }
 
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
+  return twimlResponse(twiml);
 }

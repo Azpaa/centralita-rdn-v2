@@ -21,7 +21,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Plus, Pencil, Trash2, PlusCircle, X } from 'lucide-react';
+import { Plus, Pencil, Trash2, PlusCircle, X, AlertCircle } from 'lucide-react';
 import {
   Select,
   SelectContent,
@@ -58,6 +58,7 @@ function normalizeSlots(slots: Slot[]) {
 export default function SchedulesPage() {
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<ScheduleWithSlots | null>(null);
 
@@ -68,22 +69,14 @@ export default function SchedulesPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setError(null);
     const res = await api.get<Schedule[]>('/schedules?limit=100');
     if (res.ok) setSchedules(res.data);
+    else setError(res.error || 'Error al cargar horarios');
     setLoading(false);
   }, []);
 
-  useEffect(() => {
-    let active = true;
-    api.get<Schedule[]>('/schedules?limit=100').then((res) => {
-      if (!active) return;
-      if (res.ok) setSchedules(res.data);
-      setLoading(false);
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
+  useEffect(() => { load(); }, [load]);
 
   function openCreate() {
     setEditing(null);
@@ -176,6 +169,13 @@ export default function SchedulesPage() {
           <Plus className="mr-2 h-4 w-4" /> Nuevo horario
         </Button>
       </div>
+
+      {error && (
+        <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/5 p-3 text-destructive text-sm">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          {error}
+        </div>
+      )}
 
       <div className="rounded-md border bg-card">
         <Table>

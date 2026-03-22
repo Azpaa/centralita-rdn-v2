@@ -1,30 +1,20 @@
-import { NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
-import { parseTwilioBody } from '@/lib/api/twilio-auth';
+import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { CallRecord, Queue } from '@/lib/types/database';
 
 /**
  * POST /api/webhooks/twilio/voice/dial-action
  * Twilio llama aquí cuando un <Dial> termina (el operador cuelga o no contesta).
- * FUENTE AUTORITATIVA del resultado real de la llamada:
- *   - DialCallStatus = completed → hubo conversación real
- *   - DialCallStatus = no-answer → no contestaron
- *   - DialCallStatus = busy → línea ocupada
- *
- * Para llamadas entrantes con cola:
- *   Si nadie contesta pero aún hay tiempo de espera → redirigir a queue-retry
- *   para reintentar con los operadores (bucle de cola).
- *
- * Parámetros de Twilio:
- * - DialCallStatus: completed | busy | no-answer | failed | canceled
- * - DialCallSid, DialCallDuration
- * - CallSid (del caller original)
+ * FUENTE AUTORITATIVA del resultado real de la llamada.
  */
 export async function POST(req: NextRequest) {
-  const body = await req.text();
-  const params = parseTwilioBody(body);
+  // Validar firma + parsear body
+  const webhook = await validateAndParseTwilioWebhook(req);
+  if (!webhook.ok) return webhook.response;
+  const params = webhook.params;
 
   const callSid = params.CallSid || '';
   const dialStatus = params.DialCallStatus || '';
@@ -144,10 +134,4 @@ export async function POST(req: NextRequest) {
 
   twiml.hangup();
   return twimlResponse(twiml);
-}
-
-function twimlResponse(twiml: twilio.twiml.VoiceResponse): NextResponse {
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
 }

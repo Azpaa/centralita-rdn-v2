@@ -1,7 +1,7 @@
-import { NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
-import { parseTwilioBody } from '@/lib/api/twilio-auth';
+import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 
 /**
  * POST /api/webhooks/twilio/voice/whisper
@@ -13,8 +13,10 @@ import { parseTwilioBody } from '@/lib/api/twilio-auth';
  * Query params: operator_id, call_sid
  */
 export async function POST(req: NextRequest) {
-  const body = await req.text();
-  const params = parseTwilioBody(body);
+  // Validar firma + parsear body
+  const webhook = await validateAndParseTwilioWebhook(req);
+  if (!webhook.ok) return webhook.response;
+  const params = webhook.params;
   const { searchParams } = new URL(req.url);
 
   const operatorId = searchParams.get('operator_id') || '';
@@ -43,7 +45,5 @@ export async function POST(req: NextRequest) {
     `Llamada entrante.`
   );
 
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
+  return twimlResponse(twiml);
 }

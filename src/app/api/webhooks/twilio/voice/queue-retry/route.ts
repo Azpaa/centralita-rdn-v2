@@ -1,7 +1,7 @@
-import { NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
 import { getQueueWithOperators } from '@/lib/twilio/call-engine';
-import { parseTwilioBody } from '@/lib/api/twilio-auth';
+import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { CallRecord, PhoneNumber, Queue } from '@/lib/types/database';
 
@@ -9,21 +9,12 @@ import type { CallRecord, PhoneNumber, Queue } from '@/lib/types/database';
  * POST /api/webhooks/twilio/voice/queue-retry
  * Endpoint de reintento de cola. Se llama cuando dial-action detecta que
  * nadie contestó pero aún hay tiempo de espera en la cola.
- *
- * Flujo:
- * 1. Buscar call_record → obtener queue_id, from_number, phone_number_id
- * 2. Obtener cola y operadores disponibles
- * 3. Reproducir mensaje de espera + pausa breve
- * 4. Re-marcar a operadores con action=dial-action (bucle)
- *
- * El bucle se rompe cuando:
- * - Un operador contesta → dial-action pone completed
- * - Se agota max_wait_time → dial-action da mensaje de despedida y cuelga
- * - El llamante cuelga → Twilio termina la llamada automáticamente
  */
 export async function POST(req: NextRequest) {
-  const body = await req.text();
-  const params = parseTwilioBody(body);
+  // Validar firma + parsear body
+  const webhook = await validateAndParseTwilioWebhook(req);
+  if (!webhook.ok) return webhook.response;
+  const params = webhook.params;
 
   const callSid = params.CallSid || '';
 
@@ -194,10 +185,4 @@ export async function POST(req: NextRequest) {
     twiml.hangup();
     return twimlResponse(twiml);
   }
-}
-
-function twimlResponse(twiml: twilio.twiml.VoiceResponse): NextResponse {
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
 }

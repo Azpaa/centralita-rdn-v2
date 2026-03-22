@@ -1,6 +1,7 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
-import { parseTwilioBody } from '@/lib/api/twilio-auth';
+import { validateAndParseTwilioWebhook } from '@/lib/api/twilio-auth';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { CallRecord, CallStatus } from '@/lib/types/database';
 
@@ -15,14 +16,12 @@ const TERMINAL_STATUSES: CallStatus[] = ['completed', 'no_answer', 'busy', 'fail
  * El dial-action webhook determina el resultado real (completada vs no contestada).
  * Este webhook solo actualiza estados intermedios (ringing, in_progress) y
  * pone ended_at como respaldo si dial-action no se ejecutó.
- *
- * Parámetros que envía Twilio:
- * - CallSid, CallStatus, CallDuration, Timestamp
- * - From, To, Direction
  */
 export async function POST(req: NextRequest) {
-  const body = await req.text();
-  const params = parseTwilioBody(body);
+  // Validar firma + parsear body
+  const webhook = await validateAndParseTwilioWebhook(req);
+  if (!webhook.ok) return webhook.response;
+  const params = webhook.params;
 
   const callSid = params.CallSid || params.ParentCallSid || '';
   const callStatus = params.CallStatus || '';

@@ -1,6 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
-import { parseTwilioBody } from '@/lib/api/twilio-auth';
+import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { createCallRecord } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { User, PhoneNumber } from '@/lib/types/database';
@@ -9,15 +9,12 @@ import type { User, PhoneNumber } from '@/lib/types/database';
  * POST /api/webhooks/twilio/voice/client
  * Webhook para la TwiML App de Twilio.
  * Se ejecuta cuando un cliente del navegador (Twilio Device) inicia una llamada saliente.
- *
- * Params enviados desde el SDK del navegador:
- * - To: número destino
- * - From: número Twilio origen (callerId)
- * - UserId: ID del usuario que llama
  */
 export async function POST(req: NextRequest) {
-  const body = await req.text();
-  const params = parseTwilioBody(body);
+  // Validar firma + parsear body
+  const webhook = await validateAndParseTwilioWebhook(req);
+  if (!webhook.ok) return webhook.response;
+  const params = webhook.params;
 
   const to = params.To || '';
   // Leer CallerId (param personalizado) — NO usar From que Twilio sobreescribe con "client:<identity>"
@@ -121,7 +118,5 @@ export async function POST(req: NextRequest) {
     twiml.hangup();
   }
 
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
+  return twimlResponse(twiml);
 }

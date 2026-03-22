@@ -1,5 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
+import { validateTwilioWebhookLight, twimlResponse } from '@/lib/api/twilio-auth';
 
 /**
  * POST /api/webhooks/twilio/voice/fallback
@@ -7,6 +8,10 @@ import twilio from 'twilio';
  * Respuesta de emergencia.
  */
 export async function POST(req: NextRequest) {
+  // Validar firma de Twilio
+  const validation = await validateTwilioWebhookLight(req);
+  if (validation !== true) return validation;
+
   const twiml = new twilio.twiml.VoiceResponse();
   twiml.say(
     { language: 'es-ES', voice: 'Polly.Conchita' },
@@ -14,7 +19,5 @@ export async function POST(req: NextRequest) {
   );
   twiml.hangup();
 
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
+  return twimlResponse(twiml);
 }

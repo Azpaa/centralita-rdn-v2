@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '@/lib/api/client';
 import type { User } from '@/lib/types/database';
 import { Button } from '@/components/ui/button';
@@ -17,15 +17,24 @@ import {
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
-import { Plus, Pencil, Trash2, Search } from 'lucide-react';
+import { Plus, Pencil, Trash2, Search, AlertCircle } from 'lucide-react';
 import { toast } from 'sonner';
 
 export default function UsersPage() {
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<User | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Debounce search input (400ms)
+  useEffect(() => {
+    const timeout = setTimeout(() => setDebouncedSearch(search), 400);
+    return () => clearTimeout(timeout);
+  }, [search]);
 
   // Form state
   const [formName, setFormName] = useState('');
@@ -35,12 +44,23 @@ export default function UsersPage() {
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(async () => {
+    // Cancel previous request
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
-    const params = search ? `?search=${encodeURIComponent(search)}&limit=100` : '?limit=100';
-    const res = await api.get<User[]>(`/users${params}`);
-    if (res.ok) setUsers(res.data);
+    setError(null);
+    const params = debouncedSearch ? `?search=${encodeURIComponent(debouncedSearch)}&limit=100` : '?limit=100';
+    const res = await api.get<User[]>(`/users${params}`, { signal: controller.signal });
+    if (controller.signal.aborted) return;
+    if (res.ok) {
+      setUsers(res.data);
+    } else {
+      setError(res.error || 'Error al cargar usuarios');
+    }
     setLoading(false);
-  }, [search]);
+  }, [debouncedSearch]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -115,6 +135,12 @@ export default function UsersPage() {
       </div>
 
       {/* Table */}
+      {error && (
+        <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/5 p-3 text-destructive text-sm">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          {error}
+        </div>
+      )}
       <div className="rounded-md border bg-card">
         <Table>
           <TableHeader>

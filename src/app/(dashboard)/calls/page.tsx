@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '@/lib/api/client';
 import type { CallRecord, PhoneNumber } from '@/lib/types/database';
 import { Badge } from '@/components/ui/badge';
@@ -16,7 +16,7 @@ import {
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
-import { Search, ChevronLeft, ChevronRight, PhoneOutgoing } from 'lucide-react';
+import { Search, ChevronLeft, ChevronRight, PhoneOutgoing, AlertCircle } from 'lucide-react';
 import { toast } from 'sonner';
 import { useCall } from '@/contexts/call-context';
 
@@ -62,10 +62,12 @@ interface CallDetail extends CallRecord {
 export default function CallsPage() {
   const [calls, setCalls] = useState<CallRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [detailOpen, setDetailOpen] = useState(false);
   const [detail, setDetail] = useState<CallDetail | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
   const limit = 20;
 
   // Filters
@@ -83,7 +85,12 @@ export default function CallsPage() {
   const { dial } = useCall();
 
   const load = useCallback(async () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
+    setError(null);
     const params = new URLSearchParams();
     params.set('page', String(page));
     params.set('limit', String(limit));
@@ -91,10 +98,13 @@ export default function CallsPage() {
     if (filterStatus) params.set('status', filterStatus);
     if (filterFrom) params.set('from_number', filterFrom);
 
-    const res = await api.get<CallRecord[]>(`/calls?${params}`);
+    const res = await api.get<CallRecord[]>(`/calls?${params}`, { signal: controller.signal });
+    if (controller.signal.aborted) return;
     if (res.ok) {
       setCalls(res.data);
       setTotal(res.meta?.total ?? 0);
+    } else {
+      setError(res.error || 'Error al cargar llamadas');
     }
     setLoading(false);
   }, [page, filterDirection, filterStatus, filterFrom]);
@@ -194,6 +204,13 @@ export default function CallsPage() {
           />
         </div>
       </div>
+
+      {error && (
+        <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/5 p-3 text-destructive text-sm">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          {error}
+        </div>
+      )}
 
       <div className="rounded-md border bg-card">
         <Table>

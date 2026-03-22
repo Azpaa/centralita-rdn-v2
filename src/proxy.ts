@@ -1,6 +1,15 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
+/**
+ * Rutas públicas:
+ * - /login: página de autenticación
+ * - /api/webhooks/: webhooks de Twilio (validados con X-Twilio-Signature)
+ * - /api/v1/: API REST (cada ruta tiene su propio authenticate() que acepta
+ *   sesión Supabase O API key; el proxy no puede validar API keys, así que
+ *   las dejamos pasar y la ruta se encarga)
+ * - /api/health: healthcheck
+ */
 const publicRoutes = ['/login', '/api/webhooks/', '/api/v1/', '/api/health']
 
 function isPublicRoute(pathname: string): boolean {

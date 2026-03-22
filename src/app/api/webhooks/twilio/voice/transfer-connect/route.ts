@@ -1,16 +1,16 @@
-import { NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
+import { validateTwilioWebhookLight, twimlResponse } from '@/lib/api/twilio-auth';
 
 /**
  * POST /api/webhooks/twilio/voice/transfer-connect
  * TwiML endpoint invocado cuando se redirige una llamada para transferencia en frío.
  * Conecta la llamada con el nuevo destino.
- *
- * Query params:
- * - destination: número de teléfono o "client:<userId>"
- * - caller_id: callerId para la llamada transferida
  */
 export async function POST(req: NextRequest) {
+  // Validar firma de Twilio
+  const validation = await validateTwilioWebhookLight(req);
+  if (validation !== true) return validation;
   const { searchParams } = new URL(req.url);
   const destination = searchParams.get('destination') || '';
   const callerId = searchParams.get('caller_id') || '';
@@ -61,10 +61,4 @@ export async function POST(req: NextRequest) {
   }
 
   return twimlResponse(twiml);
-}
-
-function twimlResponse(twiml: twilio.twiml.VoiceResponse): NextResponse {
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
 }

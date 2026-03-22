@@ -1,16 +1,16 @@
-import { NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
+import { validateTwilioWebhookLight, twimlResponse } from '@/lib/api/twilio-auth';
 
 /**
  * POST /api/webhooks/twilio/voice/outbound-connect
  * TwiML que Twilio ejecuta cuando se inicia una llamada saliente.
- * Como llamamos directamente al destino, este TwiML simplemente
- * mantiene la llamada abierta y opcionalmente graba.
- *
- * Query params:
- * - caller_id: número de origen (para determinar si grabar)
+ * Mantiene la llamada abierta y opcionalmente graba.
  */
 export async function POST(req: NextRequest) {
+  // Validar firma de Twilio
+  const validation = await validateTwilioWebhookLight(req);
+  if (validation !== true) return validation;
   const { searchParams } = new URL(req.url);
   const callerId = searchParams.get('caller_id') || '';
 
@@ -45,10 +45,4 @@ export async function POST(req: NextRequest) {
   // La llamada se mantiene abierta — el destino ya está conectado
   // No se necesita <Dial> adicional porque Twilio ya llamó al destino directamente
   return twimlResponse(twiml);
-}
-
-function twimlResponse(twiml: twilio.twiml.VoiceResponse): NextResponse {
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
 }

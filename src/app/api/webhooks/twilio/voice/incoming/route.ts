@@ -1,7 +1,7 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import twilio from 'twilio';
 import { routeIncomingCall, createCallRecord } from '@/lib/twilio/call-engine';
-import { parseTwilioBody } from '@/lib/api/twilio-auth';
+import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 
 /**
  * POST /api/webhooks/twilio/voice/incoming
@@ -9,15 +9,18 @@ import { parseTwilioBody } from '@/lib/api/twilio-auth';
  * Twilio llama a esta URL cuando un número recibe una llamada.
  *
  * Flujo:
- * 1. Buscar número en phone_numbers
- * 2. Comprobar horario
- * 3. Si fuera de horario → mensaje + acción OOH
- * 4. Si dentro de horario → bienvenida + enrutar a operadores
- * 5. Crear registro en call_records
+ * 1. Validar firma de Twilio
+ * 2. Buscar número en phone_numbers
+ * 3. Comprobar horario
+ * 4. Si fuera de horario → mensaje + acción OOH
+ * 5. Si dentro de horario → bienvenida + enrutar a operadores
+ * 6. Crear registro en call_records
  */
 export async function POST(req: NextRequest) {
-  const body = await req.text();
-  const params = parseTwilioBody(body);
+  // Validar firma + parsear body en un solo paso
+  const webhook = await validateAndParseTwilioWebhook(req);
+  if (!webhook.ok) return webhook.response;
+  const params = webhook.params;
 
   const callSid = params.CallSid || '';
   const fromNumber = params.From || '';
@@ -239,10 +242,4 @@ export async function POST(req: NextRequest) {
     twiml.hangup();
     return twimlResponse(twiml);
   }
-}
-
-function twimlResponse(twiml: twilio.twiml.VoiceResponse): NextResponse {
-  return new NextResponse(twiml.toString(), {
-    headers: { 'Content-Type': 'text/xml' },
-  });
 }

@@ -1,20 +1,19 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { parseTwilioBody } from '@/lib/api/twilio-auth';
+import { validateAndParseTwilioWebhook } from '@/lib/api/twilio-auth';
 import type { RecordingStatus } from '@/lib/types/database';
 
 /**
  * POST /api/webhooks/twilio/recording/status
  * Twilio notifica cuando una grabación está lista.
  * Crea un registro en la tabla recordings vinculado al call_record.
- *
- * Parámetros de Twilio:
- * - RecordingSid, RecordingUrl, RecordingStatus, RecordingDuration
- * - CallSid, AccountSid
  */
 export async function POST(req: NextRequest) {
-  const body = await req.text();
-  const params = parseTwilioBody(body);
+  // Validar firma + parsear body
+  const webhook = await validateAndParseTwilioWebhook(req);
+  if (!webhook.ok) return webhook.response;
+  const params = webhook.params;
 
   const recordingSid = params.RecordingSid || '';
   const recordingUrl = params.RecordingUrl || '';
