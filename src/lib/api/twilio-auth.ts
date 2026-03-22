@@ -37,10 +37,17 @@ export async function validateAndParseTwilioWebhook(
 
     const signature = req.headers.get('x-twilio-signature') || '';
 
-    // Twilio valida contra la URL original completa
-    const url = req.url;
+    // Twilio firma contra la URL pública. Detrás de Cloudflare Tunnel / reverse proxy,
+    // req.url puede ser http://localhost:3000/... en lugar de la URL pública.
+    // Reconstruimos la URL usando NEXT_PUBLIC_APP_URL para que coincida.
+    const publicBase = process.env.NEXT_PUBLIC_APP_URL || '';
+    let validationUrl = req.url;
+    if (publicBase) {
+      const urlObj = new URL(req.url);
+      validationUrl = `${publicBase}${urlObj.pathname}${urlObj.search}`;
+    }
 
-    const isValid = twilio.validateRequest(authToken, signature, url, params);
+    const isValid = twilio.validateRequest(authToken, signature, validationUrl, params);
 
     if (!isValid) {
       console.warn('[TWILIO-AUTH] Firma inválida', { url: req.url });
@@ -74,9 +81,17 @@ export async function validateTwilioWebhookLight(
     params[key] = value;
   });
 
-  const isValid = twilio.validateRequest(authToken, signature, req.url, params);
+  // Reconstruir URL pública (misma lógica que validateAndParseTwilioWebhook)
+  const publicBase = process.env.NEXT_PUBLIC_APP_URL || '';
+  let validationUrl = req.url;
+  if (publicBase) {
+    const urlObj = new URL(req.url);
+    validationUrl = `${publicBase}${urlObj.pathname}${urlObj.search}`;
+  }
+
+  const isValid = twilio.validateRequest(authToken, signature, validationUrl, params);
   if (!isValid) {
-    console.warn('[TWILIO-AUTH] Firma inválida (light)', { url: req.url });
+    console.warn('[TWILIO-AUTH] Firma inválida (light)', { url: validationUrl });
     return apiUnauthorized('Firma de Twilio inválida');
   }
   return true;
