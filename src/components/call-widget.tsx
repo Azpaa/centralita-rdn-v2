@@ -232,46 +232,130 @@ export function CallWidget() {
 
   // ─── Initialize Twilio Device ──────────────────────────────────────────────
 
+  // Track whether we're already reconnecting to avoid overlapping attempts
+  const reconnectingRef = useRef(false);
+  // Track the keepalive Web Worker
+  const keepaliveWorkerRef = useRef<Worker | null>(null);
+
   const initDevice = useCallback(async () => {
+    if (reconnectingRef.current) return; // prevent parallel reconnect attempts
+    reconnectingRef.current = true;
+
     try {
       setError('');
       const res = await api.get<{ token: string; identity: string; userName: string }>('/token');
       if (!res.ok) {
         setError('Error obteniendo token de voz');
+        reconnectingRef.current = false;
         return;
       }
 
       const { token, identity: id } = res.data;
       setIdentity(id);
 
-      if (deviceRef.current) deviceRef.current.destroy();
+      if (deviceRef.current) {
+        // Try to just update the token if the device exists and is usable
+        try {
+          deviceRef.current.updateToken(token);
+          await deviceRef.current.register();
+          reconnectingRef.current = false;
+          return;
+        } catch {
+          // Device is in bad state — destroy and recreate
+          deviceRef.current.destroy();
+          deviceRef.current = null;
+        }
+      }
 
       const device = new Device(token, {
         logLevel: 1,
         codecPreferences: [Call.Codec.Opus, Call.Codec.PCMU],
+        // Keep the WebSocket alive even when not in a call
+        closeProtection: true,
       });
 
-      device.on('registered', () => { setRegistered(true); setError(''); });
-      device.on('unregistered', () => { setRegistered(false); });
-      device.on('error', (err: { message?: string }) => { setError(err.message || 'Error de dispositivo'); });
+      device.on('registered', () => {
+        setRegistered(true);
+        setError('');
+        console.log('[CallWidget] Device registered ✓');
+      });
+
+      device.on('unregistered', () => {
+        setRegistered(false);
+        console.warn('[CallWidget] Device unregistered — scheduling auto-reconnect');
+        // Auto-reconnect after a short delay
+        setTimeout(() => {
+          reconnectingRef.current = false;
+          initDevice();
+        }, 3000);
+      });
+
+      device.on('error', (err: { message?: string; code?: number }) => {
+        console.error('[CallWidget] Device error:', err);
+        // 31205 = token expired, 31009 = transport error
+        if (err.code === 31205 || err.code === 31009) {
+          // Token expired or connection lost — auto-reconnect
+          console.warn('[CallWidget] Token/transport error — reconnecting...');
+          setTimeout(() => {
+            reconnectingRef.current = false;
+            initDevice();
+          }, 2000);
+        } else {
+          setError(err.message || 'Error de dispositivo');
+        }
+      });
 
       device.on('incoming', (call: Call) => {
         console.log('[CallWidget] Incoming call from:', call.parameters.From);
         incomingCallRef.current = call;
         setIncomingInfo(call.parameters.From || 'Desconocido');
         setWidgetState('incoming');
+
+        // Bring attention to the tab if in background
+        if (document.hidden) {
+          try {
+            // Try to show a notification
+            if (Notification.permission === 'granted') {
+              new Notification('Llamada entrante', {
+                body: `De: ${call.parameters.From || 'Desconocido'}`,
+                icon: '/favicon.ico',
+                tag: 'incoming-call',
+                requireInteraction: true,
+              });
+            }
+          } catch { /* notifications not supported */ }
+        }
       });
 
       device.on('tokenWillExpire', async () => {
-        const refreshRes = await api.get<{ token: string }>('/token');
-        if (refreshRes.ok) device.updateToken(refreshRes.data.token);
+        console.log('[CallWidget] Token expiring — refreshing...');
+        try {
+          const refreshRes = await api.get<{ token: string }>('/token');
+          if (refreshRes.ok) {
+            device.updateToken(refreshRes.data.token);
+            console.log('[CallWidget] Token refreshed ✓');
+          } else {
+            console.warn('[CallWidget] Token refresh failed — will reconnect on expire');
+          }
+        } catch {
+          console.warn('[CallWidget] Token refresh error');
+        }
       });
 
       await device.register();
       deviceRef.current = device;
-    } catch {
+    } catch (err) {
+      console.error('[CallWidget] Init error:', err);
       setError('Error inicializando dispositivo de voz');
+      // Retry after delay
+      setTimeout(() => {
+        reconnectingRef.current = false;
+        initDevice();
+      }, 5000);
+      return;
     }
+
+    reconnectingRef.current = false;
   }, []);
 
   // ─── Mute helpers ──────────────────────────────────────────────────────────
@@ -483,11 +567,78 @@ export function CallWidget() {
 
   useEffect(() => {
     initDevice();
+
+    // Request notification permission for incoming calls when tab is in background
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => {});
+    }
+
+    // DO NOT destroy the device on cleanup — the widget should stay alive
+    // as long as the app is open. Only clean up timers.
     return () => {
-      deviceRef.current?.destroy();
-      deviceRef.current = null;
       stopAllTimers();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── Visibility change: re-check device when tab regains focus ─────────────
+
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        console.log('[CallWidget] Tab visible — checking device...');
+        const device = deviceRef.current;
+        if (!device) {
+          // Device was never created or was destroyed — reinitialize
+          reconnectingRef.current = false;
+          initDevice();
+          return;
+        }
+        // Check if the device is still registered
+        // If state is 'registered' the WebSocket is alive — nothing to do
+        // If state is 'unregistered' or 'destroyed' — reconnect
+        const state = device.state;
+        if (state !== 'registered') {
+          console.warn(`[CallWidget] Device state is "${state}" after tab visible — reconnecting`);
+          reconnectingRef.current = false;
+          initDevice();
+        } else {
+          // Device is registered, but token might be close to expiring.
+          // Proactively refresh the token.
+          api.get<{ token: string }>('/token').then((res) => {
+            if (res.ok && deviceRef.current) {
+              deviceRef.current.updateToken(res.data.token);
+              console.log('[CallWidget] Token proactively refreshed on tab visible');
+            }
+          }).catch(() => {});
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── Keepalive: periodic check even in background ──────────────────────────
+  // Browsers throttle setTimeout/setInterval in background tabs to ~1/min max.
+  // We use a setInterval at 5-min cadence to catch cases where the device
+  // silently lost its WebSocket. This is our safety net.
+
+  useEffect(() => {
+    const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+    const interval = setInterval(() => {
+      const device = deviceRef.current;
+      if (!device) return;
+      if (device.state !== 'registered') {
+        console.warn('[CallWidget] Keepalive: device not registered — reconnecting');
+        reconnectingRef.current = false;
+        initDevice();
+      }
+    }, KEEPALIVE_INTERVAL);
+
+    return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1019,10 +1170,14 @@ export function CallWidget() {
             'flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium border shadow-sm',
             registered
               ? 'bg-green-500/10 text-green-600 border-green-500/30'
-              : 'bg-muted text-muted-foreground border-border'
+              : reconnectingRef.current
+                ? 'bg-yellow-500/10 text-yellow-600 border-yellow-500/30'
+                : 'bg-muted text-muted-foreground border-border'
           )}>
-            {registered ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
-            {registered ? 'Conectado' : 'Sin conexión'}
+            {registered ? <Wifi className="h-3 w-3" /> :
+              reconnectingRef.current ? <Loader2 className="h-3 w-3 animate-spin" /> :
+              <WifiOff className="h-3 w-3" />}
+            {registered ? 'Conectado' : reconnectingRef.current ? 'Reconectando...' : 'Sin conexión'}
           </div>
 
           <Button
@@ -1033,7 +1188,7 @@ export function CallWidget() {
             )}
             onClick={() => {
               if (registered) setShowNewCallDialpad(true);
-              else initDevice();
+              else { reconnectingRef.current = false; initDevice(); }
             }}
             title={registered ? 'Nueva llamada' : 'Reconectar'}
           >

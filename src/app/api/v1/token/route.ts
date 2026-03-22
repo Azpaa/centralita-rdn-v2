@@ -52,10 +52,13 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // Crear Access Token
+    // Crear Access Token — TTL largo para que el dispositivo se mantenga
+    // registrado incluso con la pestaña en segundo plano.
+    // El SDK de Twilio dispara 'tokenWillExpire' ~10 min antes de expirar
+    // para que el front-end pueda refrescar sin interrupciones.
     const token = new AccessToken(accountSid, apiKeySid, apiKeySecret, {
       identity,
-      ttl: 3600, // 1 hora
+      ttl: 28800, // 8 horas
     });
 
     // Conceder permisos de voz (entrantes y salientes)
