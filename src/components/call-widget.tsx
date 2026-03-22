@@ -25,8 +25,6 @@ import {
   Wifi,
   WifiOff,
   PhoneForwarded,
-  Pause,
-  Play,
   UserPlus,
   Users,
   LogOut,
@@ -44,7 +42,7 @@ type CallSlot = {
   call: Call;
   number: string;
   direction: 'inbound' | 'outbound';
-  state: 'connecting' | 'active' | 'held';
+  state: 'connecting' | 'active';
   elapsed: number;
   muted: boolean;
   /** Twilio Call SID for server-side operations */
@@ -276,52 +274,21 @@ export function CallWidget() {
     }
   }, []);
 
-  // ─── Hold / Unhold ─────────────────────────────────────────────────────────
+  // ─── Mute helpers ──────────────────────────────────────────────────────────
 
-  const holdCall = useCallback(async (callId: string) => {
+  const muteCall = useCallback((callId: string) => {
     const slot = callsRef.current.find(c => c.id === callId);
     if (!slot) return;
-
-    // Client-side hold: mute + update state
     slot.call.mute(true);
-    updateCallSlot(callId, { state: 'held', muted: true });
-    stopTimer(callId);
+    updateCallSlot(callId, { muted: true });
+  }, [updateCallSlot]);
 
-    // Server-side hold: redirect the remote party to hold music
-    if (slot.callSid) {
-      try {
-        await api.post('/calls/hold', { callSid: slot.callSid, hold: true });
-      } catch {
-        console.warn('[CallWidget] Server-side hold failed, client-side only');
-      }
-    }
-  }, [updateCallSlot, stopTimer]);
-
-  const unholdCall = useCallback(async (callId: string) => {
+  const unmuteCall = useCallback((callId: string) => {
     const slot = callsRef.current.find(c => c.id === callId);
     if (!slot) return;
-
-    // If there's another active call, hold it first
-    const currentActive = callsRef.current.find(c => c.id !== callId && c.state === 'active');
-    if (currentActive) {
-      await holdCall(currentActive.id);
-    }
-
-    // Client-side unhold
     slot.call.mute(false);
-    updateCallSlot(callId, { state: 'active', muted: false });
-    startTimer(callId);
-    setActiveCallId(callId);
-
-    // Server-side unhold
-    if (slot.callSid) {
-      try {
-        await api.post('/calls/hold', { callSid: slot.callSid, hold: false });
-      } catch {
-        console.warn('[CallWidget] Server-side unhold failed');
-      }
-    }
-  }, [updateCallSlot, startTimer, holdCall]);
+    updateCallSlot(callId, { muted: false });
+  }, [updateCallSlot]);
 
   // ─── Call actions ──────────────────────────────────────────────────────────
 
@@ -382,10 +349,10 @@ export function CallWidget() {
 
     const callerIdToUse = from || fromNumber;
 
-    // If there's an active call, put it on hold first
+    // If there's an active call, mute it while we dial the new one
     const currentActive = callsRef.current.find(c => c.state === 'active');
     if (currentActive) {
-      await holdCall(currentActive.id);
+      muteCall(currentActive.id);
     }
 
     setWidgetState('active');
@@ -408,7 +375,7 @@ export function CallWidget() {
       console.error('[CallWidget] Dial error:', err);
       setError('Error al iniciar llamada');
     }
-  }, [fromNumber, identity, addCallSlot, setupCallHandlers, holdCall]);
+  }, [fromNumber, identity, addCallSlot, setupCallHandlers, muteCall]);
 
   // ─── Transfer (cold) ──────────────────────────────────────────────────────
 
@@ -527,7 +494,6 @@ export function CallWidget() {
   // ─── Compute derived state ─────────────────────────────────────────────────
 
   const activeCall = calls.find(c => c.id === activeCallId);
-  const heldCalls = calls.filter(c => c.state === 'held');
   const hasMultipleCalls = calls.length > 1;
 
   // ─── RENDER ────────────────────────────────────────────────────────────────
@@ -567,15 +533,15 @@ export function CallWidget() {
         </div>
       )}
 
-      {/* ── Held calls cards (stacked above active) ── */}
-      {heldCalls.map((slot) => (
-        <div key={slot.id} className="w-80 rounded-xl border border-yellow-500/30 bg-card/80 p-3 shadow-lg">
+      {/* ── Other calls (when multiple active) ── */}
+      {calls.filter(c => c.id !== activeCallId).map((slot) => (
+        <div key={slot.id} className="w-80 rounded-xl border border-muted-foreground/30 bg-card/80 p-3 shadow-lg">
           <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-yellow-500/20">
-              <Pause className="h-4 w-4 text-yellow-500" />
+            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-muted">
+              {slot.muted ? <MicOff className="h-4 w-4 text-muted-foreground" /> : <Mic className="h-4 w-4 text-muted-foreground" />}
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-xs font-semibold truncate">En espera</p>
+              <p className="text-xs font-semibold truncate">{slot.muted ? 'Silenciada' : 'En llamada'}</p>
               <p className="text-xs text-muted-foreground truncate">{slot.number}</p>
             </div>
             <span className="text-xs font-mono text-muted-foreground">{formatTime(slot.elapsed)}</span>
@@ -584,10 +550,16 @@ export function CallWidget() {
                 size="icon"
                 variant="outline"
                 className="h-7 w-7"
-                onClick={() => unholdCall(slot.id)}
-                title="Recuperar"
+                onClick={() => {
+                  // Switch to this call as active
+                  const currentActive = callsRef.current.find(c => c.id === activeCallId);
+                  if (currentActive) muteCall(currentActive.id);
+                  unmuteCall(slot.id);
+                  setActiveCallId(slot.id);
+                }}
+                title="Retomar"
               >
-                <Play className="h-3 w-3" />
+                <Phone className="h-3 w-3" />
               </Button>
               <Button
                 size="icon"
@@ -878,15 +850,6 @@ export function CallWidget() {
                 </Button>
                 <Button
                   size="icon"
-                  variant="outline"
-                  className="h-9 w-9"
-                  onClick={() => holdCall(activeCall.id)}
-                  title="Poner en espera"
-                >
-                  <Pause className="h-4 w-4" />
-                </Button>
-                <Button
-                  size="icon"
                   variant="destructive"
                   className="h-10 w-10"
                   onClick={() => hangupCall(activeCall.id)}
@@ -969,11 +932,11 @@ export function CallWidget() {
         </div>
       )}
 
-      {/* ── Active state but no activeCall and calls exist (all held) ── */}
+      {/* ── Active state but no activeCall and calls exist ── */}
       {widgetState === 'active' && !activeCall && calls.length > 0 && (
         <div className="w-80 rounded-xl border bg-card p-3 shadow-2xl text-center">
           <p className="text-xs text-muted-foreground">
-            {calls.length} llamada{calls.length > 1 ? 's' : ''} en espera
+            {calls.length} llamada{calls.length > 1 ? 's' : ''} activa{calls.length > 1 ? 's' : ''}
           </p>
           <Button
             size="sm"
@@ -981,10 +944,13 @@ export function CallWidget() {
             className="mt-2 text-xs"
             onClick={() => {
               const first = calls[0];
-              if (first) unholdCall(first.id);
+              if (first) {
+                unmuteCall(first.id);
+                setActiveCallId(first.id);
+              }
             }}
           >
-            <Play className="mr-1 h-3 w-3" /> Recuperar
+            <Phone className="mr-1 h-3 w-3" /> Retomar
           </Button>
         </div>
       )}

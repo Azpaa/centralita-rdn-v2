@@ -8,10 +8,11 @@ import { getTwilioClient } from '@/lib/twilio/client';
  * Transferencia en frío: redirige la llamada activa a otro destino.
  * El agente se desconecta y la llamada pasa directamente al nuevo destino.
  *
+ * IMPORTANTE: El front-end envía el CallSid del agente (la leg del browser).
+ * Para transferir correctamente, necesitamos redirigir la leg del llamante original,
+ * NO la del agente. Usamos la API de Twilio para obtener la llamada padre.
+ *
  * Body: { callSid: string, destination: string, callerId?: string }
- *   - callSid: SID de la llamada a transferir (la child leg del <Dial>)
- *   - destination: número de teléfono o "client:<userId>" 
- *   - callerId: caller ID para la nueva llamada
  */
 export async function POST(req: NextRequest) {
   const auth = await authenticate(req);
@@ -34,18 +35,45 @@ export async function POST(req: NextRequest) {
   try {
     const client = getTwilioClient();
 
-    // Redirigir la llamada padre (del caller original) a un nuevo TwiML
-    // que hace <Dial> al nuevo destino
+    // Obtener la llamada para encontrar la leg correcta.
+    // El callSid del browser puede ser la leg hija (para entrantes) o la leg padre (para salientes).
+    // Para transferir, necesitamos redirigir la leg del llamante original.
+    const callInfo = await client.calls(callSid).fetch();
+    let parentCallSid = callSid;
+
+    if (callInfo.parentCallSid) {
+      // Esta es una child leg (típico de entrantes) → redirigir la parent leg
+      parentCallSid = callInfo.parentCallSid;
+    } else {
+      // Esta es la parent call (típico de salientes del browser).
+      // Necesitamos encontrar las child legs y redirigir la que conecta con el destino.
+      // Listamos las child calls activas
+      const childCalls = await client.calls.list({
+        parentCallSid: callSid,
+        status: 'in-progress',
+        limit: 5,
+      });
+
+      if (childCalls.length > 0) {
+        // Redirigir la llamada padre (la del browser) para que se conecte al nuevo destino.
+        // Las child legs se cerrarán automáticamente.
+        parentCallSid = callSid;
+      }
+    }
+
+    console.log(`[TRANSFER] Agent SID=${callSid} → Redirecting parent SID=${parentCallSid} to ${destination}`);
+
+    // Redirigir la llamada padre al TwiML de transferencia
     const transferUrl = `${baseUrl}/api/webhooks/twilio/voice/transfer-connect` +
       `?destination=${encodeURIComponent(destination)}` +
       `&caller_id=${encodeURIComponent(callerId || '')}`;
 
-    await client.calls(callSid).update({
+    await client.calls(parentCallSid).update({
       url: transferUrl,
       method: 'POST',
     });
 
-    return apiSuccess({ transferred: true, callSid, destination });
+    return apiSuccess({ transferred: true, callSid: parentCallSid, destination });
   } catch (err) {
     console.error('[TRANSFER] Error:', err);
     return apiInternalError('Error al transferir la llamada');
