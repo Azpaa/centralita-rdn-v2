@@ -67,20 +67,23 @@ export async function POST(req: NextRequest) {
 
   // Para llamadas ENTRANTES con cola: comprobar si debemos reintentar
   if (direction === 'inbound' && queueId && (dialStatus === 'no-answer' || dialStatus === 'busy')) {
-    // Obtener max_wait_time de la cola
+    // Obtener max_wait_time y timeout_action de la cola
     const { data: queueData } = await supabase
       .from('queues')
-      .select('max_wait_time')
+      .select('max_wait_time, timeout_action, timeout_forward_to')
       .eq('id', queueId)
       .single();
 
-    const maxWait = (queueData as Queue | null)?.max_wait_time ?? 300; // default 5 min
+    const queue = queueData as (Queue & { timeout_action?: string; timeout_forward_to?: string }) | null;
+    const maxWait = queue?.max_wait_time ?? 300; // default 5 min
+    const timeoutAction = queue?.timeout_action ?? 'hangup';
+    const timeoutForwardTo = queue?.timeout_forward_to ?? '';
 
     // Calcular cuánto tiempo lleva esperando el llamante
     const waitingSince = startedAt ? new Date(startedAt).getTime() : Date.now();
     const waitedSeconds = Math.round((Date.now() - waitingSince) / 1000);
 
-    console.log(`[DIAL-ACTION] Queue retry check: waited=${waitedSeconds}s maxWait=${maxWait}s`);
+    console.log(`[DIAL-ACTION] Queue retry check: waited=${waitedSeconds}s maxWait=${maxWait}s timeoutAction=${timeoutAction}`);
 
     if (waitedSeconds < maxWait) {
       // Aún hay tiempo → mantener en cola y reintentar
@@ -94,8 +97,63 @@ export async function POST(req: NextRequest) {
       return twimlResponse(twiml);
     }
 
-    // Se acabó el tiempo de espera → caer al flujo normal de despedida
-    console.log(`[DIAL-ACTION] Queue max wait exceeded (${waitedSeconds}s >= ${maxWait}s)`);
+    // Se acabó el tiempo de espera → aplicar timeout_action
+    console.log(`[DIAL-ACTION] Queue max wait exceeded (${waitedSeconds}s >= ${maxWait}s) → action: ${timeoutAction}`);
+
+    switch (timeoutAction) {
+      case 'forward': {
+        if (timeoutForwardTo) {
+          console.log(`[DIAL-ACTION] Forwarding to ${timeoutForwardTo}`);
+          await updateCallStatus(callSid, { status: 'forwarded' });
+          twiml.say(
+            { language: 'es-ES', voice: 'Polly.Conchita' },
+            'Le estamos transfiriendo. Un momento por favor.'
+          );
+          const forwardDial = twiml.dial({
+            timeout: 30,
+            action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
+          });
+          if (timeoutForwardTo.startsWith('client:')) {
+            forwardDial.client(timeoutForwardTo.replace('client:', ''));
+          } else {
+            forwardDial.number(timeoutForwardTo);
+          }
+          return twimlResponse(twiml);
+        }
+        // Si no hay número de reenvío, caer a hangup
+        break;
+      }
+      case 'voicemail': {
+        console.log(`[DIAL-ACTION] Sending to voicemail`);
+        await updateCallStatus(callSid, { status: 'voicemail' });
+        twiml.say(
+          { language: 'es-ES', voice: 'Polly.Conchita' },
+          'No hemos podido atender su llamada. Por favor, deje su mensaje después de la señal.'
+        );
+        twiml.record({
+          maxLength: 120,
+          transcribe: false,
+          playBeep: true,
+          action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
+          recordingStatusCallback: `${baseUrl}/api/webhooks/twilio/recording/status`,
+        });
+        return twimlResponse(twiml);
+      }
+      case 'keep_waiting': {
+        console.log(`[DIAL-ACTION] Keep waiting — redirecting back to queue-retry`);
+        await updateCallStatus(callSid, { status: 'in_queue' });
+        twiml.say(
+          { language: 'es-ES', voice: 'Polly.Conchita' },
+          'Seguimos intentando conectarle. Por favor, espere.'
+        );
+        twiml.redirect(
+          { method: 'POST' },
+          `${baseUrl}/api/webhooks/twilio/voice/queue-retry`
+        );
+        return twimlResponse(twiml);
+      }
+      // 'hangup' y default: caer al flujo normal de despedida
+    }
   }
 
   // Estado final: no hubo conversación

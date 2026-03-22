@@ -162,6 +162,12 @@ export function CallWidget() {
         setOverlay('none');
         setConferenceName(null);
       }
+      // Auto-unmute: if exactly one call remains and it's muted,
+      // unmute it so the agent isn't left in silent mode
+      if (remaining.length === 1 && remaining[0].muted) {
+        remaining[0].call.mute(false);
+        remaining[0] = { ...remaining[0], muted: false };
+      }
       return remaining;
     });
   }, [stopTimer]);
@@ -234,8 +240,6 @@ export function CallWidget() {
 
   // Track whether we're already reconnecting to avoid overlapping attempts
   const reconnectingRef = useRef(false);
-  // Track the keepalive Web Worker
-  const keepaliveWorkerRef = useRef<Worker | null>(null);
 
   const initDevice = useCallback(async () => {
     if (reconnectingRef.current) return; // prevent parallel reconnect attempts
@@ -477,13 +481,14 @@ export function CallWidget() {
         callerId: fromNumber,
       });
 
-      // After transfer, the agent's leg disconnects
-      removeCallSlot(slot.id);
+      // Don't remove the slot here — the Twilio 'disconnect' event will fire
+      // automatically when the transfer completes, which triggers removeCallSlot.
+      // Just close the overlay.
       setOverlay('none');
     } catch {
       setError('Error al transferir la llamada');
     }
-  }, [getActiveCall, fromNumber, removeCallSlot]);
+  }, [getActiveCall, fromNumber]);
 
   // ─── Conference / 3-way ────────────────────────────────────────────────────
 

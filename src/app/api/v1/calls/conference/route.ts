@@ -42,18 +42,45 @@ export async function POST(req: NextRequest) {
   try {
     switch (action) {
       case 'create': {
-        // Mover una llamada existente a una conferencia
+        // Mover una llamada existente a una conferencia.
+        // El callSid es la leg del browser — necesitamos resolver la leg remota
+        // para meter a ambas partes en la conferencia.
         if (!callSid || !conferenceName) {
           return apiBadRequest('callSid y conferenceName son requeridos para create');
         }
 
-        // Redirigir la llamada del interlocutor a la conferencia
-        await client.calls(callSid).update({
-          url: `${baseUrl}/api/webhooks/twilio/voice/conference-join?room=${encodeURIComponent(conferenceName)}&role=participant`,
-          method: 'POST',
-        });
+        const confJoinUrl = `${baseUrl}/api/webhooks/twilio/voice/conference-join?room=${encodeURIComponent(conferenceName)}&role=participant`;
 
-        return apiSuccess({ conferenceName, callSid });
+        // Resolver la leg del interlocutor remoto
+        const callInfo = await client.calls(callSid).fetch();
+        let remoteSid: string | null = null;
+
+        if (callInfo.parentCallSid) {
+          // Entrante: browser es child, remoto es parent
+          remoteSid = callInfo.parentCallSid;
+        } else {
+          // Saliente: browser es parent, remoto es child
+          const children = await client.calls.list({
+            parentCallSid: callSid,
+            status: 'in-progress',
+            limit: 1,
+          });
+          if (children.length > 0) remoteSid = children[0].sid;
+        }
+
+        // Redirigir ambas legs a la conferencia (en paralelo)
+        const redirects: Promise<unknown>[] = [];
+        if (remoteSid) {
+          redirects.push(
+            client.calls(remoteSid).update({ url: confJoinUrl, method: 'POST' })
+          );
+        }
+        redirects.push(
+          client.calls(callSid).update({ url: confJoinUrl, method: 'POST' })
+        );
+        await Promise.all(redirects);
+
+        return apiSuccess({ conferenceName, callSid, remoteSid });
       }
 
       case 'add': {

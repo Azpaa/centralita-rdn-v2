@@ -51,24 +51,72 @@ export async function POST(req: NextRequest) {
 
     // Comprobar si se ha superado el tiempo máximo de espera
     const maxWait = queue?.max_wait_time ?? 300;
+    const timeoutAction = (queue as Queue & { timeout_action?: string })?.timeout_action ?? 'hangup';
+    const timeoutForwardTo = (queue as Queue & { timeout_forward_to?: string })?.timeout_forward_to ?? '';
     const waitingSince = record.started_at ? new Date(record.started_at).getTime() : Date.now();
     const waitedSeconds = Math.round((Date.now() - waitingSince) / 1000);
 
     if (waitedSeconds >= maxWait) {
-      console.log(`[QUEUE-RETRY] Max wait exceeded (${waitedSeconds}s >= ${maxWait}s), giving up`);
-      // Actualizar estado final
+      console.log(`[QUEUE-RETRY] Max wait exceeded (${waitedSeconds}s >= ${maxWait}s) → action: ${timeoutAction}`);
       const { updateCallStatus } = await import('@/lib/twilio/call-engine');
-      await updateCallStatus(callSid, {
-        status: 'no_answer',
-        endedAt: new Date().toISOString(),
-        duration: 0,
-      });
-      twiml.say(
-        { language: 'es-ES', voice: 'Polly.Conchita' },
-        'No ha sido posible conectar su llamada. Por favor, inténtelo más tarde.'
-      );
-      twiml.hangup();
-      return twimlResponse(twiml);
+
+      switch (timeoutAction) {
+        case 'forward': {
+          if (timeoutForwardTo) {
+            await updateCallStatus(callSid, { status: 'forwarded' });
+            twiml.say(
+              { language: 'es-ES', voice: 'Polly.Conchita' },
+              'Le estamos transfiriendo. Un momento por favor.'
+            );
+            const forwardDial = twiml.dial({
+              timeout: 30,
+              action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
+            });
+            if (timeoutForwardTo.startsWith('client:')) {
+              forwardDial.client(timeoutForwardTo.replace('client:', ''));
+            } else {
+              forwardDial.number(timeoutForwardTo);
+            }
+            return twimlResponse(twiml);
+          }
+          // Sin número de reenvío → hangup
+          break;
+        }
+        case 'voicemail': {
+          await updateCallStatus(callSid, { status: 'voicemail' });
+          twiml.say(
+            { language: 'es-ES', voice: 'Polly.Conchita' },
+            'No hemos podido atender su llamada. Por favor, deje su mensaje después de la señal.'
+          );
+          twiml.record({
+            maxLength: 120,
+            transcribe: false,
+            playBeep: true,
+            action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
+            recordingStatusCallback: `${baseUrl}/api/webhooks/twilio/recording/status`,
+          });
+          return twimlResponse(twiml);
+        }
+        case 'keep_waiting': {
+          // Ignorar maxWait, seguir reintentando
+          console.log(`[QUEUE-RETRY] keep_waiting — continuing retry loop`);
+          break; // Fall through to normal retry logic below
+        }
+        default: {
+          // 'hangup' — default behavior
+          await updateCallStatus(callSid, {
+            status: 'no_answer',
+            endedAt: new Date().toISOString(),
+            duration: 0,
+          });
+          twiml.say(
+            { language: 'es-ES', voice: 'Polly.Conchita' },
+            'No ha sido posible conectar su llamada. Por favor, inténtelo más tarde.'
+          );
+          twiml.hangup();
+          return twimlResponse(twiml);
+        }
+      }
     }
 
     if (!queueData || !queueData.queue || queueData.operators.length === 0) {

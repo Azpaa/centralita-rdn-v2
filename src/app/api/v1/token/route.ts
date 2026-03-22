@@ -33,8 +33,10 @@ export async function GET(req: NextRequest) {
       return apiInternalError('Twilio TwiML App no configurado');
     }
 
-    // Obtener datos del usuario para la identidad
-    let identity = auth.userId || 'anonymous';
+    // Obtener datos del usuario para la identidad.
+    // Prioridad: users.id > auth.users.id > 'anonymous'
+    // Nunca debe ser 'anonymous' si hay sesión válida.
+    let identity = auth.userId || auth.authId || 'anonymous';
     let userName = 'Usuario';
 
     if (auth.userId) {

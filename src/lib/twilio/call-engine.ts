@@ -117,7 +117,7 @@ export async function getQueueWithOperators(queueId: string): Promise<{
     .from('queue_users')
     .select('user_id, priority')
     .eq('queue_id', queueId)
-    .order('priority', { ascending: false });
+    .order('priority', { ascending: true });
 
   if (!queueUsers || queueUsers.length === 0) {
     return { queue: queue as Queue, operators: [] };
@@ -145,7 +145,7 @@ export async function getQueueWithOperators(queueId: string): Promise<{
       ...u,
       priority: priorityMap.get(u.id) ?? 0,
     }))
-    .sort((a, b) => b.priority - a.priority);
+    .sort((a, b) => a.priority - b.priority);
 
   return { queue: queue as Queue, operators };
 }

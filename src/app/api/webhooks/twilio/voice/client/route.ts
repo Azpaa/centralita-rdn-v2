@@ -29,9 +29,66 @@ export async function POST(req: NextRequest) {
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
 
   try {
-    // Si el To empieza con "client:", es una llamada entre clientes (no aplica aquí)
-    // Si el To es un número de teléfono, hacemos Dial al número
-    if (to && !to.startsWith('client:')) {
+    if (to && to.startsWith('client:')) {
+      // ─── Llamada entre clientes del navegador (ej: consulta a otro operador) ───
+      const targetIdentity = to.replace('client:', '');
+      const supabase = createAdminClient();
+
+      // Obtener nombre del usuario iniciador
+      let initiatorName = 'Sistema';
+      if (userId) {
+        const { data: user } = await supabase
+          .from('users')
+          .select('name')
+          .eq('id', userId)
+          .single();
+        if (user) initiatorName = (user as User).name;
+      }
+
+      // Resolver callerId para el registro
+      let callerId = customCallerId;
+      if (!callerId || callerId.startsWith('client:')) {
+        const { data: firstNum } = await supabase
+          .from('phone_numbers')
+          .select('phone_number')
+          .eq('active', true)
+          .limit(1)
+          .single();
+        callerId = (firstNum as PhoneNumber)?.phone_number || '';
+      }
+
+      // Registrar la llamada interna en DB
+      await createCallRecord({
+        twilioCallSid: callSid,
+        direction: 'outbound',
+        fromNumber: callerId || `client:${userId}`,
+        toNumber: to,
+        status: 'ringing',
+        twilioData: {
+          initiated_by: userId || 'unknown',
+          initiator_name: initiatorName,
+          source: 'browser',
+          internal: 'true',
+        },
+      });
+
+      // Dial al cliente del navegador destino
+      const dial = twiml.dial({
+        callerId,
+        timeout: 30,
+        action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
+      });
+
+      dial.client(
+        {
+          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+          statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+        },
+        targetIdentity
+      );
+
+    } else if (to && !to.startsWith('client:')) {
+      // ─── Llamada a número de teléfono externo ───
       const supabase = createAdminClient();
 
       // Resolver callerId: usar el param personalizado, o buscar uno válido
