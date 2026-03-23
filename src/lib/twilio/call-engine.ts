@@ -63,10 +63,13 @@ export function isWithinSchedule(
   const dayOfWeek = dayMap[dayName] ?? -1;
   const currentTime = `${hour}:${minute}`;
 
-  // Buscar si algún slot coincide
+  // Buscar si algún slot coincide.
+  // Normalizar start/end a HH:MM (la DB puede tener HH:MM:SS).
   return slots.some(slot => {
     if (slot.day_of_week !== dayOfWeek) return false;
-    return currentTime >= slot.start_time && currentTime < slot.end_time;
+    const start = slot.start_time.slice(0, 5); // "00:01:00" → "00:01"
+    const end = slot.end_time.slice(0, 5);     // "23:59:00" → "23:59"
+    return currentTime >= start && currentTime < end;
   });
 }
 
