@@ -1,16 +1,24 @@
 import { NextRequest } from 'next/server';
+import twilio from 'twilio';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
 
 /**
  * POST /api/v1/calls/transfer
- * Transferencia en frío: redirige la llamada activa a otro destino.
- * El agente se desconecta y la llamada pasa directamente al nuevo destino.
+ * Transferencia en frío (blind transfer).
  *
- * IMPORTANTE: El front-end envía el CallSid del agente (la leg del browser).
- * Para transferir correctamente, necesitamos redirigir la leg del llamante original,
- * NO la del agente. Usamos la API de Twilio para obtener la llamada padre.
+ * Flujo:
+ *  1. Identificar la leg remota (la persona con la que habla el agente).
+ *  2. Enviarle TwiML **inline** (parámetro `twiml`) que dice "Transfiriendo…"
+ *     y hace <Dial> al nuevo destino.  Sin action URL → al terminar el Dial
+ *     la llamada simplemente se despide y cuelga.
+ *  3. Colgar explícitamente la leg del agente.
+ *
+ * ¿Por qué TwiML inline en vez de redirigir a un webhook?
+ *  • Evita problemas de firma (401) detrás de reverse-proxy / Cloudflare.
+ *  • Evita que dial-action reprocesse la llamada y reintente la cola
+ *    (era el bug: "me cuelga y me vuelve a llamar").
  *
  * Body: { callSid: string, destination: string, callerId?: string }
  */
@@ -30,49 +38,82 @@ export async function POST(req: NextRequest) {
     return apiBadRequest('callSid y destination son requeridos');
   }
 
-  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
-
   try {
     const client = getTwilioClient();
 
-    // Obtener la llamada para encontrar la leg correcta.
-    // El callSid del browser puede ser la leg hija (para entrantes) o la leg padre (para salientes).
-    // Para transferir, necesitamos redirigir la leg del interlocutor remoto (no la del agente).
+    // ── 1. Identificar la leg remota ──────────────────────────────────────
     const callInfo = await client.calls(callSid).fetch();
-    let targetCallSid = callSid;
+    let remoteCallSid: string;
 
     if (callInfo.parentCallSid) {
-      // Esta es una child leg (típico de entrantes) → la persona remota es la parent leg
-      targetCallSid = callInfo.parentCallSid;
+      // callSid es child (entrante) → remoto = parent (el llamante externo)
+      remoteCallSid = callInfo.parentCallSid;
     } else {
-      // Esta es la parent call (típico de salientes del browser).
-      // La persona remota es la child call — buscarla y redirigirla.
-      const childCalls = await client.calls.list({
+      // callSid es parent (saliente browser) → remoto = child (persona llamada)
+      const children = await client.calls.list({
         parentCallSid: callSid,
         status: 'in-progress',
         limit: 5,
       });
 
-      if (childCalls.length > 0) {
-        // Redirigir la child call (el interlocutor remoto) al nuevo destino
-        targetCallSid = childCalls[0].sid;
+      if (children.length === 0) {
+        return apiBadRequest(
+          'No se encontró la otra parte de la llamada. Puede que ya haya colgado.'
+        );
       }
-      // Si no hay child calls, fallback a usar callSid (edge case)
+      remoteCallSid = children[0].sid;
     }
 
-    console.log(`[TRANSFER] Agent SID=${callSid} → Redirecting remote SID=${targetCallSid} to ${destination}`);
+    console.log(
+      `[TRANSFER] agentSid=${callSid} remoteSid=${remoteCallSid} → ${destination}`
+    );
 
-    // Redirigir la llamada padre al TwiML de transferencia
-    const transferUrl = `${baseUrl}/api/webhooks/twilio/voice/transfer-connect` +
-      `?destination=${encodeURIComponent(destination)}` +
-      `&caller_id=${encodeURIComponent(callerId || '')}`;
+    // ── 2. Construir TwiML inline para la transferencia ──────────────────
+    const twimlBuilder = new twilio.twiml.VoiceResponse();
 
-    await client.calls(targetCallSid).update({
-      url: transferUrl,
-      method: 'POST',
+    twimlBuilder.say(
+      { language: 'es-ES', voice: 'Polly.Conchita' },
+      'Transfiriendo su llamada. Un momento por favor.'
+    );
+
+    // <Dial> SIN action URL → al finalizar el Dial, la llamada continúa
+    // con los siguientes verbos (despedida + hangup). Así evitamos que
+    // dial-action reintente la cola.
+    const dial = twimlBuilder.dial({
+      callerId: callerId || undefined,
+      timeout: 30,
     });
 
-    return apiSuccess({ transferred: true, callSid: targetCallSid, destination });
+    if (destination.startsWith('client:')) {
+      dial.client(destination.replace('client:', ''));
+    } else {
+      dial.number(destination);
+    }
+
+    // Después del Dial (conteste o no), despedirse y colgar.
+    twimlBuilder.say(
+      { language: 'es-ES', voice: 'Polly.Conchita' },
+      'La transferencia ha finalizado. Gracias por llamar.'
+    );
+    twimlBuilder.hangup();
+
+    const twimlString = twimlBuilder.toString();
+
+    // ── 3. Redirigir la leg remota con TwiML inline ──────────────────────
+    await client.calls(remoteCallSid).update({ twiml: twimlString });
+
+    // ── 4. Colgar la leg del agente explícitamente ───────────────────────
+    // Para entrantes: el child (agente) se desconecta automáticamente al
+    //   interrumpir el Dial del parent, pero lo completamos por seguridad.
+    // Para salientes: evitamos que el parent vaya a dial-action (que podría
+    //   reintentar colas o mostrar errores de webhook 401).
+    try {
+      await client.calls(callSid).update({ status: 'completed' });
+    } catch {
+      // Ya estaba desconectado — OK
+    }
+
+    return apiSuccess({ transferred: true, callSid: remoteCallSid, destination });
   } catch (err) {
     console.error('[TRANSFER] Error:', err);
     return apiInternalError('Error al transferir la llamada');

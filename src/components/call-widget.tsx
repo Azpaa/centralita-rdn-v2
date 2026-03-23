@@ -481,9 +481,16 @@ export function CallWidget() {
         callerId: fromNumber,
       });
 
-      // Don't remove the slot here — the Twilio 'disconnect' event will fire
-      // automatically when the transfer completes, which triggers removeCallSlot.
-      // Just close the overlay.
+      // El servidor ya redirigió la llamada remota y completó nuestra leg
+      // vía REST API. Desconectamos también el objeto Call del SDK para
+      // limpiar el estado local de forma inmediata (el evento 'disconnect'
+      // eliminará el slot del widget).
+      try {
+        slot.call.disconnect();
+      } catch {
+        // Ya desconectada — OK
+      }
+
       setOverlay('none');
     } catch {
       setError('Error al transferir la llamada');

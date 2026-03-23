@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server';
+import twilio from 'twilio';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
@@ -49,8 +50,6 @@ export async function POST(req: NextRequest) {
           return apiBadRequest('callSid y conferenceName son requeridos para create');
         }
 
-        const confJoinUrl = `${baseUrl}/api/webhooks/twilio/voice/conference-join?room=${encodeURIComponent(conferenceName)}&role=participant`;
-
         // Resolver la leg del interlocutor remoto
         const callInfo = await client.calls(callSid).fetch();
         let remoteSid: string | null = null;
@@ -68,15 +67,28 @@ export async function POST(req: NextRequest) {
           if (children.length > 0) remoteSid = children[0].sid;
         }
 
-        // Redirigir ambas legs a la conferencia (en paralelo)
+        // Construir TwiML inline para unirse a la conferencia
+        const confTwiml = new twilio.twiml.VoiceResponse();
+        const confDial = confTwiml.dial();
+        confDial.conference(
+          {
+            startConferenceOnEnter: true,
+            endConferenceOnExit: false,
+            waitUrl: 'http://com.twilio.music.classical.s3.amazonaws.com/ith_chopin-702702.mp3',
+          },
+          conferenceName
+        );
+        const confTwimlStr = confTwiml.toString();
+
+        // Redirigir ambas legs a la conferencia con TwiML inline (en paralelo)
         const redirects: Promise<unknown>[] = [];
         if (remoteSid) {
           redirects.push(
-            client.calls(remoteSid).update({ url: confJoinUrl, method: 'POST' })
+            client.calls(remoteSid).update({ twiml: confTwimlStr })
           );
         }
         redirects.push(
-          client.calls(callSid).update({ url: confJoinUrl, method: 'POST' })
+          client.calls(callSid).update({ twiml: confTwimlStr })
         );
         await Promise.all(redirects);
 
