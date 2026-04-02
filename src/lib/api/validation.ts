@@ -8,6 +8,7 @@ export const createUserSchema = z.object({
   phone: z.string().optional().nullable(),
   role: z.enum(['admin', 'operator']).default('operator'),
   rdn_user_id: z.string().optional().nullable(),
+  password: z.string().min(8, 'Mínimo 8 caracteres').max(72).optional(),
 });
 
 export const updateUserSchema = z.object({

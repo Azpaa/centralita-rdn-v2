@@ -53,7 +53,7 @@ export async function POST(req: NextRequest, { params }: Params) {
       {
         startConferenceOnEnter: true,
         endConferenceOnExit: false,
-        beep: false,
+        beep: 'false',
       },
       confName,
     );

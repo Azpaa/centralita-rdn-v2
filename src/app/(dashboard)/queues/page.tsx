@@ -76,7 +76,10 @@ export default function QueuesPage() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+  }, [load]);
 
   // Cargar todos los usuarios activos
   useEffect(() => {

@@ -3,8 +3,6 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
 import { apiSuccess, apiNotFound, apiBadRequest, apiNoContent, apiInternalError } from '@/lib/api/response';
 import { auditLog } from '@/lib/api/audit';
-import { emitEvent } from '@/lib/events/emitter';
-import type { WebhookSubscription } from '@/lib/types/database';
 import { z } from 'zod';
 
 interface Params {

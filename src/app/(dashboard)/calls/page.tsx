@@ -109,7 +109,10 @@ export default function CallsPage() {
     setLoading(false);
   }, [page, filterDirection, filterStatus, filterFrom]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+  }, [load]);
 
   // Cargar números Twilio activos para el diálogo de llamada
   useEffect(() => {

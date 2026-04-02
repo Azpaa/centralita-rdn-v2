@@ -22,13 +22,6 @@ const createWebhookSchema = z.object({
   description: z.string().optional().nullable(),
 });
 
-const updateWebhookSchema = z.object({
-  url: z.string().url().optional(),
-  events: z.array(z.string().min(1)).optional(),
-  description: z.string().optional().nullable(),
-  active: z.boolean().optional(),
-});
-
 // --- Eventos válidos ---
 const VALID_EVENT_PATTERNS = [
   '*',

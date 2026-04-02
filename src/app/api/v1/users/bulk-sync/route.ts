@@ -1,8 +1,9 @@
 import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
-import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
+import { apiSuccess, apiBadRequest } from '@/lib/api/response';
 import { auditLog } from '@/lib/api/audit';
+import { generateTempPassword } from '@/lib/api/sanitize';
 import { z } from 'zod';
 
 // --- Validación ---
@@ -14,6 +15,7 @@ const bulkSyncUserSchema = z.object({
   phone: z.string().optional().nullable(),
   role: z.enum(['admin', 'operator']).default('operator'),
   active: z.boolean().default(true),
+  password: z.string().min(8).max(72).optional(),
 });
 
 const bulkSyncSchema = z.object({
@@ -58,6 +60,7 @@ export async function POST(req: NextRequest) {
     action: 'created' | 'updated' | 'linked' | 'error';
     user_id?: string;
     error?: string;
+    _temp_password?: string;
   }[] = [];
 
   for (const input of parsed.data.users) {
@@ -90,7 +93,7 @@ export async function POST(req: NextRequest) {
       // 2. Buscar por email
       const { data: existingByEmail } = await supabase
         .from('users')
-        .select('id, rdn_user_id')
+        .select('id, rdn_user_id, auth_id')
         .eq('email', input.email)
         .is('deleted_at', null)
         .single();
@@ -107,26 +110,64 @@ export async function POST(req: NextRequest) {
         }
 
         // Vincular y actualizar
+        const updateFields: Record<string, unknown> = {
+          rdn_user_id: input.rdn_user_id,
+          rdn_linked: true,
+          name: input.name,
+          phone: input.phone ?? null,
+          role: input.role,
+          active: input.active,
+        };
+
+        // Si no tiene cuenta auth, crearla ahora
+        let tempPassword: string | undefined;
+        if (!existingByEmail.auth_id) {
+          tempPassword = input.password || generateTempPassword();
+          const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+            email: input.email,
+            password: tempPassword,
+            email_confirm: true,
+          });
+          if (!authError && authData.user) {
+            updateFields.auth_id = authData.user.id;
+          }
+        }
+
         await supabase
           .from('users')
-          .update({
-            rdn_user_id: input.rdn_user_id,
-            rdn_linked: true,
-            name: input.name,
-            phone: input.phone ?? null,
-            role: input.role,
-            active: input.active,
-          })
+          .update(updateFields)
           .eq('id', existingByEmail.id);
 
-        results.push({ rdn_user_id: input.rdn_user_id, action: 'linked', user_id: existingByEmail.id });
+        results.push({
+          rdn_user_id: input.rdn_user_id,
+          action: 'linked',
+          user_id: existingByEmail.id,
+          _temp_password: tempPassword && !input.password ? tempPassword : undefined,
+        });
         continue;
       }
 
-      // 3. No existe → crear
+      // 3. No existe → crear con cuenta auth
+      const tempPassword = input.password || generateTempPassword();
+      const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+        email: input.email,
+        password: tempPassword,
+        email_confirm: true,
+      });
+
+      if (authError) {
+        results.push({
+          rdn_user_id: input.rdn_user_id,
+          action: 'error',
+          error: `Error creando cuenta auth: ${authError.message}`,
+        });
+        continue;
+      }
+
       const { data: newUser, error: createError } = await supabase
         .from('users')
         .insert({
+          auth_id: authData.user.id,
           name: input.name,
           email: input.email,
           phone: input.phone ?? null,
@@ -140,6 +181,8 @@ export async function POST(req: NextRequest) {
         .single();
 
       if (createError) {
+        // Rollback: eliminar auth user
+        await supabase.auth.admin.deleteUser(authData.user.id);
         results.push({
           rdn_user_id: input.rdn_user_id,
           action: 'error',
@@ -148,7 +191,12 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      results.push({ rdn_user_id: input.rdn_user_id, action: 'created', user_id: newUser?.id });
+      results.push({
+        rdn_user_id: input.rdn_user_id,
+        action: 'created',
+        user_id: newUser?.id,
+        _temp_password: input.password ? undefined : tempPassword,
+      });
     } catch (err) {
       results.push({
         rdn_user_id: input.rdn_user_id,

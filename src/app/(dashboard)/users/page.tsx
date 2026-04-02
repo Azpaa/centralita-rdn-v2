@@ -62,7 +62,10 @@ export default function UsersPage() {
     setLoading(false);
   }, [debouncedSearch]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+  }, [load]);
 
   function openCreate() {
     setEditing(null);

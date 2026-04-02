@@ -114,9 +114,14 @@ POST /api/v1/users
   "email": "maria@rdn.com",
   "phone": "+34698765432",
   "role": "operator",
-  "rdn_user_id": "rdn-456"
+  "rdn_user_id": "rdn-456",
+  "password": "MiPassword123"
 }
 ```
+
+> Si no se envía `password`, se genera una contraseña temporal automáticamente y se devuelve en el campo `_temp_password` de la respuesta. **Esto solo ocurre en el momento de la creación** — no se puede recuperar después.
+>
+> Al crear el usuario se genera automáticamente una cuenta de autenticación (Supabase Auth) para que pueda iniciar sesión en el panel web.
 
 ### 2.3 Vincular usuario con RDN
 
@@ -178,7 +183,8 @@ POST /api/v1/users/bulk-sync
       "email": "juan@rdn.com",
       "phone": "+34612345678",
       "role": "operator",
-      "active": true
+      "active": true,
+      "password": "opcional-si-queréis-elegirla"
     },
     {
       "rdn_user_id": "rdn-002",
@@ -190,6 +196,8 @@ POST /api/v1/users/bulk-sync
   ]
 }
 ```
+
+> Si no se envía `password`, se genera una contraseña temporal. Se devuelve en `_temp_password` de cada resultado con action `created` o `linked`.
 
 **Lógica de resolución:**
 
@@ -214,7 +222,7 @@ POST /api/v1/users/bulk-sync
     },
     "results": [
       { "rdn_user_id": "rdn-001", "action": "updated", "user_id": "uuid-1" },
-      { "rdn_user_id": "rdn-002", "action": "linked", "user_id": "uuid-2" }
+      { "rdn_user_id": "rdn-002", "action": "linked", "user_id": "uuid-2", "_temp_password": "aB3k-Xm9p-Qw2z" }
     ]
   }
 }

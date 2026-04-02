@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import crypto from 'crypto';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
-import { apiSuccess, apiNotFound, apiInternalError } from '@/lib/api/response';
+import { apiSuccess, apiNotFound } from '@/lib/api/response';
 import type { WebhookSubscription } from '@/lib/types/database';
 
 interface Params {

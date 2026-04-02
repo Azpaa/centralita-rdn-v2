@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
-import { apiSuccess, apiNotFound, apiBadRequest, apiInternalError } from '@/lib/api/response';
+import { apiSuccess, apiNotFound, apiBadRequest } from '@/lib/api/response';
 import { updatePhoneNumberSchema } from '@/lib/api/validation';
 import { auditLog } from '@/lib/api/audit';
 

@@ -4,7 +4,7 @@ import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiCreated, apiBadRequest, apiConflict, apiInternalError, parsePagination, buildMeta } from '@/lib/api/response';
 import { createUserSchema } from '@/lib/api/validation';
 import { auditLog } from '@/lib/api/audit';
-import { escapeIlike } from '@/lib/api/sanitize';
+import { escapeIlike, generateTempPassword } from '@/lib/api/sanitize';
 import type { User } from '@/lib/types/database';
 
 // GET /api/v1/users — Listar usuarios
@@ -82,9 +82,23 @@ export async function POST(req: NextRequest) {
     return apiConflict('Ya existe un usuario con ese email');
   }
 
+  // Crear cuenta en Supabase Auth para que el usuario pueda hacer login
+  const tempPassword = input.password || generateTempPassword();
+  const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+    email: input.email,
+    password: tempPassword,
+    email_confirm: true, // Marca el email como confirmado directamente
+  });
+
+  if (authError) {
+    console.error('Error creating auth user:', authError);
+    return apiInternalError('No se pudo crear la cuenta de autenticación');
+  }
+
   const { data, error } = await supabase
     .from('users')
     .insert({
+      auth_id: authData.user.id,
       name: input.name,
       email: input.email,
       phone: input.phone || null,
@@ -98,11 +112,18 @@ export async function POST(req: NextRequest) {
     .single<User>();
 
   if (error) {
+    // Rollback: eliminar el usuario auth si falla la inserción en users
+    await supabase.auth.admin.deleteUser(authData.user.id);
     console.error('Error creating user:', error);
     return apiInternalError();
   }
 
   await auditLog('user.created', 'user', data.id, auth.userId, { email: input.email });
 
-  return apiCreated(data);
+  // Incluir contraseña temporal en la respuesta (solo al crear)
+  const responseData = input.password
+    ? data
+    : { ...data, _temp_password: tempPassword };
+
+  return apiCreated(responseData);
 }

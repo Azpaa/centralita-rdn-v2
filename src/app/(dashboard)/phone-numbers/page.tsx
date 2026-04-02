@@ -56,7 +56,10 @@ export default function PhoneNumbersPage() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+  }, [load]);
 
   async function handleSync() {
     setSyncing(true);
@@ -142,7 +145,7 @@ export default function PhoneNumbersPage() {
             ) : numbers.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={7} className="text-center py-8 text-muted-foreground">
-                  No hay números. Usa "Sincronizar Twilio" para importarlos.
+                  No hay números. Usa Sincronizar Twilio para importarlos.
                 </TableCell>
               </TableRow>
             ) : (
