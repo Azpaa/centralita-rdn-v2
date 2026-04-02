@@ -3,12 +3,8 @@ import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
 
-interface Params {
-  params: Promise<{ callSid: string }>;
-}
-
 /**
- * POST /api/v1/calls/:callSid/hangup
+ * POST /api/v1/calls/:id/hangup
  * Cuelga una llamada activa. Funciona para cualquier leg (agente o remoto).
  *
  * Body (opcional): { target?: 'agent' | 'remote' | 'all' }
@@ -16,11 +12,14 @@ interface Params {
  * - 'agent': Solo la leg del agente
  * - 'remote': Solo la leg remota
  */
-export async function POST(req: NextRequest, { params }: Params) {
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
 
-  const { callSid } = await params;
+  const { id: callSid } = await params;
   if (!callSid) return apiBadRequest('callSid es requerido');
 
   let body: { target?: string } = {};
@@ -36,12 +35,10 @@ export async function POST(req: NextRequest, { params }: Params) {
     const client = getTwilioClient();
 
     if (target === 'all' || target === 'agent') {
-      // Colgar la leg proporcionada
       await client.calls(callSid).update({ status: 'completed' });
     }
 
     if (target === 'all' || target === 'remote') {
-      // Buscar y colgar la leg remota
       const callInfo = await client.calls(callSid).fetch().catch(() => null);
       if (callInfo) {
         let remoteSid: string | null = null;

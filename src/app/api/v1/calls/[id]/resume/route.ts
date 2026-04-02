@@ -5,28 +5,25 @@ import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response'
 import { getTwilioClient } from '@/lib/twilio/client';
 import { emitEvent } from '@/lib/events/emitter';
 
-interface Params {
-  params: Promise<{ callSid: string }>;
-}
-
 /**
- * POST /api/v1/calls/:callSid/resume
+ * POST /api/v1/calls/:id/resume
  * Saca una llamada de espera (reconecta con el agente).
  *
  * Implementación: mueve ambas partes a una conferencia efímera.
- * Esto es más fiable que intentar re-dial porque la llamada ya está viva.
  */
-export async function POST(req: NextRequest, { params }: Params) {
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
 
-  const { callSid } = await params;
+  const { id: callSid } = await params;
   if (!callSid) return apiBadRequest('callSid es requerido');
 
   try {
     const client = getTwilioClient();
 
-    // Encontrar la leg remota
     const callInfo = await client.calls(callSid).fetch();
     let remoteSid: string;
 
@@ -44,7 +41,6 @@ export async function POST(req: NextRequest, { params }: Params) {
       remoteSid = children[0].sid;
     }
 
-    // Crear conferencia efímera para reconectar ambas partes
     const confName = `resume-${callSid}-${Date.now()}`;
 
     const confTwiml = new twilio.twiml.VoiceResponse();
@@ -59,13 +55,11 @@ export async function POST(req: NextRequest, { params }: Params) {
     );
     const confTwimlStr = confTwiml.toString();
 
-    // Mover ambas legs a la conferencia en paralelo
     await Promise.all([
       client.calls(remoteSid).update({ twiml: confTwimlStr }),
       client.calls(callSid).update({ twiml: confTwimlStr }),
     ]);
 
-    // Emitir evento
     emitEvent('call.resumed', {
       call_sid: callSid,
       remote_call_sid: remoteSid,

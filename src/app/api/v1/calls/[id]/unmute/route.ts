@@ -3,21 +3,20 @@ import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
 
-interface Params {
-  params: Promise<{ callSid: string }>;
-}
-
 /**
- * POST /api/v1/calls/:callSid/unmute
+ * POST /api/v1/calls/:id/unmute
  * Reactiva el audio de un participante muteado en una conferencia.
  *
  * Body: { conference_name: string }
  */
-export async function POST(req: NextRequest, { params }: Params) {
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
 
-  const { callSid } = await params;
+  const { id: callSid } = await params;
   if (!callSid) return apiBadRequest('callSid es requerido');
 
   let body: { conference_name?: string } = {};
