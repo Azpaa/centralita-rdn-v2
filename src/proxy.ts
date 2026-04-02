@@ -4,13 +4,15 @@ import { NextResponse, type NextRequest } from 'next/server'
 /**
  * Rutas públicas:
  * - /login: página de autenticación
+ * - /change-password: cambio de contraseña obligatorio (requiere sesión, pero
+ *   está exenta del chequeo must_change_password para no crear un loop)
  * - /api/webhooks/: webhooks de Twilio (validados con X-Twilio-Signature)
  * - /api/v1/: API REST (cada ruta tiene su propio authenticate() que acepta
  *   sesión Supabase O API key; el proxy no puede validar API keys, así que
  *   las dejamos pasar y la ruta se encarga)
  * - /api/health: healthcheck
  */
-const publicRoutes = ['/login', '/api/webhooks/', '/api/v1/', '/api/health']
+const publicRoutes = ['/login', '/change-password', '/api/webhooks/', '/api/v1/', '/api/health']
 
 function isPublicRoute(pathname: string): boolean {
   return publicRoutes.some((route) => pathname.startsWith(route))

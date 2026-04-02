@@ -122,8 +122,41 @@ POST /api/v1/users
 > Si no se envía `password`, se genera una contraseña temporal automáticamente y se devuelve en el campo `_temp_password` de la respuesta. **Esto solo ocurre en el momento de la creación** — no se puede recuperar después.
 >
 > Al crear el usuario se genera automáticamente una cuenta de autenticación (Supabase Auth) para que pueda iniciar sesión en el panel web.
+>
+> ⚠️ **Primer login**: Si se usó contraseña temporal, al entrar en el panel el usuario será redirigido automáticamente a una pantalla de cambio de contraseña. No podrá acceder al panel hasta que la cambie.
 
-### 2.3 Vincular usuario con RDN
+### 2.3 Resetear contraseña de un usuario
+
+Útil para cuando un empleado olvida su contraseña o necesita acceso de nuevo.
+
+```http
+POST /api/v1/users/{id}/reset-password
+```
+
+```json
+{
+  "password": "NuevaPassword123"
+}
+```
+
+> Si se envía body vacío o sin `password`, se genera una temporal y se devuelve en `_temp_password`.
+> Siempre activa el flag de cambio de contraseña obligatorio.
+
+**Respuesta:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "user_id": "uuid",
+    "email": "juan@rdn.com",
+    "must_change_password": true,
+    "_temp_password": "aB3k-Xm9p-Qw2z"
+  }
+}
+```
+
+### 2.4 Vincular usuario con RDN
 
 Si el usuario ya existe en la centralita (creado manualmente por admin), se puede vincular con el ID de RDN:
 
@@ -137,7 +170,7 @@ POST /api/v1/users/{id}/link-rdn
 }
 ```
 
-### 2.4 Buscar usuario por email
+### 2.5 Buscar usuario por email
 
 Útil para auto-vincular: buscar si el email del empleado RDN ya existe en la centralita.
 
@@ -166,7 +199,7 @@ POST /api/v1/users/match-email
 }
 ```
 
-### 2.5 Sincronización masiva (Bulk Sync)
+### 2.6 Sincronización masiva (Bulk Sync)
 
 Sincroniza hasta 100 usuarios en una sola llamada. **Idempotente**: se puede llamar repetidamente.
 
@@ -228,7 +261,7 @@ POST /api/v1/users/bulk-sync
 }
 ```
 
-### 2.6 Cambiar disponibilidad
+### 2.7 Cambiar disponibilidad
 
 ```http
 PATCH /api/v1/users/{id}/availability

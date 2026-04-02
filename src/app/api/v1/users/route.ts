@@ -107,6 +107,7 @@ export async function POST(req: NextRequest) {
       rdn_linked: !!input.rdn_user_id,
       available: false,
       active: true,
+      must_change_password: !input.password, // true si se generó contraseña temporal
     })
     .select()
     .single<User>();

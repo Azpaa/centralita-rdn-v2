@@ -130,6 +130,7 @@ export async function POST(req: NextRequest) {
           });
           if (!authError && authData.user) {
             updateFields.auth_id = authData.user.id;
+            updateFields.must_change_password = !input.password;
           }
         }
 
@@ -176,6 +177,7 @@ export async function POST(req: NextRequest) {
           rdn_linked: true,
           available: false,
           active: input.active,
+          must_change_password: !input.password,
         })
         .select('id')
         .single();

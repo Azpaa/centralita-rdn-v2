@@ -66,6 +66,7 @@ export type User = {
   role: UserRole;
   available: boolean;
   active: boolean;
+  must_change_password: boolean;
   rdn_user_id: string | null;
   rdn_linked: boolean;
   created_at: string;
