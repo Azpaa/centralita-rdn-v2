@@ -17,6 +17,7 @@ export async function login(formData: FormData) {
   }
 
   // Comprobar si debe cambiar contraseña
+  let mustChangePassword = false;
   const { data: { user } } = await supabase.auth.getUser();
   if (user) {
     try {
@@ -27,15 +28,13 @@ export async function login(formData: FormData) {
         .eq('auth_id', user.id)
         .single();
 
-      if (profile?.must_change_password) {
-        redirect('/change-password');
-      }
+      mustChangePassword = profile?.must_change_password === true;
     } catch {
       // Columna puede no existir aún — continuar al dashboard
     }
   }
 
-  redirect('/');
+  redirect(mustChangePassword ? '/change-password' : '/');
 }
 
 export async function changePassword(formData: FormData) {
