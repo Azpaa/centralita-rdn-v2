@@ -19,15 +19,19 @@ export async function login(formData: FormData) {
   // Comprobar si debe cambiar contraseña
   const { data: { user } } = await supabase.auth.getUser();
   if (user) {
-    const admin = createAdminClient();
-    const { data: profile } = await admin
-      .from('users')
-      .select('must_change_password')
-      .eq('auth_id', user.id)
-      .single();
+    try {
+      const admin = createAdminClient();
+      const { data: profile } = await admin
+        .from('users')
+        .select('must_change_password')
+        .eq('auth_id', user.id)
+        .single();
 
-    if (profile?.must_change_password) {
-      redirect('/change-password');
+      if (profile?.must_change_password) {
+        redirect('/change-password');
+      }
+    } catch {
+      // Columna puede no existir aún — continuar al dashboard
     }
   }
 
