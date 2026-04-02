@@ -3,6 +3,7 @@ import twilio from 'twilio';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
+import { emitEvent } from '@/lib/events/emitter';
 
 /**
  * POST /api/v1/calls/transfer
@@ -112,6 +113,14 @@ export async function POST(req: NextRequest) {
     } catch {
       // Ya estaba desconectado — OK
     }
+
+    // Emitir evento call.transferred para RDN
+    emitEvent('call.transferred', {
+      call_sid: callSid,
+      remote_call_sid: remoteCallSid,
+      destination,
+      transferred_by: auth.userId ?? 'api_key',
+    });
 
     return apiSuccess({ transferred: true, callSid: remoteCallSid, destination });
   } catch (err) {

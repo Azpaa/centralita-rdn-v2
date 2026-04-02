@@ -4,6 +4,7 @@ import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiCreated, apiBadRequest, apiConflict, apiInternalError, parsePagination, buildMeta } from '@/lib/api/response';
 import { createUserSchema } from '@/lib/api/validation';
 import { auditLog } from '@/lib/api/audit';
+import { escapeIlike } from '@/lib/api/sanitize';
 import type { User } from '@/lib/types/database';
 
 // GET /api/v1/users — Listar usuarios
@@ -32,7 +33,10 @@ export async function GET(req: NextRequest) {
   if (linked !== null) query = query.eq('rdn_linked', linked === 'true');
 
   const search = searchParams.get('search');
-  if (search) query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%`);
+  if (search) {
+    const safe = escapeIlike(search);
+    query = query.or(`name.ilike.%${safe}%,email.ilike.%${safe}%`);
+  }
 
   query = query.range(skip, skip + limit - 1);
 

@@ -1,8 +1,9 @@
 import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { createClient } from '@/lib/supabase/server';
-import { apiUnauthorized } from '@/lib/api/response';
+import { apiUnauthorized, apiForbidden } from '@/lib/api/response';
 import crypto from 'crypto';
+import type { UserRole } from '@/lib/types/database';
 
 /**
  * Resultado de la autenticación.
@@ -14,6 +15,7 @@ export interface AuthResult {
   authId: string | null; // ID en auth.users de Supabase
   authMethod: 'session' | 'api_key';
   apiKeyId?: string;
+  role?: UserRole;       // Rol del usuario (admin/operator) — null para api_key
 }
 
 /**
@@ -32,6 +34,30 @@ export async function authenticate(req: NextRequest): Promise<AuthResult | Respo
 
   // 2. Comprobar sesión Supabase
   return authenticateSession();
+}
+
+/**
+ * Verifica que el usuario autenticado tiene un rol permitido.
+ * Las API keys siempre pasan (se consideran "admin" por ser M2M).
+ * Devuelve true si ok, o Response de error si no tiene permiso.
+ */
+export function requireRole(
+  auth: AuthResult,
+  ...allowedRoles: UserRole[]
+): true | Response {
+  // API keys son M2M — siempre autorizadas (equivalen a admin)
+  if (auth.authMethod === 'api_key') return true;
+
+  // Sin rol asignado (usuario sin registro en tabla users) → denegar
+  if (!auth.role) {
+    return apiForbidden('Tu cuenta no tiene un rol asignado en el sistema');
+  }
+
+  if (!allowedRoles.includes(auth.role)) {
+    return apiForbidden(`Se requiere rol: ${allowedRoles.join(' o ')}`);
+  }
+
+  return true;
 }
 
 async function authenticateApiKey(apiKey: string): Promise<AuthResult | Response> {
@@ -79,7 +105,7 @@ async function authenticateSession(): Promise<AuthResult | Response> {
   const adminClient = createAdminClient();
   const { data: appUser } = await adminClient
     .from('users')
-    .select('id')
+    .select('id, role')
     .eq('auth_id', user.id)
     .is('deleted_at', null)
     .single();
@@ -88,6 +114,7 @@ async function authenticateSession(): Promise<AuthResult | Response> {
     userId: appUser?.id || null,
     authId: user.id,
     authMethod: 'session',
+    role: (appUser?.role as UserRole) || undefined,
   };
 }
 

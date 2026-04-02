@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { validateAndParseTwilioWebhook } from '@/lib/api/twilio-auth';
+import { emitEvent } from '@/lib/events/emitter';
 import type { RecordingStatus } from '@/lib/types/database';
 
 /**
@@ -82,6 +83,18 @@ export async function POST(req: NextRequest) {
     }
 
     console.log(`[RECORDING] Saved recording ${recordingSid} for call ${callRecord.id}`);
+
+    // Emitir evento recording.ready para RDN si la grabación está completa
+    if (mappedStatus === 'completed') {
+      emitEvent('recording.ready', {
+        recording_id: existing?.id ?? 'new',
+        recording_sid: recordingSid,
+        call_sid: callSid,
+        call_record_id: callRecord.id,
+        url: recordingUrl,
+        duration: recordingDuration,
+      });
+    }
   } catch (err) {
     console.error('[RECORDING] Error saving recording:', err);
   }

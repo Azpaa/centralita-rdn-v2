@@ -3,6 +3,7 @@ import twilio from 'twilio';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { createAdminClient } from '@/lib/supabase/admin';
+import { emitEvent } from '@/lib/events/emitter';
 import type { CallRecord, Queue } from '@/lib/types/database';
 
 /**
@@ -59,6 +60,18 @@ export async function POST(req: NextRequest) {
       duration: dialDuration, // Duración REAL de conversación
       waitTime,
     });
+
+    // Emitir evento call.completed para RDN
+    emitEvent('call.completed', {
+      call_sid: callSid,
+      direction,
+      status: 'completed',
+      duration: dialDuration,
+      wait_time: waitTime ?? null,
+      answered_at: answeredAt.toISOString(),
+      ended_at: endedAt.toISOString(),
+    });
+
     twiml.hangup();
     return twimlResponse(twiml);
   }
@@ -169,6 +182,16 @@ export async function POST(req: NextRequest) {
     endedAt: new Date().toISOString(),
     duration: 0,
   });
+
+  // Emitir evento call.missed para RDN (llamada no contestada)
+  if (direction === 'inbound') {
+    emitEvent('call.missed', {
+      call_sid: callSid,
+      direction,
+      final_status: statusMap[dialStatus] || 'no_answer',
+      queue_id: queueId ?? null,
+    });
+  }
 
   // Mensaje de despedida (solo para llamadas entrantes)
   if (direction === 'inbound') {

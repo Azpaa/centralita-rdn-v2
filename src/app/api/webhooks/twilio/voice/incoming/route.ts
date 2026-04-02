@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import twilio from 'twilio';
 import { routeIncomingCall, createCallRecord } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
+import { emitEvent } from '@/lib/events/emitter';
 
 /**
  * POST /api/webhooks/twilio/voice/incoming
@@ -56,6 +57,16 @@ export async function POST(req: NextRequest) {
       queueId: route.queue?.id ?? null,
       phoneNumberId: route.phoneNumber.id,
       twilioData: params,
+    });
+
+    // Emitir evento call.incoming para RDN
+    emitEvent('call.incoming', {
+      call_sid: callSid,
+      from: fromNumber,
+      to: toNumber,
+      queue_id: route.queue?.id ?? null,
+      phone_number_id: route.phoneNumber.id,
+      route_type: route.type,
     });
 
     // --- Número inactivo ---

@@ -18,8 +18,42 @@ export type CallStatus =
   | 'no_answer'
   | 'busy'
   | 'failed'
-  | 'canceled';
+  | 'canceled'
+  | 'forwarded'
+  | 'voicemail';
 export type RecordingStatus = 'processing' | 'completed' | 'failed' | 'deleted';
+
+// --- Nuevas tablas de integración RDN ---
+
+export type WebhookSubscription = {
+  id: string;
+  url: string;
+  secret: string;
+  events: string[];
+  active: boolean;
+  description: string | null;
+  api_key_id: string | null;
+  failure_count: number;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WebhookDeliveryLog = {
+  id: string;
+  subscription_id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+  response_status: number | null;
+  response_body: string | null;
+  error_message: string | null;
+  attempts: number;
+  max_attempts: number;
+  next_retry_at: string | null;
+  delivered: boolean;
+  created_at: string;
+};
 
 // --- Tablas (type alias, no interface, para compatibilidad con Record<string, unknown>) ---
 
@@ -279,6 +313,37 @@ export interface Database {
           details?: Record<string, unknown> | null;
         };
         Update: Partial<AuditLog>;
+        Relationships: [];
+      };
+      webhook_subscriptions: {
+        Row: WebhookSubscription;
+        Insert: Omit<WebhookSubscription, 'id' | 'created_at' | 'updated_at' | 'failure_count' | 'last_success_at' | 'last_failure_at' | 'description' | 'api_key_id'> & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+          failure_count?: number;
+          last_success_at?: string | null;
+          last_failure_at?: string | null;
+          description?: string | null;
+          api_key_id?: string | null;
+        };
+        Update: Partial<Omit<WebhookSubscription, 'id' | 'created_at'>>;
+        Relationships: [];
+      };
+      webhook_delivery_log: {
+        Row: WebhookDeliveryLog;
+        Insert: Omit<WebhookDeliveryLog, 'id' | 'created_at' | 'response_status' | 'response_body' | 'error_message' | 'attempts' | 'next_retry_at' | 'delivered'> & {
+          id?: string;
+          created_at?: string;
+          response_status?: number | null;
+          response_body?: string | null;
+          error_message?: string | null;
+          attempts?: number;
+          max_attempts?: number;
+          next_retry_at?: string | null;
+          delivered?: boolean;
+        };
+        Update: Partial<Omit<WebhookDeliveryLog, 'id' | 'created_at'>>;
         Relationships: [];
       };
     };

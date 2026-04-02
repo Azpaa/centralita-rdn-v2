@@ -4,6 +4,8 @@ import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiNotFound, apiBadRequest } from '@/lib/api/response';
 import { availabilitySchema } from '@/lib/api/validation';
 import { auditLog } from '@/lib/api/audit';
+import { emitEvent } from '@/lib/events/emitter';
+import type { User } from '@/lib/types/database';
 
 interface Params {
   params: Promise<{ id: string }>;
@@ -41,6 +43,15 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   if (error || !data) return apiNotFound('Usuario');
 
   await auditLog('user.availability_changed', 'user', id, auth.userId, {
+    available: parsed.data.available,
+  });
+
+  // Emitir evento de disponibilidad para RDN
+  const user = data as User;
+  emitEvent(parsed.data.available ? 'agent.available' : 'agent.unavailable', {
+    user_id: id,
+    rdn_user_id: user.rdn_user_id ?? null,
+    name: user.name,
     available: parsed.data.available,
   });
 

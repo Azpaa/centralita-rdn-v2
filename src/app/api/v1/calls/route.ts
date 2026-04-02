@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiInternalError, parsePagination, buildMeta } from '@/lib/api/response';
+import { escapeIlike } from '@/lib/api/sanitize';
 import type { CallDirection, CallStatus } from '@/lib/types/database';
 
 // GET /api/v1/calls — Listar llamadas con filtros
@@ -29,10 +30,10 @@ export async function GET(req: NextRequest) {
   if (queueId) query = query.eq('queue_id', queueId);
 
   const fromNumber = searchParams.get('from_number');
-  if (fromNumber) query = query.ilike('from_number', `%${fromNumber}%`);
+  if (fromNumber) query = query.ilike('from_number', `%${escapeIlike(fromNumber)}%`);
 
   const toNumber = searchParams.get('to_number');
-  if (toNumber) query = query.ilike('to_number', `%${toNumber}%`);
+  if (toNumber) query = query.ilike('to_number', `%${escapeIlike(toNumber)}%`);
 
   const dateFrom = searchParams.get('date_from');
   if (dateFrom) query = query.gte('started_at', dateFrom);
