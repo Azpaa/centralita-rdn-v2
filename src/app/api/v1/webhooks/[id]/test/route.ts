@@ -34,8 +34,10 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (error || !sub) return apiNotFound('Suscripción webhook');
 
   const subscription = sub as WebhookSubscription;
+  const eventId = crypto.randomUUID();
 
   const payload = {
+    event_id: eventId,
     event: 'test.ping',
     timestamp: new Date().toISOString(),
     data: {
@@ -62,6 +64,7 @@ export async function POST(req: NextRequest, { params }: Params) {
         'Content-Type': 'application/json',
         'X-Centralita-Signature': `sha256=${signature}`,
         'X-Centralita-Event': 'test.ping',
+        'X-Centralita-Event-Id': eventId,
         'X-Centralita-Delivery-Id': deliveryId,
         'X-Centralita-Timestamp': payload.timestamp,
         'User-Agent': 'Centralita-RDN/2.0',
@@ -76,6 +79,7 @@ export async function POST(req: NextRequest, { params }: Params) {
 
     return apiSuccess({
       test: true,
+      event_id: eventId,
       delivery_id: deliveryId,
       url: subscription.url,
       response_status: response.status,
@@ -86,6 +90,7 @@ export async function POST(req: NextRequest, { params }: Params) {
     const message = err instanceof Error ? err.message : 'Error desconocido';
     return apiSuccess({
       test: true,
+      event_id: eventId,
       delivery_id: deliveryId,
       url: subscription.url,
       response_status: null,

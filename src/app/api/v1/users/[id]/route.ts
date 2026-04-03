@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { authenticate, isAuthenticated } from '@/lib/api/auth';
+import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
 import { apiSuccess, apiNotFound, apiBadRequest, apiInternalError, apiNoContent } from '@/lib/api/response';
 import { updateUserSchema } from '@/lib/api/validation';
 import { auditLog } from '@/lib/api/audit';
@@ -13,6 +13,8 @@ interface Params {
 export async function GET(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
+  const roleCheck = requireRole(auth, 'admin');
+  if (roleCheck !== true) return roleCheck;
 
   const { id } = await params;
   const supabase = createAdminClient();
@@ -33,6 +35,8 @@ export async function GET(req: NextRequest, { params }: Params) {
 export async function PUT(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
+  const roleCheck = requireRole(auth, 'admin');
+  if (roleCheck !== true) return roleCheck;
 
   const { id } = await params;
   let body: unknown;
@@ -68,6 +72,8 @@ export async function PUT(req: NextRequest, { params }: Params) {
 export async function DELETE(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
+  const roleCheck = requireRole(auth, 'admin');
+  if (roleCheck !== true) return roleCheck;
 
   const { id } = await params;
   const supabase = createAdminClient();

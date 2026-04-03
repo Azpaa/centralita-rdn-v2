@@ -1,289 +1,177 @@
-# Guía de Integración — Centralita RDN → Sistema RDN
+﻿# Guia contractual de integracion - Centralita <-> RDN
 
-> **Versión**: 2.0  
-> **Base URL**: `https://centralita.reparacionesdelnorte.es`  
-> **Formato**: JSON sobre HTTPS  
-> **Autenticación**: API Key (Bearer token)
+> Version contrato: 2.1
+> Estado: Canónico (externo para RDN)
+> Base URL: `https://centralita.reparacionesdelnorte.es`
+> Formato: JSON sobre HTTPS
+> Auth M2M: `Authorization: Bearer ck_...`
 
----
+## 0. Alcance y documento canónico
 
-## Índice
+Este archivo es el **unico contrato externo** para el equipo RDN.
 
-1. [Autenticación](#1-autenticación)
-2. [Gestión de Usuarios](#2-gestión-de-usuarios)
-3. [Control de Llamadas](#3-control-de-llamadas)
-4. [Historial y Grabaciones](#4-historial-y-grabaciones)
-5. [Sistema de Webhooks (Eventos)](#5-sistema-de-webhooks-eventos)
-6. [Estadísticas](#6-estadísticas)
-7. [Verificación de Firma de Webhooks](#7-verificación-de-firma-de-webhooks)
-8. [Errores y Códigos de Respuesta](#8-errores-y-códigos-de-respuesta)
-9. [Ejemplos Completos](#9-ejemplos-completos)
+- Fuente canónica: `docs/rdn-api-guide.md`
+- Cualquier otro documento del repo se considera interno/no contractual.
 
----
+## 1. Modelo de integracion recomendado
 
-## 1. Autenticación
+Modelo productivo recomendado: **hibrido API + Webhooks + reconciliacion**.
 
-Todas las peticiones a la API requieren un **API Key** en la cabecera `Authorization`.
+- RDN -> Centralita (comandos/consultas): API REST `/api/v1/*`
+- Centralita -> RDN (tiempo casi real): Webhooks firmados
+- Reconciliacion: polling periodico de `/api/v1/calls` y `/api/v1/recordings`
 
-```http
-Authorization: Bearer ck_a1b2c3d4e5f6...
-```
+No usar acceso directo a tablas de Supabase como contrato de integracion.
 
-### Obtener API Key
+## 2. Autenticacion
 
-El administrador de la centralita os proporcionará un API Key. El key tiene formato `ck_<hex>`.
+### 2.1 API REST (RDN -> Centralita)
 
-### Ejemplo con cURL
-
-```bash
-curl -X GET "https://centralita.reparacionesdelnorte.es/api/v1/users" \
-  -H "Authorization: Bearer ck_YOUR_API_KEY_HERE" \
-  -H "Content-Type: application/json"
-```
-
-### Respuesta cuando el key es inválido
-
-```json
-{
-  "error": {
-    "code": "UNAUTHORIZED",
-    "message": "API key inválida o desactivada"
-  }
-}
-```
-
----
-
-## 2. Gestión de Usuarios
-
-### 2.1 Listar usuarios
+Cabecera requerida:
 
 ```http
-GET /api/v1/users?page=1&limit=50&active=true&available=true&rdn_linked=true&search=Juan
+Authorization: Bearer ck_xxxxxxxxx
 ```
 
-**Parámetros de query:**
+Notas:
+- Las API keys M2M son tratadas como rol admin en backend.
+- Si la key es invalida o esta inactiva: `401 UNAUTHORIZED`.
 
-| Parámetro | Tipo | Descripción |
-|---|---|---|
-| `page` | number | Página (default: 1) |
-| `limit` | number | Registros por página (default: 50, max: 100) |
-| `active` | boolean | Filtrar por activo/inactivo |
-| `available` | boolean | Filtrar por disponible/no disponible |
-| `rdn_linked` | boolean | Filtrar por vinculados a RDN |
-| `search` | string | Buscar por nombre o email |
+### 2.2 Webhooks (Centralita -> RDN)
 
-**Respuesta:**
+Cada webhook incluye firma HMAC-SHA256:
 
-```json
-{
-  "ok": true,
-  "data": [
-    {
-      "id": "uuid",
-      "name": "Juan García",
-      "email": "juan@rdn.com",
-      "phone": "+34612345678",
-      "role": "operator",
-      "available": true,
-      "active": true,
-      "rdn_user_id": "rdn-123",
-      "rdn_linked": true,
-      "created_at": "2025-01-15T10:00:00Z",
-      "updated_at": "2025-06-01T12:00:00Z"
-    }
-  ],
-  "meta": {
-    "page": 1,
-    "limit": 50,
-    "total": 15,
-    "totalPages": 1
-  }
-}
-```
+- `X-Centralita-Signature: sha256=<hex>`
+- Secret entregado en `POST /api/v1/webhooks` (solo una vez)
 
-### 2.2 Crear usuario
+Validar firma sobre el body raw (sin parsear).
+
+## 3. Politica de entrega de eventos
+
+### 3.1 Garantias reales
+
+Entrega: **at-least-once**.
+
+RDN debe asumir:
+- Posibles duplicados
+- Posible desorden entre eventos
+- Reintentos ante timeout o no-2xx
+
+### 3.2 IDs para idempotencia
+
+Cada delivery incluye:
+
+- `delivery_id` (header): estable para la misma entrega y sus reintentos
+- `event_id` (payload/header): estable para el evento logico
+
+Cabeceras:
 
 ```http
-POST /api/v1/users
+X-Centralita-Event: call.completed
+X-Centralita-Event-Id: <uuid>
+X-Centralita-Delivery-Id: <uuid>
+X-Centralita-Timestamp: 2026-04-03T10:05:30.000Z
 ```
 
-```json
-{
-  "name": "María López",
-  "email": "maria@rdn.com",
-  "phone": "+34698765432",
-  "role": "operator",
-  "rdn_user_id": "rdn-456",
-  "password": "MiPassword123"
-}
-```
+Recomendacion RDN:
+- deduplicar por `delivery_id` (tecnico)
+- proteger negocio por `event_id` + `event` + entidad (`call_sid`)
 
-> Si no se envía `password`, se genera una contraseña temporal automáticamente y se devuelve en el campo `_temp_password` de la respuesta. **Esto solo ocurre en el momento de la creación** — no se puede recuperar después.
->
-> Al crear el usuario se genera automáticamente una cuenta de autenticación (Supabase Auth) para que pueda iniciar sesión en el panel web.
->
-> ⚠️ **Primer login**: Si se usó contraseña temporal, al entrar en el panel el usuario será redirigido automáticamente a una pantalla de cambio de contraseña. No podrá acceder al panel hasta que la cambie.
+### 3.3 Retries (persistentes)
 
-### 2.3 Resetear contraseña de un usuario
+Estrategia actual:
+- Intento inicial inmediato
+- Reintentos persistidos en DB (`webhook_delivery_log.next_retry_at`)
+- Backoff: `10s`, `60s`, `300s`
+- Max intentos por delivery: `4` (1 inicial + 3 retries)
+- Auto-desactivacion de suscripcion al llegar a 50 fallos consecutivos
 
-Útil para cuando un empleado olvida su contraseña o necesita acceso de nuevo.
+Endpoint operativo para worker/cron:
 
 ```http
-POST /api/v1/users/{id}/reset-password
+POST /api/v1/webhooks/retry-deliveries
 ```
+
+Body opcional:
 
 ```json
-{
-  "password": "NuevaPassword123"
-}
+{ "limit": 100 }
 ```
 
-> Si se envía body vacío o sin `password`, se genera una temporal y se devuelve en `_temp_password`.
-> Siempre activa el flag de cambio de contraseña obligatorio.
+Recomendacion operativa: ejecutar este endpoint cada 1 minuto (cron).
 
-**Respuesta:**
+## 4. Semantica de IDs (obligatorio)
 
-```json
-{
-  "ok": true,
-  "data": {
-    "user_id": "uuid",
-    "email": "juan@rdn.com",
-    "must_change_password": true,
-    "_temp_password": "aB3k-Xm9p-Qw2z"
-  }
-}
-```
+### 4.1 `call_sid` (Twilio Call SID, prefijo `CA`)
 
-### 2.4 Vincular usuario con RDN
+Uso:
+- Control operativo en caliente (hangup/hold/resume/mute/unmute/transfer)
+- Correlacion en eventos de llamada
 
-Si el usuario ya existe en la centralita (creado manualmente por admin), se puede vincular con el ID de RDN:
+### 4.2 `call_record_id` (UUID interno)
 
-```http
-POST /api/v1/users/{id}/link-rdn
-```
+Uso:
+- Persistencia e historico en DB
+- Consultas de detalle por API (`GET /api/v1/calls/{call_record_id}`)
+- Correlacion de grabaciones internas
 
-```json
-{
-  "rdn_user_id": "rdn-456"
-}
-```
+### 4.3 `recording_id` (UUID interno) y `recording_sid` (Twilio `RE...`)
 
-### 2.5 Buscar usuario por email
+Uso:
+- `recording_id`: ID interno de tabla `recordings`
+- `recording_sid`: referencia Twilio
 
-Útil para auto-vincular: buscar si el email del empleado RDN ya existe en la centralita.
+### 4.4 Regla practica para RDN
 
-```http
-POST /api/v1/users/match-email
-```
+- Para mandar comandos en tiempo real: usar `call_sid`
+- Para consultar/guardar historico: usar `call_record_id`
+- Para grabaciones: guardar ambos (`recording_id`, `recording_sid`)
 
-```json
-{
-  "email": "maria@rdn.com"
-}
-```
+## 5. Endpoints contractuales (RDN)
 
-**Respuesta:**
+## 5.1 Usuarios
 
-```json
-{
-  "ok": true,
-  "data": {
-    "id": "uuid",
-    "name": "María López",
-    "email": "maria@rdn.com",
-    "rdn_user_id": null,
-    "rdn_linked": false
-  }
-}
-```
+### POST `/api/v1/users/bulk-sync`
+Sincronizacion masiva idempotente (max 100 usuarios por batch).
 
-### 2.6 Sincronización masiva (Bulk Sync)
-
-Sincroniza hasta 100 usuarios en una sola llamada. **Idempotente**: se puede llamar repetidamente.
-
-```http
-POST /api/v1/users/bulk-sync
-```
+Body:
 
 ```json
 {
   "users": [
     {
       "rdn_user_id": "rdn-001",
-      "name": "Juan García",
+      "name": "Juan Garcia",
       "email": "juan@rdn.com",
-      "phone": "+34612345678",
+      "phone": "+34600000001",
       "role": "operator",
       "active": true,
-      "password": "opcional-si-queréis-elegirla"
-    },
-    {
-      "rdn_user_id": "rdn-002",
-      "name": "Ana Martín",
-      "email": "ana@rdn.com",
-      "role": "operator",
-      "active": true
+      "password": "opcional"
     }
   ]
 }
 ```
 
-> Si no se envía `password`, se genera una contraseña temporal. Se devuelve en `_temp_password` de cada resultado con action `created` o `linked`.
+Notas:
+- Si no se envia `password`, se genera temporal.
+- En `results`, `_temp_password` solo aparece cuando aplica.
 
-**Lógica de resolución:**
+### POST `/api/v1/users/match-email`
+Buscar usuario existente por email para vincular.
 
-| Caso | Acción |
-|---|---|
-| `rdn_user_id` ya existe | Actualiza nombre, email, phone, role, active |
-| `rdn_user_id` no existe pero `email` coincide | Vincula + actualiza |
-| Nada coincide | Crea nuevo usuario |
+### POST `/api/v1/users/{user_id}/link-rdn`
+Vincular usuario existente con `rdn_user_id`.
 
-**Respuesta:**
+### PATCH `/api/v1/users/{user_id}/availability`
+Cambiar disponibilidad del agente.
+Emite `agent.available` o `agent.unavailable`.
 
-```json
-{
-  "ok": true,
-  "data": {
-    "summary": {
-      "total": 2,
-      "created": 0,
-      "updated": 1,
-      "linked": 1,
-      "errors": 0
-    },
-    "results": [
-      { "rdn_user_id": "rdn-001", "action": "updated", "user_id": "uuid-1" },
-      { "rdn_user_id": "rdn-002", "action": "linked", "user_id": "uuid-2", "_temp_password": "aB3k-Xm9p-Qw2z" }
-    ]
-  }
-}
-```
+## 5.2 Llamadas salientes y control
 
-### 2.7 Cambiar disponibilidad
+### POST `/api/v1/calls/dial`
+Inicia llamada saliente.
 
-```http
-PATCH /api/v1/users/{id}/availability
-```
-
-```json
-{
-  "available": true
-}
-```
-
-> ⚡ Este endpoint emite un evento `agent.available` o `agent.unavailable` hacia vuestros webhooks.
-
----
-
-## 3. Control de Llamadas
-
-### 3.1 Iniciar llamada saliente
-
-```http
-POST /api/v1/calls/dial
-```
+Body:
 
 ```json
 {
@@ -292,500 +180,310 @@ POST /api/v1/calls/dial
 }
 ```
 
-> `from_number` debe ser un número Twilio activo en la centralita.
+### POST `/api/v1/calls/{call_sid}/hangup`
+Cuelga llamada.
 
-**Respuesta:**
+Body opcional:
+
+```json
+{ "target": "all" }
+```
+
+Valores:
+- `all` (default): cuelga ambas legs
+- `agent`: cuelga solo leg `call_sid`
+- `remote`: cuelga solo la otra leg
+
+### POST `/api/v1/calls/{call_sid}/hold`
+Pone en espera la otra leg.
+
+Body opcional:
+
+```json
+{ "music_url": "https://.../hold.mp3" }
+```
+
+### POST `/api/v1/calls/{call_sid}/resume`
+Saca de espera reconectando ambas legs via conferencia efimera.
+
+Body: vacio.
+
+### POST `/api/v1/calls/{call_sid}/mute`
+Silencia participante en conferencia.
+
+Body obligatorio:
+
+```json
+{ "conference_name": "conf-abc" }
+```
+
+No soportado para llamada directa no-conferencia.
+
+### POST `/api/v1/calls/{call_sid}/unmute`
+Reactiva audio de participante en conferencia.
+
+Body obligatorio:
+
+```json
+{ "conference_name": "conf-abc" }
+```
+
+### POST `/api/v1/calls/transfer`
+Transferencia en frio.
+
+Body:
 
 ```json
 {
-  "ok": true,
-  "data": {
-    "call_sid": "CAxxxxxx",
-    "call_record_id": "uuid",
-    "status": "initiated",
-    "from": "+34848819410",
-    "to": "+34612345678"
-  }
-}
-```
-
-### 3.2 Colgar llamada
-
-```http
-POST /api/v1/calls/{callSid}/hangup
-```
-
-```json
-{
-  "target": "all"
-}
-```
-
-| Target | Efecto |
-|---|---|
-| `all` (default) | Cuelga todas las partes |
-| `agent` | Solo desconecta al agente |
-| `remote` | Solo desconecta al llamante/destinatario |
-
-### 3.3 Poner en espera
-
-```http
-POST /api/v1/calls/{callSid}/hold
-```
-
-```json
-{
-  "music_url": "https://example.com/hold-music.mp3"
-}
-```
-
-> El campo `music_url` es opcional. Si no se proporciona, usa música clásica por defecto.
-
-### 3.4 Sacar de espera
-
-```http
-POST /api/v1/calls/{callSid}/resume
-```
-
-(Body vacío)
-
-### 3.5 Transferir llamada
-
-```http
-POST /api/v1/calls/transfer
-```
-
-```json
-{
-  "callSid": "CAxxxxxx",
-  "destination": "+34698765432",
+  "callSid": "CAxxxxxxxx",
+  "destination": "+34612345678",
   "callerId": "+34848819410"
 }
 ```
 
-> Para transferir a un agente del navegador, usar `destination: "client:UUID_DEL_USUARIO"`.
+Tambien soporta destino navegador: `"destination": "client:<user_id>"`.
 
-### 3.6 Conferencia a 3 vías
+## 5.3 Consultas de historico
 
-```http
-POST /api/v1/calls/conference
-```
+### GET `/api/v1/calls`
+Lista llamadas (filtros por estado, direccion, fechas, numeros, etc.).
 
-| Acción | Body |
-|---|---|
-| Crear conferencia | `{ "action": "create", "conferenceName": "conf-1", "callSid": "CAxx" }` |
-| Añadir participante | `{ "action": "add", "conferenceName": "conf-1", "destination": "+34...", "callerId": "+34..." }` |
-| Agente sale | `{ "action": "leave", "conferenceName": "conf-1", "participantSid": "CAxx" }` |
-| Expulsar participante | `{ "action": "kick", "conferenceName": "conf-1", "participantSid": "CAxx" }` |
+### GET `/api/v1/calls/{call_record_id}`
+Detalle de llamada + grabaciones + usuario que atendio.
 
----
+### GET `/api/v1/recordings`
+Lista grabaciones.
 
-## 4. Historial y Grabaciones
+### GET `/api/v1/recordings/{recording_id}`
+Detalle de grabacion.
 
-### 4.1 Listar llamadas
+## 5.4 Webhooks de suscripcion
 
-```http
-GET /api/v1/calls?direction=inbound&status=completed&date_from=2025-06-01T00:00:00Z&limit=20
-```
+### POST `/api/v1/webhooks`
+Crear suscripcion webhook.
 
-**Filtros disponibles:**
-
-| Parámetro | Tipo | Descripción |
-|---|---|---|
-| `direction` | `inbound` / `outbound` | Dirección |
-| `status` | `ringing`, `in_queue`, `in_progress`, `completed`, `no_answer`, `busy`, `failed`, `canceled`, `forwarded`, `voicemail` | Estado |
-| `queue_id` | uuid | Cola que procesó la llamada |
-| `from_number` | string | Buscar por número de origen (parcial) |
-| `to_number` | string | Buscar por número de destino (parcial) |
-| `date_from` | ISO 8601 | Desde fecha |
-| `date_to` | ISO 8601 | Hasta fecha |
-| `answered_by_user_id` | uuid | Quién contestó |
-
-### 4.2 Detalle de llamada
-
-```http
-GET /api/v1/calls/{id}
-```
-
-**Respuesta:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "id": "uuid",
-    "twilio_call_sid": "CAxxxxxx",
-    "direction": "inbound",
-    "from_number": "+34612345678",
-    "to_number": "+34848819410",
-    "status": "completed",
-    "started_at": "2025-06-01T10:00:00Z",
-    "answered_at": "2025-06-01T10:00:15Z",
-    "ended_at": "2025-06-01T10:05:30Z",
-    "duration": 315,
-    "wait_time": 15,
-    "queue_id": "uuid",
-    "answered_by_user_id": "uuid",
-    "answered_by_user": {
-      "id": "uuid",
-      "name": "Juan García",
-      "email": "juan@rdn.com"
-    },
-    "recordings": [
-      {
-        "id": "uuid",
-        "url": "https://api.twilio.com/2010-04-01/Accounts/.../Recordings/RExx",
-        "duration": 315,
-        "status": "completed"
-      }
-    ]
-  }
-}
-```
-
-### 4.3 Listar grabaciones
-
-```http
-GET /api/v1/recordings?limit=20
-```
-
----
-
-## 5. Sistema de Webhooks (Eventos)
-
-La centralita envía eventos HTTP POST a los endpoints que registréis. Esto permite que RDN reaccione en **tiempo real** a llamadas, cambios de disponibilidad, etc.
-
-### 5.1 Crear suscripción
-
-```http
-POST /api/v1/webhooks
-```
+Body:
 
 ```json
 {
   "url": "https://rdn.example.com/webhooks/centralita",
   "events": ["call.*", "agent.*", "recording.ready"],
-  "description": "Webhook principal RDN"
+  "description": "RDN main webhook"
 }
 ```
 
-**Respuesta (⚠️ el `secret` solo se muestra aquí):**
+Respuesta devuelve `secret` solo en esta llamada.
 
-```json
-{
-  "ok": true,
-  "data": {
-    "id": "uuid",
-    "url": "https://rdn.example.com/webhooks/centralita",
-    "secret": "whsec_a1b2c3d4e5f6...",
-    "events": ["call.*", "agent.*", "recording.ready"],
-    "active": true,
-    "description": "Webhook principal RDN",
-    "created_at": "2025-06-01T12:00:00Z"
-  }
-}
-```
+### GET `/api/v1/webhooks`
+Lista suscripciones.
 
-> ⚠️ **Guardad el `secret`**. Se necesita para verificar la firma de los eventos entrantes. No se puede recuperar después.
+### GET `/api/v1/webhooks/{id}`
+Detalle + ultimas entregas.
 
-### 5.2 Patrones de eventos
+### PUT `/api/v1/webhooks/{id}`
+Actualiza URL/eventos/active/description.
+Valida patrones de eventos.
 
-| Patrón | Coincide con |
-|---|---|
-| `*` | Todos los eventos |
-| `call.*` | Todos los eventos de llamadas |
-| `agent.*` | Todos los eventos de agentes |
-| `recording.*` | Todos los eventos de grabaciones |
-| `call.answered` | Solo evento específico |
+### DELETE `/api/v1/webhooks/{id}`
+Elimina suscripcion.
 
-### 5.3 Catálogo de eventos
+### POST `/api/v1/webhooks/{id}/test`
+Envia evento `test.ping` firmado.
 
-#### Llamadas
+## 6. Catalogo de eventos (contrato)
 
-| Evento | Cuándo | Datos |
-|---|---|---|
-| `call.incoming` | Llamada entrante recibida | `call_sid`, `from`, `to`, `queue_id`, `phone_number_id` |
-| `call.answered` | *(futuro — integrar con whisper)* | |
-| `call.completed` | Llamada finalizada exitosamente | `call_sid`, `direction`, `duration`, `wait_time`, `answered_at`, `ended_at` |
-| `call.missed` | Nadie contestó | `call_sid`, `direction`, `final_status`, `queue_id` |
-| `call.transferred` | Transferida a otro destino | `call_sid`, `remote_call_sid`, `destination`, `transferred_by` |
-| `call.hold` | Puesta en espera | `call_sid`, `remote_call_sid`, `by_user_id` |
-| `call.resumed` | Sacada de espera | `call_sid`, `remote_call_sid`, `by_user_id` |
+## 6.1 Eventos operativos hoy (contractuales)
 
-#### Agentes
+| Evento | Estado | Cuando se emite | Campos principales |
+|---|---|---|---|
+| `call.incoming` | Operativo | Entrada de llamada | `call_sid`, `from`, `to`, `queue_id`, `phone_number_id`, `route_type` |
+| `call.completed` | Operativo | Dial finaliza con conversacion | `call_sid`, `direction`, `status`, `duration`, `wait_time`, `answered_at`, `ended_at` |
+| `call.missed` | Operativo | Llamada inbound no contestada/fallida | `call_sid`, `direction`, `final_status`, `queue_id` |
+| `call.transferred` | Operativo | Transferencia ejecutada | `call_sid`, `remote_call_sid`, `destination`, `transferred_by` |
+| `call.hold` | Operativo | Se pone en espera | `call_sid`, `remote_call_sid`, `by_user_id` |
+| `call.resumed` | Operativo | Se saca de espera | `call_sid`, `remote_call_sid`, `by_user_id` |
+| `agent.available` | Operativo | Cambio disponibilidad a true | `user_id`, `rdn_user_id`, `name`, `available` |
+| `agent.unavailable` | Operativo | Cambio disponibilidad a false | `user_id`, `rdn_user_id`, `name`, `available` |
+| `recording.ready` | Operativo | Grabacion completada | `recording_id`, `recording_sid`, `call_sid`, `call_record_id`, `url`, `duration` |
 
-| Evento | Cuándo | Datos |
-|---|---|---|
-| `agent.available` | Agente marcó disponible | `user_id`, `rdn_user_id`, `name` |
-| `agent.unavailable` | Agente marcó no disponible | `user_id`, `rdn_user_id`, `name` |
+## 6.2 Eventos reservados/futuros (no contractuales hoy)
 
-#### Grabaciones
+Estos patrones pueden existir en validacion de suscripcion, pero **no deben asumirse activos**:
 
-| Evento | Cuándo | Datos |
-|---|---|---|
-| `recording.ready` | Grabación procesada y disponible | `recording_id`, `call_sid`, `call_record_id`, `url`, `duration` |
+- `call.ringing`
+- `call.answered`
+- `agent.online`
+- `agent.offline`
+- `agent.busy`
 
-### 5.4 Formato del webhook entrante
+## 7. Formato webhook
 
-Cada POST que recibáis tendrá esta estructura:
+Headers:
 
-**Cabeceras:**
-
-```
+```http
 Content-Type: application/json
-X-Centralita-Signature: sha256=a1b2c3d4e5f6...
+X-Centralita-Signature: sha256=<hex>
 X-Centralita-Event: call.completed
-X-Centralita-Delivery-Id: uuid
-X-Centralita-Timestamp: 2025-06-01T10:05:30Z
+X-Centralita-Event-Id: <uuid>
+X-Centralita-Delivery-Id: <uuid>
+X-Centralita-Timestamp: 2026-04-03T10:05:30.000Z
 User-Agent: Centralita-RDN/2.0
 ```
 
-**Body:**
+Body:
 
 ```json
 {
+  "event_id": "f43f8f04-3c7e-4d1b-9d8d-4cd9a3b6a9e0",
   "event": "call.completed",
-  "timestamp": "2025-06-01T10:05:30Z",
+  "timestamp": "2026-04-03T10:05:30.000Z",
   "data": {
-    "call_sid": "CAxxxxxx",
+    "call_sid": "CAxxxxxxxx",
     "direction": "inbound",
+    "status": "completed",
     "duration": 315,
     "wait_time": 15,
-    "answered_at": "2025-06-01T10:00:15Z",
-    "ended_at": "2025-06-01T10:05:30Z"
+    "answered_at": "2026-04-03T10:00:15.000Z",
+    "ended_at": "2026-04-03T10:05:30.000Z"
   }
 }
 ```
 
-### 5.5 Probar webhook
+## 8. Canonical Call Completion Contract
 
-```http
-POST /api/v1/webhooks/{id}/test
-```
+## 8.1 Cierre funcional de llamada
 
-Envía un evento `test.ping` al endpoint para verificar que funciona.
+Para RDN, una llamada queda cerrada por uno de estos eventos:
 
-### 5.6 Reintentos
+- `call.completed` -> hubo conversacion
+- `call.missed` -> inbound no atendida/fallida
 
-Si vuestro endpoint devuelve un error (non-2xx o timeout), la centralita reintenta:
+Siempre almacenar `call_sid` y reconciliar con `/api/v1/calls` para cierre definitivo.
 
-| Intento | Delay |
-|---|---|
-| 1 (original) | Inmediato |
-| 2 | 10 segundos |
-| 3 | 60 segundos |
-| 4 | 5 minutos |
+## 8.2 Campos obligatorios de cierre
 
-Tras 50 fallos consecutivos, la suscripción se desactiva automáticamente.
+Para `call.completed`:
+- Obligatorios: `call_sid`, `direction`, `status`, `ended_at`
+- Normalmente presentes: `duration`, `wait_time`, `answered_at`
 
----
+Para `call.missed`:
+- Obligatorios: `call_sid`, `direction`, `final_status`
+- Opcional: `queue_id`
 
-## 6. Estadísticas
+## 9. Recording Availability Contract
 
-```http
-GET /api/v1/stats/summary
-```
+Evento de disponibilidad de grabacion: `recording.ready`.
 
-```json
-{
-  "ok": true,
-  "data": {
-    "calls_today": 42,
-    "active_calls": 3,
-    "available_users": 5,
-    "total_users": 12
-  }
-}
-```
+Campos:
+- `recording_id`: UUID interno (puede ser null solo si hubo inconsistencia puntual de persistencia)
+- `recording_sid`: SID Twilio
+- `call_sid`: SID de llamada
+- `call_record_id`: UUID de llamada
+- `url`, `duration`
 
----
+Regla de consumo:
+- Usar `recording_id` cuando exista
+- Si llega null, usar `recording_sid + call_record_id` como clave temporal y reconciliar via `/api/v1/recordings`
 
-## 7. Verificación de Firma de Webhooks
+## 10. Errores y codigos
 
-Para verificar que un webhook viene realmente de la centralita:
-
-### Node.js
-
-```javascript
-const crypto = require('crypto');
-
-function verifyWebhook(rawBody, secret, signatureHeader) {
-  const expectedSignature = crypto
-    .createHmac('sha256', secret)
-    .update(rawBody)
-    .digest('hex');
-  
-  const receivedSignature = signatureHeader.replace('sha256=', '');
-  
-  return crypto.timingSafeEqual(
-    Buffer.from(expectedSignature),
-    Buffer.from(receivedSignature)
-  );
-}
-
-// En vuestro endpoint:
-app.post('/webhooks/centralita', (req, res) => {
-  const rawBody = req.rawBody; // body sin parsear
-  const signature = req.headers['x-centralita-signature'];
-  const secret = 'whsec_xxxxx'; // el secret que os dimos al crear la suscripción
-  
-  if (!verifyWebhook(rawBody, secret, signature)) {
-    return res.status(401).send('Firma inválida');
-  }
-  
-  const event = JSON.parse(rawBody);
-  console.log('Evento recibido:', event.event, event.data);
-  
-  // Procesar el evento...
-  
-  res.status(200).send('OK');
-});
-```
-
-### Python
-
-```python
-import hmac
-import hashlib
-
-def verify_webhook(raw_body: bytes, secret: str, signature_header: str) -> bool:
-    expected = hmac.new(
-        secret.encode(), raw_body, hashlib.sha256
-    ).hexdigest()
-    received = signature_header.replace('sha256=', '')
-    return hmac.compare_digest(expected, received)
-```
-
-### PHP
-
-```php
-function verifyWebhook(string $rawBody, string $secret, string $signatureHeader): bool {
-    $expected = hash_hmac('sha256', $rawBody, $secret);
-    $received = str_replace('sha256=', '', $signatureHeader);
-    return hash_equals($expected, $received);
-}
-```
-
-### C#
-
-```csharp
-using System.Security.Cryptography;
-using System.Text;
-
-bool VerifyWebhook(string rawBody, string secret, string signatureHeader)
-{
-    using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
-    var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(rawBody));
-    var expected = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
-    var received = signatureHeader.Replace("sha256=", "");
-    return expected == received;
-}
-```
-
----
-
-## 8. Errores y Códigos de Respuesta
-
-| HTTP Status | Código | Significado |
+| HTTP | code | Significado |
 |---|---|---|
-| 200 | - | Éxito |
-| 201 | - | Recurso creado |
-| 204 | - | Sin contenido (DELETE exitoso) |
-| 400 | `BAD_REQUEST` | Datos inválidos |
-| 401 | `UNAUTHORIZED` | API key inválida o no proporcionada |
-| 403 | `FORBIDDEN` | No tiene permiso para esta acción |
-| 404 | `NOT_FOUND` | Recurso no encontrado |
-| 409 | `CONFLICT` | Conflicto (ej: email duplicado) |
-| 500 | `INTERNAL_ERROR` | Error interno del servidor |
+| 200 | - | Exito |
+| 201 | - | Creado |
+| 204 | - | Sin contenido |
+| 400 | `BAD_REQUEST` | Datos invalidos |
+| 401 | `UNAUTHORIZED` | Auth invalida |
+| 403 | `FORBIDDEN` | Rol insuficiente |
+| 404 | `NOT_FOUND` | Recurso no existe |
+| 409 | `CONFLICT` | Conflicto de datos |
+| 500 | `INTERNAL_ERROR` | Error interno |
 
-**Formato de error:**
+Formato error:
 
 ```json
 {
   "error": {
     "code": "BAD_REQUEST",
-    "message": "Datos de validación inválidos",
+    "message": "Datos invalidos",
     "details": {
-      "email": ["Email no válido"]
+      "field": ["motivo"]
     }
   }
 }
 ```
 
----
+Todas las respuestas API incluyen header `X-Request-Id`.
 
-## 9. Ejemplos Completos
+## 11. Seguridad operativa minima
 
-### Flujo completo: Sincronizar usuarios + suscribir webhooks
+## 11.1 API keys
+
+Recomendado:
+- Rotacion periodica (ej. cada 90 dias)
+- Revocacion inmediata si sospecha de fuga
+- Una key por integracion/entorno
+
+## 11.2 Secret de webhooks
+
+- Guardar `secret` solo en backend RDN
+- Rotar secret recreando suscripcion webhook
+- Validar siempre `X-Centralita-Signature`
+
+## 11.3 CORS
+
+- Configurable por entorno via `API_CORS_ALLOW_ORIGIN`
+- En produccion, no dejar `*` salvo necesidad explicita
+
+## 12. Observabilidad y operacion
+
+Para soporte de integracion:
+
+- Correlacion API: `X-Request-Id`
+- Correlacion eventos: `event_id`
+- Correlacion delivery/retry: `X-Centralita-Delivery-Id`
+
+Donde mirar:
+- `GET /api/v1/webhooks/{id}` -> estado de suscripcion + ultimos deliveries
+- `POST /api/v1/webhooks/retry-deliveries` -> reprocesar pendientes
+- `GET /api/v1/calls` y `GET /api/v1/recordings` -> reconciliacion
+
+## 13. Checklist para RDN
+
+1. Consumir API con API key backend-only.
+2. Implementar endpoint webhook con verificacion HMAC.
+3. Deduplicar por `delivery_id` y proteger negocio por `event_id`.
+4. No asumir orden total de eventos.
+5. Implementar reconciliacion periodica calls/recordings.
+6. Usar `call_sid` para comandos y `call_record_id` para historico.
+7. Tratar `mute/unmute` como operaciones solo-conferencia.
+8. Manejar retries de webhooks (idempotencia total).
+
+## 14. Ejemplos rapidos
+
+### 14.1 Hangup
 
 ```bash
-# 1. Sincronizar usuarios de RDN
+curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/calls/CAxxxx/hangup" \
+  -H "Authorization: Bearer ck_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"target":"all"}'
+```
+
+### 14.2 Retry de pendientes (cron)
+
+```bash
+curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/webhooks/retry-deliveries" \
+  -H "Authorization: Bearer ck_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"limit":100}'
+```
+
+### 14.3 Bulk sync
+
+```bash
 curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/users/bulk-sync" \
-  -H "Authorization: Bearer ck_YOUR_KEY" \
+  -H "Authorization: Bearer ck_xxx" \
   -H "Content-Type: application/json" \
-  -d '{
-    "users": [
-      {"rdn_user_id": "emp-001", "name": "Juan García", "email": "juan@rdn.com", "role": "operator", "active": true},
-      {"rdn_user_id": "emp-002", "name": "Ana Martín", "email": "ana@rdn.com", "role": "operator", "active": true}
-    ]
-  }'
-
-# 2. Crear suscripción de webhooks
-curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/webhooks" \
-  -H "Authorization: Bearer ck_YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://rdn.example.com/api/centralita-events",
-    "events": ["call.*", "agent.*", "recording.ready"],
-    "description": "Webhook principal sistema RDN"
-  }'
-# → Guardad el "secret" de la respuesta
-
-# 3. Probar que el webhook funciona
-curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/webhooks/{webhook_id}/test" \
-  -H "Authorization: Bearer ck_YOUR_KEY"
-
-# 4. Marcar un agente como disponible
-curl -X PATCH "https://centralita.reparacionesdelnorte.es/api/v1/users/{user_id}/availability" \
-  -H "Authorization: Bearer ck_YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"available": true}'
-
-# 5. Consultar estadísticas
-curl -X GET "https://centralita.reparacionesdelnorte.es/api/v1/stats/summary" \
-  -H "Authorization: Bearer ck_YOUR_KEY"
+  -d '{"users":[{"rdn_user_id":"emp-1","name":"Ana","email":"ana@rdn.com","role":"operator","active":true}]}'
 ```
-
-### Flujo: Control remoto de llamada
-
-```bash
-# Colgar una llamada activa
-curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/calls/CAxxxxxx/hangup" \
-  -H "Authorization: Bearer ck_YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"target": "all"}'
-
-# Poner en espera
-curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/calls/CAxxxxxx/hold" \
-  -H "Authorization: Bearer ck_YOUR_KEY"
-
-# Sacar de espera
-curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/calls/CAxxxxxx/resume" \
-  -H "Authorization: Bearer ck_YOUR_KEY"
-
-# Transferir a otro número
-curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/calls/transfer" \
-  -H "Authorization: Bearer ck_YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "callSid": "CAxxxxxx",
-    "destination": "+34698765432",
-    "callerId": "+34848819410"
-  }'
-```
-
----
-
-## Contacto
-
-Para dudas técnicas sobre la integración, contactar al equipo de la centralita.

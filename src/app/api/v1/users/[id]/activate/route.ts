@@ -1,6 +1,6 @@
-import { NextRequest } from 'next/server';
+﻿import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { authenticate, isAuthenticated } from '@/lib/api/auth';
+import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
 import { apiSuccess, apiNotFound } from '@/lib/api/response';
 import { auditLog } from '@/lib/api/audit';
 
@@ -12,6 +12,8 @@ interface Params {
 export async function PATCH(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
+  const roleCheck = requireRole(auth, 'admin');
+  if (roleCheck !== true) return roleCheck;
 
   const { id } = await params;
   const supabase = createAdminClient();
@@ -30,3 +32,4 @@ export async function PATCH(req: NextRequest, { params }: Params) {
 
   return apiSuccess(data);
 }
+

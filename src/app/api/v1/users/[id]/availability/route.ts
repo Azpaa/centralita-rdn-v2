@@ -1,6 +1,6 @@
-import { NextRequest } from 'next/server';
+﻿import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { authenticate, isAuthenticated } from '@/lib/api/auth';
+import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
 import { apiSuccess, apiNotFound, apiBadRequest } from '@/lib/api/response';
 import { availabilitySchema } from '@/lib/api/validation';
 import { auditLog } from '@/lib/api/audit';
@@ -15,18 +15,20 @@ interface Params {
 export async function PATCH(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
+  const roleCheck = requireRole(auth, 'admin');
+  if (roleCheck !== true) return roleCheck;
 
   const { id } = await params;
   let body: unknown;
   try {
     body = await req.json();
   } catch {
-    return apiBadRequest('Body JSON inválido');
+    return apiBadRequest('Body JSON invÃ¡lido');
   }
 
   const parsed = availabilitySchema.safeParse(body);
   if (!parsed.success) {
-    return apiBadRequest('Datos inválidos', parsed.error.flatten().fieldErrors);
+    return apiBadRequest('Datos invÃ¡lidos', parsed.error.flatten().fieldErrors);
   }
 
   const supabase = createAdminClient();
@@ -57,3 +59,4 @@ export async function PATCH(req: NextRequest, { params }: Params) {
 
   return apiSuccess(data);
 }
+

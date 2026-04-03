@@ -15,12 +15,27 @@ interface ApiErrorBody {
   details?: unknown;
 }
 
+function generateRequestId() {
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function withRequestId(headers?: HeadersInit) {
+  const merged = new Headers(headers);
+  if (!merged.has('X-Request-Id')) {
+    merged.set('X-Request-Id', generateRequestId());
+  }
+  return merged;
+}
+
 // --- Respuestas de éxito ---
 
 export function apiSuccess(data: unknown, meta?: ApiMeta, status = 200) {
   const body: Record<string, unknown> = { ok: true, data };
   if (meta) body.meta = meta;
-  return NextResponse.json(body, { status });
+  return NextResponse.json(body, { status, headers: withRequestId() });
 }
 
 export function apiCreated(data: unknown) {
@@ -28,7 +43,7 @@ export function apiCreated(data: unknown) {
 }
 
 export function apiNoContent() {
-  return new NextResponse(null, { status: 204 });
+  return new NextResponse(null, { status: 204, headers: withRequestId() });
 }
 
 // --- Respuestas de error ---
@@ -36,7 +51,7 @@ export function apiNoContent() {
 export function apiError(status: number, code: string, message: string, details?: unknown) {
   const error: ApiErrorBody = { code, message };
   if (details) error.details = details;
-  return NextResponse.json({ error }, { status });
+  return NextResponse.json({ error }, { status, headers: withRequestId() });
 }
 
 export function apiNotFound(entity = 'Recurso') {

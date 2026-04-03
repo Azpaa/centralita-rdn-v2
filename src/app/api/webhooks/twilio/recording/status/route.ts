@@ -59,19 +59,25 @@ export async function POST(req: NextRequest) {
       .eq('twilio_recording_sid', recordingSid)
       .single();
 
+    let recordingRowId = existing?.id as string | undefined;
+
     if (existing) {
       // Actualizar
-      await supabase
+      const { data: updated } = await supabase
         .from('recordings')
         .update({
           url: recordingUrl,
           duration: recordingDuration,
           status: mappedStatus as RecordingStatus,
         })
-        .eq('id', existing.id);
+        .eq('id', existing.id)
+        .select('id')
+        .single();
+
+      recordingRowId = (updated as { id: string } | null)?.id ?? recordingRowId;
     } else {
       // Crear nuevo
-      await supabase
+      const { data: created } = await supabase
         .from('recordings')
         .insert({
           twilio_recording_sid: recordingSid,
@@ -79,7 +85,11 @@ export async function POST(req: NextRequest) {
           url: recordingUrl,
           duration: recordingDuration,
           status: mappedStatus as RecordingStatus,
-        });
+        })
+        .select('id')
+        .single();
+
+      recordingRowId = (created as { id: string } | null)?.id ?? recordingRowId;
     }
 
     console.log(`[RECORDING] Saved recording ${recordingSid} for call ${callRecord.id}`);
@@ -87,7 +97,7 @@ export async function POST(req: NextRequest) {
     // Emitir evento recording.ready para RDN si la grabación está completa
     if (mappedStatus === 'completed') {
       emitEvent('recording.ready', {
-        recording_id: existing?.id ?? 'new',
+        recording_id: recordingRowId ?? null,
         recording_sid: recordingSid,
         call_sid: callSid,
         call_record_id: callRecord.id,

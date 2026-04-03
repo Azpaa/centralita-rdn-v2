@@ -1,4 +1,4 @@
-import { NextRequest } from 'next/server';
+﻿import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
 import { apiSuccess, apiNotFound, apiBadRequest, apiNoContent, apiInternalError } from '@/lib/api/response';
@@ -16,8 +16,16 @@ const updateWebhookSchema = z.object({
   active: z.boolean().optional(),
 });
 
+const VALID_EVENT_PATTERNS = [
+  '*',
+  'call.*', 'call.incoming', 'call.ringing', 'call.answered', 'call.completed',
+  'call.missed', 'call.transferred', 'call.hold', 'call.resumed',
+  'agent.*', 'agent.online', 'agent.offline', 'agent.available', 'agent.unavailable', 'agent.busy',
+  'recording.*', 'recording.ready',
+];
+
 /**
- * GET /api/v1/webhooks/:id — Detalle de suscripción webhook
+ * GET /api/v1/webhooks/:id - Detalle de suscripcion webhook
  */
 export async function GET(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);
@@ -35,9 +43,8 @@ export async function GET(req: NextRequest, { params }: Params) {
     .eq('id', id)
     .single();
 
-  if (error || !data) return apiNotFound('Suscripción webhook');
+  if (error || !data) return apiNotFound('Suscripcion webhook');
 
-  // Obtener últimas 10 entregas
   const { data: deliveries } = await supabase
     .from('webhook_delivery_log')
     .select('id, event_type, response_status, delivered, attempts, created_at')
@@ -52,7 +59,7 @@ export async function GET(req: NextRequest, { params }: Params) {
 }
 
 /**
- * PUT /api/v1/webhooks/:id — Actualizar suscripción webhook
+ * PUT /api/v1/webhooks/:id - Actualizar suscripcion webhook
  */
 export async function PUT(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);
@@ -66,12 +73,21 @@ export async function PUT(req: NextRequest, { params }: Params) {
   try {
     body = await req.json();
   } catch {
-    return apiBadRequest('Body JSON inválido');
+    return apiBadRequest('Body JSON invalido');
   }
 
   const parsed = updateWebhookSchema.safeParse(body);
   if (!parsed.success) {
-    return apiBadRequest('Datos inválidos', parsed.error.flatten().fieldErrors);
+    return apiBadRequest('Datos invalidos', parsed.error.flatten().fieldErrors);
+  }
+
+  if (parsed.data.events) {
+    const invalidEvents = parsed.data.events.filter((e) => !VALID_EVENT_PATTERNS.includes(e));
+    if (invalidEvents.length > 0) {
+      return apiBadRequest(
+        `Eventos invalidos: ${invalidEvents.join(', ')}. Eventos validos: ${VALID_EVENT_PATTERNS.join(', ')}`
+      );
+    }
   }
 
   const supabase = createAdminClient();
@@ -83,13 +99,13 @@ export async function PUT(req: NextRequest, { params }: Params) {
     .select()
     .single();
 
-  if (error || !data) return apiNotFound('Suscripción webhook');
+  if (error || !data) return apiNotFound('Suscripcion webhook');
 
   return apiSuccess(data);
 }
 
 /**
- * DELETE /api/v1/webhooks/:id — Eliminar suscripción webhook
+ * DELETE /api/v1/webhooks/:id - Eliminar suscripcion webhook
  */
 export async function DELETE(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);

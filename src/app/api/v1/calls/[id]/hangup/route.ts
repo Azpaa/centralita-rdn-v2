@@ -33,16 +33,12 @@ export async function POST(
 
   try {
     const client = getTwilioClient();
+    let remoteSid: string | null = null;
 
-    if (target === 'all' || target === 'agent') {
-      await client.calls(callSid).update({ status: 'completed' });
-    }
-
+    // Resolver primero la otra leg para no perder referencia si colgamos callSid.
     if (target === 'all' || target === 'remote') {
       const callInfo = await client.calls(callSid).fetch().catch(() => null);
       if (callInfo) {
-        let remoteSid: string | null = null;
-
         if (callInfo.parentCallSid) {
           remoteSid = callInfo.parentCallSid;
         } else {
@@ -53,14 +49,18 @@ export async function POST(
           });
           if (children.length > 0) remoteSid = children[0].sid;
         }
-
-        if (remoteSid && target === 'remote') {
-          await client.calls(remoteSid).update({ status: 'completed' });
-        }
       }
     }
 
-    return apiSuccess({ hungup: true, callSid, target });
+    if (target === 'all' || target === 'agent') {
+      await client.calls(callSid).update({ status: 'completed' });
+    }
+
+    if (remoteSid && (target === 'all' || target === 'remote')) {
+      await client.calls(remoteSid).update({ status: 'completed' });
+    }
+
+    return apiSuccess({ hungup: true, callSid, target, remote_call_sid: remoteSid });
   } catch (err) {
     console.error(`[HANGUP] Error hanging up ${callSid}:`, err);
     return apiInternalError('Error al colgar la llamada');

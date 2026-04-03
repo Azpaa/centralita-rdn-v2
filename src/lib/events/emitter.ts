@@ -11,8 +11,9 @@
  * 4. Si falla, programa reintentos (máx 3)
  */
 
+import crypto from 'crypto';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { deliverWebhook } from '@/lib/events/delivery';
+import { deliverWebhook, processPendingWebhookDeliveries } from '@/lib/events/delivery';
 import type { WebhookSubscription } from '@/lib/types/database';
 
 /**
@@ -41,6 +42,7 @@ export type EventType =
  * Payload base de un evento.
  */
 export interface EventPayload {
+  event_id: string;
   event: EventType;
   timestamp: string;
   data: Record<string, unknown>;
@@ -55,6 +57,11 @@ export async function emitEvent(
   data: Record<string, unknown>,
 ): Promise<void> {
   try {
+    // Reintentos pendientes persistidos (best effort, no bloquea la emisión actual).
+    processPendingWebhookDeliveries().catch((err) => {
+      console.error('[EVENT] Error processing pending deliveries:', err);
+    });
+
     const supabase = createAdminClient();
 
     // Buscar suscripciones activas que escuchen este evento
@@ -66,6 +73,7 @@ export async function emitEvent(
     if (error || !subscriptions || subscriptions.length === 0) return;
 
     const payload: EventPayload = {
+      event_id: crypto.randomUUID(),
       event,
       timestamp: new Date().toISOString(),
       data,

@@ -1,24 +1,26 @@
-import { NextRequest } from 'next/server';
+﻿import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { authenticate, isAuthenticated } from '@/lib/api/auth';
+import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiNotFound } from '@/lib/api/response';
 import { matchEmailSchema } from '@/lib/api/validation';
 
-// POST /api/v1/users/match-email — Buscar usuario por email para vincular con RDN
+// POST /api/v1/users/match-email â€” Buscar usuario por email para vincular con RDN
 export async function POST(req: NextRequest) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
+  const roleCheck = requireRole(auth, 'admin');
+  if (roleCheck !== true) return roleCheck;
 
   let body: unknown;
   try {
     body = await req.json();
   } catch {
-    return apiBadRequest('Body JSON inválido');
+    return apiBadRequest('Body JSON invÃ¡lido');
   }
 
   const parsed = matchEmailSchema.safeParse(body);
   if (!parsed.success) {
-    return apiBadRequest('Datos inválidos', parsed.error.flatten().fieldErrors);
+    return apiBadRequest('Datos invÃ¡lidos', parsed.error.flatten().fieldErrors);
   }
 
   const supabase = createAdminClient();
@@ -34,3 +36,4 @@ export async function POST(req: NextRequest) {
 
   return apiSuccess(data);
 }
+

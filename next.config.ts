@@ -1,21 +1,23 @@
-import type { NextConfig } from "next";
+﻿import type { NextConfig } from "next";
+
+const apiCorsAllowOrigin =
+  process.env.API_CORS_ALLOW_ORIGIN ||
+  process.env.NEXT_PUBLIC_APP_URL ||
+  "*";
 
 const nextConfig: NextConfig = {
   /**
    * Cabeceras de seguridad y CORS para la API REST.
-   * Permite que el sistema RDN haga peticiones cross-origin a /api/v1/*.
+   * Permite restringir origen en produccion via API_CORS_ALLOW_ORIGIN.
    */
   async headers() {
     return [
       {
-        // CORS para la API REST (RDN u otros sistemas M2M)
         source: "/api/v1/:path*",
         headers: [
           {
             key: "Access-Control-Allow-Origin",
-            // En producción se puede restringir al dominio de RDN.
-            // Por ahora, solo requests autenticadas con API Key.
-            value: "*",
+            value: apiCorsAllowOrigin,
           },
           {
             key: "Access-Control-Allow-Methods",
@@ -32,7 +34,6 @@ const nextConfig: NextConfig = {
         ],
       },
       {
-        // Cabeceras de seguridad globales
         source: "/:path*",
         headers: [
           {

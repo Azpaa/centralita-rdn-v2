@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { authenticate, isAuthenticated } from '@/lib/api/auth';
+import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
 import { apiSuccess, apiCreated, apiBadRequest, apiConflict, apiInternalError, parsePagination, buildMeta } from '@/lib/api/response';
 import { createUserSchema } from '@/lib/api/validation';
 import { auditLog } from '@/lib/api/audit';
@@ -11,6 +11,8 @@ import type { User } from '@/lib/types/database';
 export async function GET(req: NextRequest) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
+  const roleCheck = requireRole(auth, 'admin');
+  if (roleCheck !== true) return roleCheck;
 
   const supabase = createAdminClient();
   const { searchParams } = new URL(req.url);
@@ -54,6 +56,8 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
+  const roleCheck = requireRole(auth, 'admin');
+  if (roleCheck !== true) return roleCheck;
 
   let body: unknown;
   try {
