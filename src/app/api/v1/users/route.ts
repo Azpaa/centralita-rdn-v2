@@ -11,7 +11,7 @@ import type { User } from '@/lib/types/database';
 export async function GET(req: NextRequest) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
-  const roleCheck = requireRole(auth, 'admin');
+  const roleCheck = requireRole(auth, 'admin', 'operator');
   if (roleCheck !== true) return roleCheck;
 
   const supabase = createAdminClient();
