@@ -215,7 +215,8 @@ export async function createCallRecord(params: {
   status: string;
   queueId?: string | null;
   phoneNumberId?: string | null;
-  twilioData?: Record<string, string>;
+  answeredByUserId?: string | null;
+  twilioData?: Record<string, unknown>;
 }): Promise<string | null> {
   const supabase = createAdminClient();
 
@@ -230,6 +231,7 @@ export async function createCallRecord(params: {
       started_at: new Date().toISOString(),
       queue_id: params.queueId ?? null,
       phone_number_id: params.phoneNumberId ?? null,
+      answered_by_user_id: params.answeredByUserId ?? null,
       twilio_data: params.twilioData ?? null,
     })
     .select('id')

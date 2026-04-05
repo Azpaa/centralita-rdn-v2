@@ -97,4 +97,7 @@ export const updatePhoneNumberSchema = z.object({
 export const dialSchema = z.object({
   destination_number: z.string().min(5, 'Número destino requerido'),
   from_number: z.string().min(5, 'Número de origen requerido'),
+  user_id: z.string().uuid('user_id debe ser un UUID válido').optional(),
+  rdn_user_id: z.string().min(1, 'rdn_user_id no válido').optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });

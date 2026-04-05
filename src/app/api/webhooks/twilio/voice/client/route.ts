@@ -1,40 +1,82 @@
 import type { NextRequest } from 'next/server';
 import twilio from 'twilio';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
-import { createCallRecord } from '@/lib/twilio/call-engine';
+import { createCallRecord, updateCallStatus } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { User, PhoneNumber } from '@/lib/types/database';
 
 /**
  * POST /api/webhooks/twilio/voice/client
- * Webhook para la TwiML App de Twilio.
- * Se ejecuta cuando un cliente del navegador (Twilio Device) inicia una llamada saliente.
+ * TwiML App webhook executed when a browser Twilio Device starts a call.
+ *
+ * Also used by RDN-adopted calls created server-side to client:<agent-id>
+ * with query params (outbound_to, caller_id, user_id).
  */
 export async function POST(req: NextRequest) {
-  // Validar firma + parsear body
   const webhook = await validateAndParseTwilioWebhook(req);
   if (!webhook.ok) return webhook.response;
   const params = webhook.params;
 
-  const to = params.To || '';
-  // Leer CallerId (param personalizado) — NO usar From que Twilio sobreescribe con "client:<identity>"
-  const customCallerId = params.CallerId || '';
-  const twilioFrom = params.From || '';
-  const userId = params.UserId || '';
-  const callSid = params.CallSid || '';
+  const { searchParams } = new URL(req.url);
+  const forcedOutboundTo = searchParams.get('outbound_to') || '';
+  const forcedCallerId = searchParams.get('caller_id') || '';
+  const forcedUserId = searchParams.get('user_id') || '';
+  const source = searchParams.get('source') || '';
 
-  console.log(`[CLIENT-VOICE] CallSid=${callSid} To=${to} CallerId=${customCallerId} TwilioFrom=${twilioFrom} UserId=${userId}`);
+  const rawTo = params.To || '';
+  const to = forcedOutboundTo || rawTo;
+  const customCallerId = params.CallerId || forcedCallerId || '';
+  const twilioFrom = params.From || '';
+  const callSid = params.CallSid || '';
+  let userId = params.UserId || forcedUserId || '';
+
+  if (!userId && rawTo.startsWith('client:')) {
+    userId = rawTo.replace('client:', '');
+  }
+
+  const isRdnAdopted = source === 'rdn' || Boolean(forcedOutboundTo);
+
+  console.log(
+    `[CLIENT-VOICE] mode=${isRdnAdopted ? 'rdn-adopted' : 'browser'} CallSid=${callSid} RawTo=${rawTo} To=${to} CallerId=${customCallerId} TwilioFrom=${twilioFrom} UserId=${userId}`
+  );
 
   const twiml = new twilio.twiml.VoiceResponse();
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
 
   try {
-    if (to && to.startsWith('client:')) {
-      // ─── Llamada entre clientes del navegador (ej: consulta a otro operador) ───
-      const targetIdentity = to.replace('client:', '');
-      const supabase = createAdminClient();
+    const supabase = createAdminClient();
 
-      // Obtener nombre del usuario iniciador
+    const ensureRecord = async (input: {
+      direction: 'outbound' | 'inbound';
+      fromNumber: string;
+      toNumber: string;
+      status: string;
+      phoneNumberId?: string | null;
+      twilioData?: Record<string, unknown>;
+    }) => {
+      if (!callSid) return null;
+
+      const { data: existing } = await supabase
+        .from('call_records')
+        .select('id')
+        .eq('twilio_call_sid', callSid)
+        .maybeSingle();
+
+      if (existing?.id) {
+        console.log(`[CLIENT-VOICE] Reusing existing call_record id=${existing.id} for CallSid=${callSid}`);
+        return existing.id as string;
+      }
+
+      return createCallRecord({
+        twilioCallSid: callSid,
+        ...input,
+      });
+    };
+
+    if (to && to.startsWith('client:')) {
+      // Browser-to-browser internal call.
+      const targetIdentity = to.replace('client:', '');
+
       let initiatorName = 'Sistema';
       if (userId) {
         const { data: user } = await supabase
@@ -45,7 +87,6 @@ export async function POST(req: NextRequest) {
         if (user) initiatorName = (user as User).name;
       }
 
-      // Resolver callerId para el registro
       let callerId = customCallerId;
       if (!callerId || callerId.startsWith('client:')) {
         const { data: firstNum } = await supabase
@@ -57,9 +98,7 @@ export async function POST(req: NextRequest) {
         callerId = (firstNum as PhoneNumber)?.phone_number || '';
       }
 
-      // Registrar la llamada interna en DB
-      await createCallRecord({
-        twilioCallSid: callSid,
+      await ensureRecord({
         direction: 'outbound',
         fromNumber: callerId || `client:${userId}`,
         toNumber: to,
@@ -67,12 +106,15 @@ export async function POST(req: NextRequest) {
         twilioData: {
           initiated_by: userId || 'unknown',
           initiator_name: initiatorName,
-          source: 'browser',
-          internal: 'true',
+          source: isRdnAdopted ? 'rdn_adopted_browser' : 'browser',
+          internal: true,
         },
       });
 
-      // Dial al cliente del navegador destino
+      if (userId) {
+        await updateCallStatus(callSid, { answeredByUserId: userId });
+      }
+
       const dial = twiml.dial({
         callerId,
         timeout: 30,
@@ -84,18 +126,12 @@ export async function POST(req: NextRequest) {
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
         },
-        targetIdentity
+        targetIdentity,
       );
-
     } else if (to && !to.startsWith('client:')) {
-      // ─── Llamada a número de teléfono externo ───
-      const supabase = createAdminClient();
-
-      // Resolver callerId: usar el param personalizado, o buscar uno válido
-      // NUNCA usar "client:xxx" como callerId (no es un número real)
+      // Call to external phone number.
       let callerId = customCallerId;
       if (!callerId || callerId.startsWith('client:')) {
-        // Usar el primer número activo como fallback
         const { data: firstNum } = await supabase
           .from('phone_numbers')
           .select('phone_number')
@@ -105,7 +141,6 @@ export async function POST(req: NextRequest) {
         callerId = (firstNum as PhoneNumber)?.phone_number || '';
       }
 
-      // Obtener nombre del usuario
       let initiatorName = 'Sistema';
       if (userId) {
         const { data: user } = await supabase
@@ -116,7 +151,6 @@ export async function POST(req: NextRequest) {
         if (user) initiatorName = (user as User).name;
       }
 
-      // Registrar la llamada en DB
       const phoneData = await supabase
         .from('phone_numbers')
         .select('id, record_calls')
@@ -126,8 +160,7 @@ export async function POST(req: NextRequest) {
       const phoneNumberId = phoneData.data?.id || null;
       const shouldRecord = phoneData.data?.record_calls ?? false;
 
-      await createCallRecord({
-        twilioCallSid: callSid,
+      await ensureRecord({
         direction: 'outbound',
         fromNumber: callerId,
         toNumber: to,
@@ -136,15 +169,18 @@ export async function POST(req: NextRequest) {
         twilioData: {
           initiated_by: userId || 'unknown',
           initiator_name: initiatorName,
-          source: 'browser',
+          source: isRdnAdopted ? 'rdn_adopted' : 'browser',
         },
       });
 
-      // Dial al número destino
+      if (userId) {
+        await updateCallStatus(callSid, { answeredByUserId: userId });
+      }
+
       const dial = twiml.dial({
         callerId,
         timeout: 30,
-        record: shouldRecord ? 'record-from-answer-dual' as const : 'do-not-record' as const,
+        record: shouldRecord ? ('record-from-answer-dual' as const) : ('do-not-record' as const),
         recordingStatusCallback: shouldRecord
           ? `${baseUrl}/api/webhooks/twilio/recording/status`
           : undefined,
@@ -156,13 +192,12 @@ export async function POST(req: NextRequest) {
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
         },
-        to
+        to,
       );
     } else {
-      // Sin destino válido
       twiml.say(
         { language: 'es-ES', voice: 'Polly.Conchita' },
-        'No se ha especificado un número de destino.'
+        'No se ha especificado un numero de destino.'
       );
       twiml.hangup();
     }
