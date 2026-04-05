@@ -44,6 +44,9 @@ export async function GET(req: NextRequest) {
   const answeredBy = searchParams.get('answered_by_user_id');
   if (answeredBy) query = query.eq('answered_by_user_id', answeredBy);
 
+  const twilioCallSid = searchParams.get('twilio_call_sid');
+  if (twilioCallSid) query = query.eq('twilio_call_sid', twilioCallSid);
+
   query = query.range(skip, skip + limit - 1);
 
   const { data, error, count } = await query;

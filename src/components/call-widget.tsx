@@ -31,7 +31,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useCall } from '@/contexts/call-context';
-import type { PhoneNumber, User } from '@/lib/types/database';
+import type { CallRecord, PhoneNumber, User } from '@/lib/types/database';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -204,6 +204,45 @@ export function CallWidget() {
     setIncomingInfo('');
   }, [stopAllTimers]);
 
+  const lookupRdnOutboundBySid = useCallback(async (callSid: string, currentIdentity: string) => {
+    if (!callSid) return null;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const params = new URLSearchParams();
+      params.set('twilio_call_sid', callSid);
+      params.set('page', '1');
+      params.set('limit', '1');
+
+      const res = await api.get<CallRecord[]>(`/calls?${params.toString()}`);
+      if (!res.ok || res.data.length === 0) {
+        if (attempt < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          continue;
+        }
+        return null;
+      }
+
+      const record = res.data[0];
+      const source = typeof record.twilio_data?.source === 'string'
+        ? record.twilio_data.source
+        : '';
+
+      const isRdnOutbound = record.direction === 'outbound'
+        && (
+          source === 'rdn'
+          || source === 'rdn_adopted'
+          || source === 'rdn_adopted_browser'
+        );
+
+      if (!isRdnOutbound) return null;
+      if (record.answered_by_user_id && record.answered_by_user_id !== currentIdentity) return null;
+
+      return record;
+    }
+
+    return null;
+  }, []);
+
   // ─── Setup call event handlers ─────────────────────────────────────────────
 
   const setupCallHandlers = useCallback((call: Call, callId: string) => {
@@ -310,25 +349,48 @@ export function CallWidget() {
       });
 
       device.on('incoming', (call: Call) => {
-        console.log('[CallWidget] Incoming call from:', call.parameters.From);
-        incomingCallRef.current = call;
-        setIncomingInfo(call.parameters.From || 'Desconocido');
-        setWidgetState('incoming');
+        const currentIdentity = id;
+        const incomingSid = call.parameters?.CallSid || '';
 
-        // Bring attention to the tab if in background
-        if (document.hidden) {
+        void (async () => {
           try {
-            // Try to show a notification
-            if (Notification.permission === 'granted') {
-              new Notification('Llamada entrante', {
-                body: `De: ${call.parameters.From || 'Desconocido'}`,
-                icon: '/favicon.ico',
-                tag: 'incoming-call',
-                requireInteraction: true,
-              });
+            const outboundRecord = await lookupRdnOutboundBySid(incomingSid, currentIdentity);
+            if (outboundRecord) {
+              console.log(
+                `[CallWidget] Auto-adopting RDN outbound CallSid=${incomingSid} to=${outboundRecord.to_number} (no inbound acceptance UX)`
+              );
+              const callId = addCallSlot(call, outboundRecord.to_number, 'outbound');
+              setupCallHandlers(call, callId);
+              call.accept();
+              incomingCallRef.current = null;
+              setIncomingInfo('');
+              setWidgetState('active');
+              return;
             }
-          } catch { /* notifications not supported */ }
-        }
+          } catch (err) {
+            console.warn('[CallWidget] Failed to lookup outgoing adoption context, fallback to normal incoming UI', err);
+          }
+
+          console.log('[CallWidget] Incoming call from:', call.parameters.From);
+          incomingCallRef.current = call;
+          setIncomingInfo(call.parameters.From || 'Desconocido');
+          setWidgetState('incoming');
+
+          // Bring attention to the tab if in background
+          if (document.hidden) {
+            try {
+              // Try to show a notification
+              if (Notification.permission === 'granted') {
+                new Notification('Llamada entrante', {
+                  body: `De: ${call.parameters.From || 'Desconocido'}`,
+                  icon: '/favicon.ico',
+                  tag: 'incoming-call',
+                  requireInteraction: true,
+                });
+              }
+            } catch { /* notifications not supported */ }
+          }
+        })();
       });
 
       device.on('tokenWillExpire', async () => {
@@ -360,7 +422,7 @@ export function CallWidget() {
     }
 
     reconnectingRef.current = false;
-  }, []);
+  }, [addCallSlot, lookupRdnOutboundBySid, setupCallHandlers]);
 
   // ─── Mute helpers ──────────────────────────────────────────────────────────
 
