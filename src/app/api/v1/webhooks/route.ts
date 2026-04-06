@@ -6,6 +6,7 @@ import {
   apiSuccess,
   apiCreated,
   apiBadRequest,
+  apiConflict,
   apiInternalError,
   parsePagination,
   buildMeta,
@@ -30,6 +31,16 @@ const VALID_EVENT_PATTERNS = [
   'agent.*', 'agent.online', 'agent.offline', 'agent.available', 'agent.unavailable', 'agent.busy',
   'recording.*', 'recording.ready',
 ];
+
+function normalizeWebhookUrl(rawUrl: string): string {
+  const parsed = new URL(rawUrl.trim());
+  const pathname = parsed.pathname === '/' ? '/' : parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.protocol}//${parsed.host}${pathname}${parsed.search}`;
+}
+
+function normalizeEventPatterns(events: string[]): string[] {
+  return [...new Set(events.map((e) => e.trim()).filter(Boolean))].sort();
+}
 
 /**
  * GET /api/v1/webhooks — Listar suscripciones webhook
@@ -90,17 +101,36 @@ export async function POST(req: NextRequest) {
     return apiBadRequest(`Eventos inválidos: ${invalidEvents.join(', ')}. Eventos válidos: ${VALID_EVENT_PATTERNS.join(', ')}`);
   }
 
-  // Generar secret criptográficamente seguro
-  const secret = `whsec_${crypto.randomBytes(32).toString('hex')}`;
+  const normalizedUrl = normalizeWebhookUrl(parsed.data.url);
+  const normalizedEvents = normalizeEventPatterns(parsed.data.events);
+  if (normalizedEvents.length === 0) {
+    return apiBadRequest('Debe especificar al menos un evento válido');
+  }
 
   const supabase = createAdminClient();
+
+  const { data: existingActive } = await supabase
+    .from('webhook_subscriptions')
+    .select('id, url')
+    .eq('active', true)
+    .eq('url', normalizedUrl)
+    .limit(1);
+
+  if (existingActive && existingActive.length > 0) {
+    return apiConflict(
+      `Ya existe una suscripcion webhook activa para esta URL (${normalizedUrl}). Desactiva o elimina la anterior antes de crear otra.`
+    );
+  }
+
+  // Generar secret criptográficamente seguro
+  const secret = `whsec_${crypto.randomBytes(32).toString('hex')}`;
 
   const { data, error } = await supabase
     .from('webhook_subscriptions')
     .insert({
-      url: parsed.data.url,
+      url: normalizedUrl,
       secret,
-      events: parsed.data.events,
+      events: normalizedEvents,
       active: true,
       description: parsed.data.description ?? null,
       api_key_id: auth.apiKeyId ?? null,
@@ -114,8 +144,8 @@ export async function POST(req: NextRequest) {
   }
 
   await auditLog('api_key.created', 'webhook_subscription', data.id, auth.userId, {
-    url: parsed.data.url,
-    events: parsed.data.events,
+    url: normalizedUrl,
+    events: normalizedEvents,
   });
 
   // Devolver incluyendo el secret (solo esta vez)

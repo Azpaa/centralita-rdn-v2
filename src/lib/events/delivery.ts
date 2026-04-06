@@ -51,6 +51,12 @@ export async function deliverWebhook(
   const maxAttempts = RETRY_DELAYS.length + 1;
 
   const normalizedPayload = ensureEventId(payload);
+  if (!serializePayloadForDelivery(normalizedPayload)) {
+    console.error(
+      `[DELIVERY] Skipping invalid payload before insert sub_id=${subscription.id} event=${normalizedPayload.event ?? 'unknown'}`
+    );
+    return;
+  }
 
   const { error: insertError } = await supabase.from('webhook_delivery_log').insert({
     id: deliveryId,
@@ -116,6 +122,16 @@ export async function processPendingWebhookDeliveries(limit = 100): Promise<Retr
 
   const subscriptions = (subsData || []) as WebhookSubscription[];
   const subMap = new Map(subscriptions.map((sub) => [sub.id, sub]));
+  const preferredSubIdByUrl = new Map<string, string>();
+  const sortedSubs = [...subscriptions].sort(
+    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  );
+  for (const sub of sortedSubs) {
+    const key = normalizeWebhookUrlForDelivery(sub.url);
+    if (!preferredSubIdByUrl.has(key)) {
+      preferredSubIdByUrl.set(key, sub.id);
+    }
+  }
 
   for (const row of pending) {
     if (row.attempts >= row.max_attempts) {
@@ -129,6 +145,20 @@ export async function processPendingWebhookDeliveries(limit = 100): Promise<Retr
         .from('webhook_delivery_log')
         .update({
           error_message: 'Subscription not found or inactive',
+          next_retry_at: null,
+        })
+        .eq('id', row.id);
+      result.skipped += 1;
+      continue;
+    }
+
+    const preferredSubId = preferredSubIdByUrl.get(normalizeWebhookUrlForDelivery(sub.url));
+    if (preferredSubId && preferredSubId !== sub.id) {
+      await supabase
+        .from('webhook_delivery_log')
+        .update({
+          attempts: row.max_attempts,
+          error_message: `Skipped duplicate active subscription in favor of ${preferredSubId}`,
           next_retry_at: null,
         })
         .eq('id', row.id);
@@ -183,16 +213,41 @@ async function runDeliveryAttempt(params: {
 }): Promise<boolean> {
   const { deliveryId, subscription, payload, currentAttempts, maxAttempts } = params;
   const supabase = createAdminClient();
-  const bodyStr = JSON.stringify(payload);
+  const serialized = serializePayloadForDelivery(payload);
+  if (!serialized) {
+    await supabase
+      .from('webhook_delivery_log')
+      .update({
+        attempts: Math.max(currentAttempts, 1),
+        error_message: 'Invalid payload format for webhook delivery',
+        next_retry_at: null,
+      })
+      .eq('id', deliveryId);
+    return false;
+  }
+
+  const { bodyStr, bodyBuffer } = serialized;
 
   // Firmar payload con HMAC-SHA256
   const signature = crypto
     .createHmac('sha256', subscription.secret)
-    .update(bodyStr)
+    .update(bodyBuffer)
     .digest('hex');
 
   const attemptNumber = currentAttempts + 1;
-  const result = await attemptDelivery(subscription.url, bodyStr, signature, payload, deliveryId);
+  const isRetry = attemptNumber > 1;
+
+  console.log(
+    `[WEBHOOK] send delivery_id=${deliveryId} event=${payload.event} event_id=${payload.event_id} sub_id=${subscription.id} retry=${isRetry} attempt=${attemptNumber}/${maxAttempts} payload_bytes=${bodyBuffer.byteLength} signature=${signature.slice(0, 12)}...`
+  );
+
+  const result = await attemptDelivery(
+    subscription.url,
+    bodyStr,
+    signature,
+    payload,
+    deliveryId,
+  );
 
   if (result.success) {
     await supabase
@@ -216,6 +271,9 @@ async function runDeliveryAttempt(params: {
       .eq('id', subscription.id);
 
     subscription.failure_count = 0;
+    console.log(
+      `[WEBHOOK] delivered delivery_id=${deliveryId} event=${payload.event} sub_id=${subscription.id} status=${result.status ?? 0} retry=${isRetry}`
+    );
     return true;
   }
 
@@ -252,6 +310,10 @@ async function runDeliveryAttempt(params: {
       .eq('id', subscription.id);
   }
 
+  console.warn(
+    `[WEBHOOK] failed delivery_id=${deliveryId} event=${payload.event} sub_id=${subscription.id} status=${result.status ?? 0} retry=${isRetry} next_retry_at=${nextRetryAt ?? 'none'} error=${result.error ?? 'HTTP error'}`
+  );
+
   return false;
 }
 
@@ -287,9 +349,11 @@ function normalizePersistedPayload(payload: unknown): EventPayload | null {
     ? raw.timestamp
     : new Date().toISOString();
 
-  const data = raw.data && typeof raw.data === 'object'
-    ? (raw.data as Record<string, unknown>)
-    : {};
+  const data =
+    raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data)
+      ? (raw.data as Record<string, unknown>)
+      : null;
+  if (!data || Object.keys(data).length === 0) return null;
 
   const eventId = typeof raw.event_id === 'string' && raw.event_id.length > 0
     ? raw.event_id
@@ -347,5 +411,31 @@ async function attemptDelivery(
     clearTimeout(timeoutId);
     const message = err instanceof Error ? err.message : 'Unknown error';
     return { success: false, error: message };
+  }
+}
+
+function serializePayloadForDelivery(payload: EventPayload): {
+  bodyStr: string;
+  bodyBuffer: Buffer;
+} | null {
+  if (!payload || typeof payload !== 'object') return null;
+  if (!payload.event || !payload.event_id || !payload.timestamp) return null;
+  if (!payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) return null;
+  if (Object.keys(payload.data).length === 0) return null;
+
+  const bodyStr = JSON.stringify(payload);
+  if (!bodyStr || bodyStr === '{}') return null;
+
+  const bodyBuffer = Buffer.from(bodyStr, 'utf8');
+  return { bodyStr, bodyBuffer };
+}
+
+function normalizeWebhookUrlForDelivery(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl.trim());
+    const pathname = u.pathname === '/' ? '/' : u.pathname.replace(/\/+$/, '');
+    return `${u.protocol}//${u.host}${pathname}${u.search}`;
+  } catch {
+    return rawUrl.trim();
   }
 }

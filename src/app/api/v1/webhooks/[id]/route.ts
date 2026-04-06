@@ -1,7 +1,7 @@
-﻿import { NextRequest } from 'next/server';
+import { NextRequest } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
-import { apiSuccess, apiNotFound, apiBadRequest, apiNoContent, apiInternalError } from '@/lib/api/response';
+import { apiSuccess, apiNotFound, apiBadRequest, apiNoContent, apiInternalError, apiConflict } from '@/lib/api/response';
 import { auditLog } from '@/lib/api/audit';
 import { z } from 'zod';
 
@@ -23,6 +23,16 @@ const VALID_EVENT_PATTERNS = [
   'agent.*', 'agent.online', 'agent.offline', 'agent.available', 'agent.unavailable', 'agent.busy',
   'recording.*', 'recording.ready',
 ];
+
+function normalizeWebhookUrl(rawUrl: string): string {
+  const parsed = new URL(rawUrl.trim());
+  const pathname = parsed.pathname === '/' ? '/' : parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.protocol}//${parsed.host}${pathname}${parsed.search}`;
+}
+
+function normalizeEventPatterns(events: string[]): string[] {
+  return [...new Set(events.map((e) => e.trim()).filter(Boolean))].sort();
+}
 
 /**
  * GET /api/v1/webhooks/:id - Detalle de suscripcion webhook
@@ -92,9 +102,47 @@ export async function PUT(req: NextRequest, { params }: Params) {
 
   const supabase = createAdminClient();
 
+  const { data: current } = await supabase
+    .from('webhook_subscriptions')
+    .select('id, url, active')
+    .eq('id', id)
+    .single();
+  if (!current) return apiNotFound('Suscripcion webhook');
+
+  const updateData: Record<string, unknown> = { ...parsed.data };
+  if (typeof parsed.data.url === 'string') {
+    updateData.url = normalizeWebhookUrl(parsed.data.url);
+  }
+  if (Array.isArray(parsed.data.events)) {
+    const normalizedEvents = normalizeEventPatterns(parsed.data.events);
+    if (normalizedEvents.length === 0) {
+      return apiBadRequest('Debe especificar al menos un evento válido');
+    }
+    updateData.events = normalizedEvents;
+  }
+
+  const nextUrl = typeof updateData.url === 'string' ? updateData.url : current.url;
+  const nextActive = typeof updateData.active === 'boolean' ? updateData.active : current.active;
+
+  if (nextActive) {
+    const { data: duplicateActive } = await supabase
+      .from('webhook_subscriptions')
+      .select('id')
+      .eq('active', true)
+      .eq('url', nextUrl)
+      .neq('id', id)
+      .limit(1);
+
+    if (duplicateActive && duplicateActive.length > 0) {
+      return apiConflict(
+        `Ya existe otra suscripcion webhook activa para la URL ${nextUrl}.`
+      );
+    }
+  }
+
   const { data, error } = await supabase
     .from('webhook_subscriptions')
-    .update(parsed.data)
+    .update(updateData)
     .eq('id', id)
     .select()
     .single();

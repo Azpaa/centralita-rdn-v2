@@ -1,14 +1,8 @@
 /**
- * Sistema de eventos — Motor de emisión.
+ * Sistema de eventos - Motor de emision.
  *
- * emitEvent() es la función principal que todo el sistema usa para emitir
- * eventos hacia RDN. Es fire-and-forget: nunca bloquea ni lanza errores.
- *
- * Flujo:
- * 1. emitEvent('call.answered', { ... })
- * 2. Busca todas las suscripciones activas que coincidan con el evento
- * 3. Para cada suscripción, llama a deliverWebhook()
- * 4. Si falla, programa reintentos (máx 3)
+ * emitEvent() es la funcion principal para emitir eventos hacia RDN.
+ * Es fire-and-forget: nunca bloquea ni lanza errores al caller.
  */
 
 import crypto from 'crypto';
@@ -16,11 +10,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { deliverWebhook, processPendingWebhookDeliveries } from '@/lib/events/delivery';
 import type { WebhookSubscription } from '@/lib/types/database';
 
-/**
- * Tipos de eventos soportados.
- */
 export type EventType =
-  // Llamadas
   | 'call.incoming'
   | 'call.ringing'
   | 'call.answered'
@@ -29,18 +19,13 @@ export type EventType =
   | 'call.transferred'
   | 'call.hold'
   | 'call.resumed'
-  // Agentes
   | 'agent.online'
   | 'agent.offline'
   | 'agent.available'
   | 'agent.unavailable'
   | 'agent.busy'
-  // Grabaciones
   | 'recording.ready';
 
-/**
- * Payload base de un evento.
- */
 export interface EventPayload {
   event_id: string;
   event: EventType;
@@ -48,27 +33,27 @@ export interface EventPayload {
   data: Record<string, unknown>;
 }
 
-/**
- * Emitir un evento hacia todas las suscripciones que coincidan.
- * Fire-and-forget: nunca bloquea ni lanza errores al caller.
- */
 export async function emitEvent(
   event: EventType,
   data: Record<string, unknown>,
 ): Promise<void> {
   try {
-    // Reintentos pendientes persistidos (best effort, no bloquea la emisión actual).
+    if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length === 0) {
+      console.error(`[EVENT] Skipping ${event}: payload.data vacio o invalido`);
+      return;
+    }
+
     processPendingWebhookDeliveries().catch((err) => {
       console.error('[EVENT] Error processing pending deliveries:', err);
     });
 
     const supabase = createAdminClient();
 
-    // Buscar suscripciones activas que escuchen este evento
     const { data: subscriptions, error } = await supabase
       .from('webhook_subscriptions')
       .select('*')
-      .eq('active', true);
+      .eq('active', true)
+      .order('created_at', { ascending: false });
 
     if (error || !subscriptions || subscriptions.length === 0) return;
 
@@ -79,44 +64,60 @@ export async function emitEvent(
       data,
     };
 
-    // Filtrar suscripciones por patrón de eventos
-    const matching = (subscriptions as WebhookSubscription[]).filter(sub =>
+    const matching = (subscriptions as WebhookSubscription[]).filter((sub) =>
       matchesEventPattern(sub.events, event)
     );
 
     if (matching.length === 0) return;
 
-    // Entregar a cada suscripción en paralelo (fire-and-forget)
-    const deliveries = matching.map(sub =>
-      deliverWebhook(sub, payload).catch(err => {
+    // Proteccion operativa: si hay varias activas para la misma URL,
+    // enviamos solo a la mas reciente para evitar firmas inconsistentes.
+    const dedupByUrl = new Map<string, WebhookSubscription>();
+    for (const sub of matching) {
+      const key = normalizeWebhookUrlForDelivery(sub.url);
+      const existing = dedupByUrl.get(key);
+      if (existing) {
+        console.warn(
+          `[EVENT] Duplicate active webhook URL detected (${key}). Keeping ${existing.id}, skipping ${sub.id}`
+        );
+        continue;
+      }
+      dedupByUrl.set(key, sub);
+    }
+
+    const targets = [...dedupByUrl.values()];
+    if (targets.length === 0) return;
+
+    const deliveries = targets.map((sub) =>
+      deliverWebhook(sub, payload).catch((err) => {
         console.error(`[EVENT] Error delivering ${event} to ${sub.url}:`, err);
       })
     );
 
-    // No esperamos — es fire-and-forget. Pero usamos Promise.allSettled
-    // para que no se pierdan los errores si el proceso sigue vivo.
     Promise.allSettled(deliveries).catch(() => {});
   } catch (err) {
     console.error(`[EVENT] Error emitting ${event}:`, err);
   }
 }
 
-/**
- * Comprueba si un evento coincide con los patrones de una suscripción.
- *
- * Patrones soportados:
- * - 'call.answered' → coincide exactamente
- * - 'call.*' → coincide con cualquier evento que empiece por 'call.'
- * - '*' → coincide con todo
- */
 function matchesEventPattern(patterns: string[], event: string): boolean {
-  return patterns.some(pattern => {
+  return patterns.some((pattern) => {
     if (pattern === '*') return true;
     if (pattern === event) return true;
     if (pattern.endsWith('.*')) {
-      const prefix = pattern.slice(0, -1); // 'call.*' → 'call.'
+      const prefix = pattern.slice(0, -1);
       return event.startsWith(prefix);
     }
     return false;
   });
+}
+
+function normalizeWebhookUrlForDelivery(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl.trim());
+    const pathname = u.pathname === '/' ? '/' : u.pathname.replace(/\/+$/, '');
+    return `${u.protocol}//${u.host}${pathname}${u.search}`;
+  } catch {
+    return rawUrl.trim();
+  }
 }
