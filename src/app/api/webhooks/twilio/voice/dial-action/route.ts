@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
   const supabase = createAdminClient();
   const { data: callRecord } = await supabase
     .from('call_records')
-    .select('direction, started_at, queue_id, phone_number_id')
+    .select('direction, started_at, queue_id, phone_number_id, from_number, to_number, answered_by_user_id')
     .eq('twilio_call_sid', callSid)
     .single();
 
@@ -39,6 +39,9 @@ export async function POST(req: NextRequest) {
   const direction = record?.direction || 'outbound';
   const startedAt = record?.started_at;
   const queueId = record?.queue_id;
+  const fromNumber = record?.from_number ?? null;
+  const toNumber = record?.to_number ?? null;
+  const answeredByUserId = record?.answered_by_user_id ?? null;
 
   // Si la llamada fue contestada y completada → hubo conversación real
   if (dialStatus === 'completed') {
@@ -66,6 +69,10 @@ export async function POST(req: NextRequest) {
       call_sid: callSid,
       direction,
       status: 'completed',
+      from: fromNumber,
+      to: toNumber,
+      queue_id: queueId ?? null,
+      answered_by_user_id: answeredByUserId,
       duration: dialDuration,
       wait_time: waitTime ?? null,
       answered_at: answeredAt.toISOString(),
@@ -188,6 +195,8 @@ export async function POST(req: NextRequest) {
     emitEvent('call.missed', {
       call_sid: callSid,
       direction,
+      from: fromNumber,
+      to: toNumber,
       final_status: statusMap[dialStatus] || 'no_answer',
       queue_id: queueId ?? null,
     });

@@ -185,6 +185,7 @@ export async function POST(req: NextRequest) {
           {
             statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
             statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+            url: `${baseUrl}/api/webhooks/twilio/voice/whisper?operator_id=${op.id}&call_sid=${callSid}`,
           },
           op.id
         );
@@ -208,6 +209,7 @@ export async function POST(req: NextRequest) {
           {
             statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
             statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+            url: `${baseUrl}/api/webhooks/twilio/voice/whisper?operator_id=${nextOperator.id}&call_sid=${callSid}`,
           },
           nextOperator.id
         );

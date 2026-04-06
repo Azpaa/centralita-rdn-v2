@@ -36,6 +36,7 @@ import type { CallRecord, PhoneNumber, User } from '@/lib/types/database';
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type WidgetState = 'idle' | 'connecting' | 'incoming' | 'active' | 'disconnected';
+type SoftphoneStatus = 'connected' | 'reconnecting' | 'degraded' | 'disconnected' | 'needs_intervention';
 
 type CallSlot = {
   id: string;
@@ -66,6 +67,8 @@ export function CallWidget() {
   // Global state
   const [widgetState, setWidgetState] = useState<WidgetState>('idle');
   const [registered, setRegistered] = useState(false);
+  const [softphoneStatus, setSoftphoneStatus] = useState<SoftphoneStatus>('reconnecting');
+  const [softphoneReason, setSoftphoneReason] = useState('Inicializando...');
   const [error, setError] = useState('');
   const [identity, setIdentity] = useState('');
 
@@ -104,6 +107,13 @@ export function CallWidget() {
   callsRef.current = calls;
   const activeCallIdRef = useRef<string | null>(null);
   activeCallIdRef.current = activeCallId;
+  const reconnectingRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const healthCheckInFlightRef = useRef(false);
+  const reconnectAttemptRef = useRef(0);
+  const initDeviceRef = useRef<(() => Promise<void>) | null>(null);
+  const lastHealthyAtRef = useRef(0);
+  const consecutiveInitFailuresRef = useRef(0);
 
   // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -277,19 +287,78 @@ export function CallWidget() {
 
   // ─── Initialize Twilio Device ──────────────────────────────────────────────
 
-  // Track whether we're already reconnecting to avoid overlapping attempts
-  const reconnectingRef = useRef(false);
+  const clearReconnectTimer = useCallback(() => {
+    if (!reconnectTimerRef.current) return;
+    clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
+  }, []);
+
+  const markSoftphoneHealthy = useCallback((reason: string) => {
+    setRegistered(true);
+    setSoftphoneStatus('connected');
+    setSoftphoneReason(reason);
+    setError('');
+    lastHealthyAtRef.current = Date.now();
+    reconnectAttemptRef.current = 0;
+    consecutiveInitFailuresRef.current = 0;
+    clearReconnectTimer();
+    reconnectingRef.current = false;
+  }, [clearReconnectTimer]);
+
+  const markSoftphoneProblem = useCallback((status: Exclude<SoftphoneStatus, 'connected'>, reason: string) => {
+    setRegistered(false);
+    setSoftphoneStatus(status);
+    setSoftphoneReason(reason);
+  }, []);
+
+  const scheduleReconnect = useCallback((reason: string, delayMs?: number) => {
+    if (reconnectTimerRef.current) return;
+
+    reconnectAttemptRef.current += 1;
+    const computedDelay = delayMs ?? Math.min(20_000, 1_000 * 2 ** Math.min(reconnectAttemptRef.current, 4));
+    markSoftphoneProblem('reconnecting', reason);
+
+    console.warn(
+      `[CallWidget] Scheduling reconnect in ${Math.round(computedDelay / 1000)}s. reason=${reason} attempt=${reconnectAttemptRef.current}`
+    );
+
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      reconnectingRef.current = false;
+      const runInit = initDeviceRef.current;
+      if (runInit) void runInit();
+    }, computedDelay);
+  }, [markSoftphoneProblem]);
 
   const initDevice = useCallback(async () => {
     if (reconnectingRef.current) return; // prevent parallel reconnect attempts
     reconnectingRef.current = true;
+    clearReconnectTimer();
+    markSoftphoneProblem('reconnecting', 'Inicializando softphone');
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      markSoftphoneProblem('degraded', 'Sin conectividad de red');
+      reconnectingRef.current = false;
+      return;
+    }
 
     try {
       setError('');
       const res = await api.get<{ token: string; identity: string; userName: string }>('/token');
       if (!res.ok) {
-        setError('Error obteniendo token de voz');
+        const message = res.error || 'Error obteniendo token de voz';
+        setError(message);
+        consecutiveInitFailuresRef.current += 1;
+
+        if (consecutiveInitFailuresRef.current >= 3) {
+          markSoftphoneProblem('needs_intervention', 'No se pudo renovar el token de voz. Reintenta o revisa la sesion.');
+          reconnectingRef.current = false;
+          return;
+        }
+
+        markSoftphoneProblem('degraded', 'No se pudo obtener token de voz');
         reconnectingRef.current = false;
+        scheduleReconnect('token_fetch_failed');
         return;
       }
 
@@ -301,11 +370,15 @@ export function CallWidget() {
         try {
           deviceRef.current.updateToken(token);
           await deviceRef.current.register();
-          reconnectingRef.current = false;
+          markSoftphoneHealthy('Registro renovado');
           return;
         } catch {
-          // Device is in bad state — destroy and recreate
-          deviceRef.current.destroy();
+          // Device is in bad state: destroy and recreate
+          try {
+            deviceRef.current.destroy();
+          } catch {
+            // no-op
+          }
           deviceRef.current = null;
         }
       }
@@ -317,35 +390,42 @@ export function CallWidget() {
         closeProtection: true,
       });
 
+      device.on('registering', () => {
+        markSoftphoneProblem('reconnecting', 'Registrando softphone');
+        console.log('[CallWidget] Device registering...');
+      });
+
       device.on('registered', () => {
-        setRegistered(true);
-        setError('');
-        console.log('[CallWidget] Device registered ✓');
+        console.log('[CallWidget] Device registered');
+        markSoftphoneHealthy('Softphone registrado');
       });
 
       device.on('unregistered', () => {
-        setRegistered(false);
-        console.warn('[CallWidget] Device unregistered — scheduling auto-reconnect');
-        // Auto-reconnect after a short delay
-        setTimeout(() => {
-          reconnectingRef.current = false;
-          initDevice();
-        }, 3000);
+        console.warn('[CallWidget] Device unregistered');
+        markSoftphoneProblem('degraded', 'Softphone desregistrado');
+        scheduleReconnect('device_unregistered', 2500);
+      });
+
+      device.on('destroyed', () => {
+        console.warn('[CallWidget] Device destroyed');
+        markSoftphoneProblem('degraded', 'Softphone destruido');
+        scheduleReconnect('device_destroyed', 2500);
       });
 
       device.on('error', (err: { message?: string; code?: number }) => {
+        const code = err.code;
+        const reason = `device_error_${String(code ?? 'unknown')}`;
         console.error('[CallWidget] Device error:', err);
-        // 31205 = token expired, 31009 = transport error
-        if (err.code === 31205 || err.code === 31009) {
-          // Token expired or connection lost — auto-reconnect
-          console.warn('[CallWidget] Token/transport error — reconnecting...');
-          setTimeout(() => {
-            reconnectingRef.current = false;
-            initDevice();
-          }, 2000);
-        } else {
-          setError(err.message || 'Error de dispositivo');
+
+        // Token/transport-related errors
+        if (code === 31204 || code === 31205 || code === 31009) {
+          markSoftphoneProblem('degraded', 'Error de token o transporte en softphone');
+          scheduleReconnect(reason, 2000);
+          return;
         }
+
+        setError(err.message || 'Error de dispositivo');
+        markSoftphoneProblem('degraded', err.message || 'Error de dispositivo');
       });
 
       device.on('incoming', (call: Call) => {
@@ -394,35 +474,93 @@ export function CallWidget() {
       });
 
       device.on('tokenWillExpire', async () => {
-        console.log('[CallWidget] Token expiring — refreshing...');
+        console.log('[CallWidget] Token expiring, refreshing...');
         try {
           const refreshRes = await api.get<{ token: string }>('/token');
           if (refreshRes.ok) {
             device.updateToken(refreshRes.data.token);
-            console.log('[CallWidget] Token refreshed ✓');
+            console.log('[CallWidget] Token refreshed');
           } else {
-            console.warn('[CallWidget] Token refresh failed — will reconnect on expire');
+            markSoftphoneProblem('degraded', 'No se pudo refrescar el token de voz');
+            scheduleReconnect('token_refresh_failed', 2000);
           }
         } catch {
-          console.warn('[CallWidget] Token refresh error');
+          markSoftphoneProblem('degraded', 'Error refrescando token de voz');
+          scheduleReconnect('token_refresh_exception', 2000);
         }
       });
 
-      await device.register();
       deviceRef.current = device;
+      await device.register();
     } catch (err) {
       console.error('[CallWidget] Init error:', err);
       setError('Error inicializando dispositivo de voz');
-      // Retry after delay
-      setTimeout(() => {
-        reconnectingRef.current = false;
-        initDevice();
-      }, 5000);
-      return;
-    }
+      consecutiveInitFailuresRef.current += 1;
 
-    reconnectingRef.current = false;
-  }, [addCallSlot, lookupRdnOutboundBySid, setupCallHandlers]);
+      if (consecutiveInitFailuresRef.current >= 3) {
+        markSoftphoneProblem('needs_intervention', 'No se pudo levantar el softphone tras varios intentos.');
+      } else {
+        markSoftphoneProblem('degraded', 'Error inicializando softphone');
+        scheduleReconnect('init_exception', 5000);
+      }
+    } finally {
+      reconnectingRef.current = false;
+    }
+  }, [addCallSlot, clearReconnectTimer, lookupRdnOutboundBySid, markSoftphoneHealthy, markSoftphoneProblem, scheduleReconnect, setupCallHandlers]);
+  useEffect(() => {
+    initDeviceRef.current = initDevice;
+  }, [initDevice]);
+
+  const runSoftphoneHealthCheck = useCallback(async (trigger: string, forceRegister = false) => {
+    if (healthCheckInFlightRef.current) return;
+    healthCheckInFlightRef.current = true;
+
+    try {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        markSoftphoneProblem('degraded', 'Sin conectividad de red');
+        return;
+      }
+
+      const device = deviceRef.current;
+      if (!device) {
+        markSoftphoneProblem('degraded', `Softphone no inicializado (${trigger})`);
+        scheduleReconnect(`missing_device_${trigger}`, 1200);
+        return;
+      }
+
+      if (device.state !== 'registered') {
+        markSoftphoneProblem('degraded', `Softphone ${device.state} (${trigger})`);
+        scheduleReconnect(`state_${device.state}_${trigger}`, 1200);
+        return;
+      }
+
+      const staleMs = Date.now() - lastHealthyAtRef.current;
+      const shouldReRegister = forceRegister || (staleMs > 7 * 60 * 1000);
+      if (shouldReRegister && callsRef.current.length === 0) {
+        console.log(
+          `[CallWidget] Health check (${trigger}) forcing register refresh. staleMs=${staleMs}`
+        );
+
+        try {
+          await device.register();
+          markSoftphoneHealthy(`Registro validado (${trigger})`);
+        } catch (err) {
+          console.warn(`[CallWidget] Health check register failed (${trigger})`, err);
+          markSoftphoneProblem('degraded', `Fallo al re-registrar (${trigger})`);
+          scheduleReconnect(`register_refresh_failed_${trigger}`, 1500);
+        }
+        return;
+      }
+
+      if (softphoneStatus !== 'connected') {
+        markSoftphoneHealthy(`Salud OK (${trigger})`);
+      } else {
+        lastHealthyAtRef.current = Date.now();
+      }
+    } finally {
+      healthCheckInFlightRef.current = false;
+    }
+  }, [markSoftphoneHealthy, markSoftphoneProblem, scheduleReconnect, softphoneStatus]);
 
   // ─── Mute helpers ──────────────────────────────────────────────────────────
 
@@ -647,10 +785,11 @@ export function CallWidget() {
       Notification.requestPermission().catch(() => {});
     }
 
-    // DO NOT destroy the device on cleanup — the widget should stay alive
-    // as long as the app is open. Only clean up timers.
+    // DO NOT destroy the device on cleanup: the widget should stay alive
+    // as long as the app is open. Only clean up timers/reconnect scheduler.
     return () => {
       stopAllTimers();
+      clearReconnectTimer();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -658,68 +797,94 @@ export function CallWidget() {
   // ─── Visibility change: re-check device when tab regains focus ─────────────
 
   useEffect(() => {
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        console.log('[CallWidget] Tab visible — checking device...');
-        const device = deviceRef.current;
-        if (!device) {
-          // Device was never created or was destroyed — reinitialize
-          reconnectingRef.current = false;
-          initDevice();
-          return;
-        }
-        // Check if the device is still registered
-        // If state is 'registered' the WebSocket is alive — nothing to do
-        // If state is 'unregistered' or 'destroyed' — reconnect
-        const state = device.state;
-        if (state !== 'registered') {
-          console.warn(`[CallWidget] Device state is "${state}" after tab visible — reconnecting`);
-          reconnectingRef.current = false;
-          initDevice();
-        } else {
-          // Device is registered, but token might be close to expiring.
-          // Proactively refresh the token.
-          api.get<{ token: string }>('/token').then((res) => {
-            if (res.ok && deviceRef.current) {
-              deviceRef.current.updateToken(res.data.token);
-              console.log('[CallWidget] Token proactively refreshed on tab visible');
-            }
-          }).catch(() => {});
-        }
-      }
+    const onTabVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      console.log('[CallWidget] Tab visible: checking softphone health');
+      void runSoftphoneHealthCheck('tab_visible', true);
     };
 
-    document.addEventListener('visibilitychange', handleVisibility);
-    return () => document.removeEventListener('visibilitychange', handleVisibility);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const onFocus = () => {
+      console.log('[CallWidget] Window focus: checking softphone health');
+      void runSoftphoneHealthCheck('window_focus', true);
+    };
 
-  // ─── Keepalive: periodic check even in background ──────────────────────────
-  // Browsers throttle setTimeout/setInterval in background tabs to ~1/min max.
-  // We use a setInterval at 5-min cadence to catch cases where the device
-  // silently lost its WebSocket. This is our safety net.
+    const onPageShow = () => {
+      console.log('[CallWidget] Page shown: checking softphone health');
+      void runSoftphoneHealthCheck('pageshow', true);
+    };
+
+    document.addEventListener('visibilitychange', onTabVisible);
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('pageshow', onPageShow);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onTabVisible);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('pageshow', onPageShow);
+    };
+  }, [runSoftphoneHealthCheck]);
 
   useEffect(() => {
-    const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
+    const onOnline = () => {
+      console.log('[CallWidget] Browser online: scheduling health check');
+      void runSoftphoneHealthCheck('browser_online', true);
+    };
+
+    const onOffline = () => {
+      console.warn('[CallWidget] Browser offline: softphone degraded');
+      markSoftphoneProblem('degraded', 'Navegador sin conexion');
+    };
+
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+
+    return () => {
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
+    };
+  }, [markSoftphoneProblem, runSoftphoneHealthCheck]);
+
+  // ─── Keepalive: periodic check even in background ──────────────────────────
+  // Browsers throttle timers heavily in background tabs.
+  // Keepalive periodically validates the registration and forces recovery if needed.
+  // This is a lightweight safety net, not a voice heartbeat stream.
+
+  useEffect(() => {
+    const KEEPALIVE_INTERVAL = 90 * 1000; // 90 seconds (background tabs are throttled by the browser)
 
     const interval = setInterval(() => {
-      const device = deviceRef.current;
-      if (!device) return;
-      if (device.state !== 'registered') {
-        console.warn('[CallWidget] Keepalive: device not registered — reconnecting');
-        reconnectingRef.current = false;
-        initDevice();
-      }
+      const forceRegister = document.visibilityState === 'visible';
+      void runSoftphoneHealthCheck('interval_keepalive', forceRegister);
     }, KEEPALIVE_INTERVAL);
 
     return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [runSoftphoneHealthCheck]);
 
   // ─── Compute derived state ─────────────────────────────────────────────────
 
   const activeCall = calls.find(c => c.id === activeCallId);
   const hasMultipleCalls = calls.length > 1;
+  const canDial = softphoneStatus === 'connected' && registered;
+
+  const softphoneBadgeClass = softphoneStatus === 'connected'
+    ? 'bg-green-500/10 text-green-600 border-green-500/30'
+    : softphoneStatus === 'reconnecting'
+      ? 'bg-yellow-500/10 text-yellow-700 border-yellow-500/30'
+      : softphoneStatus === 'degraded'
+        ? 'bg-amber-500/10 text-amber-700 border-amber-500/30'
+        : softphoneStatus === 'needs_intervention'
+          ? 'bg-destructive/10 text-destructive border-destructive/40'
+          : 'bg-muted text-muted-foreground border-border';
+
+  const softphoneBadgeLabel = softphoneStatus === 'connected'
+    ? 'Conectado'
+    : softphoneStatus === 'reconnecting'
+      ? 'Reconectando...'
+      : softphoneStatus === 'degraded'
+        ? 'Degradado'
+        : softphoneStatus === 'needs_intervention'
+          ? 'Revisar sesion'
+          : 'Desconectado';
 
   // ─── RENDER ────────────────────────────────────────────────────────────────
 
@@ -1229,7 +1394,7 @@ export function CallWidget() {
             <Button
               className="w-full bg-green-600 hover:bg-green-700 text-white"
               onClick={() => makeOutboundCall(dialNumber)}
-              disabled={!dialNumber.trim() || !registered}
+              disabled={!dialNumber.trim() || !canDial}
             >
               <Phone className="mr-2 h-4 w-4" /> Llamar
             </Button>
@@ -1242,29 +1407,25 @@ export function CallWidget() {
         <div className="flex items-center gap-2">
           <div className={cn(
             'flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium border shadow-sm',
-            registered
-              ? 'bg-green-500/10 text-green-600 border-green-500/30'
-              : reconnectingRef.current
-                ? 'bg-yellow-500/10 text-yellow-600 border-yellow-500/30'
-                : 'bg-muted text-muted-foreground border-border'
-          )}>
-            {registered ? <Wifi className="h-3 w-3" /> :
-              reconnectingRef.current ? <Loader2 className="h-3 w-3 animate-spin" /> :
+            softphoneBadgeClass
+          )} title={softphoneReason || undefined}>
+            {softphoneStatus === 'connected' ? <Wifi className="h-3 w-3" /> :
+              softphoneStatus === 'reconnecting' ? <Loader2 className="h-3 w-3 animate-spin" /> :
               <WifiOff className="h-3 w-3" />}
-            {registered ? 'Conectado' : reconnectingRef.current ? 'Reconectando...' : 'Sin conexión'}
+            {softphoneBadgeLabel}
           </div>
 
           <Button
             size="icon"
             className={cn(
               'h-12 w-12 rounded-full shadow-lg',
-              registered ? 'bg-green-600 hover:bg-green-700' : 'bg-muted hover:bg-muted'
+              canDial ? 'bg-green-600 hover:bg-green-700' : 'bg-muted hover:bg-muted'
             )}
             onClick={() => {
-              if (registered) setShowNewCallDialpad(true);
+              if (canDial) setShowNewCallDialpad(true);
               else { reconnectingRef.current = false; initDevice(); }
             }}
-            title={registered ? 'Nueva llamada' : 'Reconectar'}
+            title={canDial ? 'Nueva llamada' : `Reconectar${softphoneReason ? `: ${softphoneReason}` : ''}`}
           >
             <Phone className="h-5 w-5 text-white" />
           </Button>
@@ -1273,3 +1434,5 @@ export function CallWidget() {
     </div>
   );
 }
+
+
