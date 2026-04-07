@@ -39,7 +39,7 @@
         "https://centralita.reparacionesdelnorte.es/api/v1/voice-agent/releases/latest"
       ],
       "dialog": true,
-      "pubkey": "REEMPLAZAR_TAURI_UPDATER_PUBKEY"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5RjgwNTA0MjAwQkE0QzQKUldURXBBc2dCQVg0cWRETmwwdlZ1cjVnMTBtazA3OHIvMFZXUFo1akMvVmp4aCtPTjRka3FPWEIK"
     }
   }
 }
