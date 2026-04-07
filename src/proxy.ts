@@ -17,6 +17,7 @@ const publicRoutes = [
   '/change-password',
   '/api/webhooks/',
   '/api/v1/',
+  '/api/download-agent',
   '/api/health',
   '/voice-agent/download',
   '/downloads/',

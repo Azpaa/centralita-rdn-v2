@@ -123,6 +123,14 @@ export default async function VoiceAgentDownloadPage() {
         <p className="text-sm text-muted-foreground">
           Descarga oficial del cliente Tauri de voz para Centralita.
         </p>
+        <div>
+          <Link
+            href="/api/download-agent"
+            className="inline-flex rounded-md border border-input bg-background px-3 py-2 text-sm font-medium hover:bg-muted"
+          >
+            Descargar agente
+          </Link>
+        </div>
       </header>
 
       {manifestState.status === 'missing' && (
@@ -195,4 +203,3 @@ export default async function VoiceAgentDownloadPage() {
     </main>
   );
 }
-

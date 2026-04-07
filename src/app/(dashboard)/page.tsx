@@ -4,7 +4,7 @@ import { useEffect, useState, useRef } from 'react';
 import Link from 'next/link';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { PhoneIncoming, PhoneCall, Users, UserCheck, AlertCircle } from 'lucide-react';
+import { PhoneIncoming, PhoneCall, Users, UserCheck, AlertCircle, Download } from 'lucide-react';
 import { api } from '@/lib/api/client';
 import { cn } from '@/lib/utils';
 
@@ -86,8 +86,11 @@ export default function DashboardPage() {
           <h1 className="text-2xl font-bold">Dashboard</h1>
           <p className="text-muted-foreground">Resumen general de la centralita</p>
         </div>
-        <Link href="/voice-agent/download">
-          <Button variant="outline">Descargar App Desktop</Button>
+        <Link href="/api/download-agent" prefetch={false}>
+          <Button variant="outline" className="gap-2">
+            <Download className="h-4 w-4" />
+            Descargar agente
+          </Button>
         </Link>
       </div>
 

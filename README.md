@@ -18,6 +18,15 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
+## Voice Agent Desktop Download
+
+Set `VOICE_AGENT_DOWNLOAD_URL` with the public installer URL used by `/api/download-agent`.
+Example:
+
+```bash
+VOICE_AGENT_DOWNLOAD_URL=https://github.com/Azpaa/centralita-rdn-v2/releases/download/v0.1.0/RDN.Voice.Agent_0.1.0_x64-setup.exe
+```
+
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
 ## Learn More
