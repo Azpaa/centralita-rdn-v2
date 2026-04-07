@@ -1,0 +1,16 @@
+{
+  "app_id": "com.rdn.voice_agent",
+  "version": "0.1.0",
+  "released_at": "2026-04-07T00:00:00.000Z",
+  "notes": "Base MVP de Voice Agent Tauri con login, SSE y estado canónico.",
+  "assets": [
+    {
+      "platform": "windows",
+      "arch": "x64",
+      "file_name": "RDN-Voice-Agent_0.1.0_x64-setup.exe",
+      "url": "/downloads/voice-agent/v0.1.0/RDN-Voice-Agent_0.1.0_x64-setup.exe",
+      "signature_url": "/downloads/voice-agent/v0.1.0/RDN-Voice-Agent_0.1.0_x64-setup.exe.sig",
+      "sha256": null
+    }
+  ]
+}

@@ -24,12 +24,16 @@ export interface AuthResult {
  * Devuelve AuthResult si ok, o NextResponse de error si falla.
  */
 export async function authenticate(req: NextRequest): Promise<AuthResult | Response> {
-  // 1. Comprobar API Key
+  // 1. Comprobar Bearer token (API key o JWT Supabase)
   const authHeader = req.headers.get('authorization');
-  if (authHeader?.startsWith('Bearer ') && !authHeader.includes('.')) {
-    // Parece un API key (no un JWT que contiene puntos)
-    const apiKey = authHeader.slice(7);
-    return authenticateApiKey(apiKey);
+  if (authHeader?.startsWith('Bearer ')) {
+    const bearerToken = authHeader.slice(7).trim();
+    if (bearerToken.includes('.')) {
+      // JWT de Supabase (desktop/web clientes externos con token propio)
+      return authenticateSupabaseJwt(bearerToken);
+    }
+    // API key M2M tradicional (ck_...)
+    return authenticateApiKey(bearerToken);
   }
 
   // 2. Comprobar sesión Supabase
@@ -103,6 +107,32 @@ async function authenticateSession(): Promise<AuthResult | Response> {
 
   // Buscar usuario en tabla users por auth_id
   const adminClient = createAdminClient();
+  const { data: appUser } = await adminClient
+    .from('users')
+    .select('id, role')
+    .eq('auth_id', user.id)
+    .is('deleted_at', null)
+    .single();
+
+  return {
+    userId: appUser?.id || null,
+    authId: user.id,
+    authMethod: 'session',
+    role: (appUser?.role as UserRole) || undefined,
+  };
+}
+
+async function authenticateSupabaseJwt(jwt: string): Promise<AuthResult | Response> {
+  const adminClient = createAdminClient();
+  const {
+    data: { user },
+    error,
+  } = await adminClient.auth.getUser(jwt);
+
+  if (error || !user) {
+    return apiUnauthorized('JWT de Supabase no valido');
+  }
+
   const { data: appUser } = await adminClient
     .from('users')
     .select('id, role')

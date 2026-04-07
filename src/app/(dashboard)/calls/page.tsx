@@ -81,7 +81,7 @@ export default function CallsPage() {
   const [dialFromNumber, setDialFromNumber] = useState('');
   const [activeNumbers, setActiveNumbers] = useState<PhoneNumber[]>([]);
 
-  // Call context — routes calls through Voice SDK (WebRTC) for browser audio
+  // Call context — sends dial command to backend; audio is then attached in Voice SDK
   const { dial } = useCall();
 
   const load = useCallback(async () => {
@@ -145,7 +145,7 @@ export default function CallsPage() {
       formattedNumber = `+34${formattedNumber}`;
     }
 
-    // Route through Voice SDK (WebRTC) via CallWidget for real browser audio
+    // Route through backend dial command via CallWidget (backend source of truth)
     dial(formattedNumber, dialFromNumber);
     toast.success('Llamada iniciada al ' + formattedNumber);
     setDialOpen(false);

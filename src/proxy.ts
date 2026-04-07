@@ -12,13 +12,55 @@ import { NextResponse, type NextRequest } from 'next/server'
  *   las dejamos pasar y la ruta se encarga)
  * - /api/health: healthcheck
  */
-const publicRoutes = ['/login', '/change-password', '/api/webhooks/', '/api/v1/', '/api/health']
+const publicRoutes = [
+  '/login',
+  '/change-password',
+  '/api/webhooks/',
+  '/api/v1/',
+  '/api/health',
+  '/voice-agent/download',
+  '/downloads/',
+]
+
+const defaultDesktopOrigins = ['tauri://localhost', 'http://localhost:1420', 'http://127.0.0.1:1420']
+
+function getAllowedDesktopOrigins(): string[] {
+  const fromEnv = (process.env.TAURI_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+  return [...new Set([...defaultDesktopOrigins, ...fromEnv])]
+}
+
+function isDesktopOriginAllowed(origin: string | null): origin is string {
+  if (!origin) return false
+  return getAllowedDesktopOrigins().includes(origin)
+}
+
+function applyApiCorsHeaders(response: NextResponse, origin: string | null) {
+  if (!isDesktopOriginAllowed(origin)) return
+
+  response.headers.set('Access-Control-Allow-Origin', origin)
+  response.headers.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
+  response.headers.set('Access-Control-Allow-Headers', 'Authorization,Content-Type,Accept')
+  response.headers.set('Access-Control-Expose-Headers', 'Content-Type,X-Request-Id')
+  response.headers.set('Vary', 'Origin')
+}
 
 function isPublicRoute(pathname: string): boolean {
   return publicRoutes.some((route) => pathname.startsWith(route))
 }
 
 export async function proxy(request: NextRequest) {
+  const { pathname } = request.nextUrl
+  const requestOrigin = request.headers.get('origin')
+
+  if (pathname.startsWith('/api/v1/') && request.method === 'OPTIONS') {
+    const preflight = new NextResponse(null, { status: 204 })
+    applyApiCorsHeaders(preflight, requestOrigin)
+    return preflight
+  }
+
   let supabaseResponse = NextResponse.next({ request })
 
   const supabase = createServerClient(
@@ -46,8 +88,6 @@ export async function proxy(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser()
 
-  const { pathname } = request.nextUrl
-
   // Allow public routes
   if (isPublicRoute(pathname)) {
     // Redirect authenticated users away from login
@@ -55,6 +95,9 @@ export async function proxy(request: NextRequest) {
       const url = request.nextUrl.clone()
       url.pathname = '/'
       return NextResponse.redirect(url)
+    }
+    if (pathname.startsWith('/api/v1/')) {
+      applyApiCorsHeaders(supabaseResponse, requestOrigin)
     }
     return supabaseResponse
   }
@@ -65,6 +108,10 @@ export async function proxy(request: NextRequest) {
     url.pathname = '/login'
     url.searchParams.set('redirectTo', pathname)
     return NextResponse.redirect(url)
+  }
+
+  if (pathname.startsWith('/api/v1/')) {
+    applyApiCorsHeaders(supabaseResponse, requestOrigin)
   }
 
   return supabaseResponse

@@ -60,6 +60,11 @@ export async function POST(req: NextRequest) {
     });
 
     // Emitir evento call.incoming para RDN
+    const candidateUserIds = (route.operators ?? []).map((op) => op.id);
+    const candidateRdnUserIds = (route.operators ?? [])
+      .map((op) => op.rdn_user_id)
+      .filter((value): value is string => Boolean(value));
+
     emitEvent('call.incoming', {
       call_sid: callSid,
       direction: 'inbound',
@@ -69,6 +74,9 @@ export async function POST(req: NextRequest) {
       queue_id: route.queue?.id ?? null,
       phone_number_id: route.phoneNumber.id,
       route_type: route.type,
+      ring_strategy: route.queue?.strategy ?? null,
+      candidate_user_ids: candidateUserIds,
+      candidate_rdn_user_ids: candidateRdnUserIds,
     });
 
     // --- Número inactivo ---
@@ -174,6 +182,35 @@ export async function POST(req: NextRequest) {
       .from('call_records')
       .update({ status: 'in_queue' })
       .eq('twilio_call_sid', callSid);
+
+    const ringTargets = queue.strategy === 'ring_all'
+      ? operators
+      : (operators[queue.current_index % operators.length]
+        ? [operators[queue.current_index % operators.length]]
+        : []);
+
+    if (ringTargets.length > 0) {
+      console.log(
+        `[INCOMING] pre-answer routing call_sid=${callSid} strategy=${queue.strategy} targets=${ringTargets.map((op) => op.id).join(',')}`
+      );
+
+      for (const target of ringTargets) {
+        emitEvent('call.ringing', {
+          call_sid: callSid,
+          direction: 'inbound',
+          status: 'ringing',
+          from: fromNumber,
+          to: toNumber,
+          queue_id: queue.id,
+          phone_number_id: route.phoneNumber.id,
+          route_type: route.type,
+          ring_strategy: queue.strategy,
+          user_id: target.id,
+          answered_by_user_id: target.id,
+          rdn_user_id: target.rdn_user_id ?? null,
+        });
+      }
+    }
 
     // Configurar Dial según la estrategia de la cola
     const dial = twiml.dial({

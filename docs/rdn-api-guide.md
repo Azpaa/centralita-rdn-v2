@@ -1,6 +1,6 @@
 ﻿# Guia contractual de integracion - Centralita <-> RDN
 
-> Version contrato: 2.1
+> Version contrato: 2.2
 > Estado: Canónico (externo para RDN)
 > Base URL: `https://centralita.reparacionesdelnorte.es`
 > Formato: JSON sobre HTTPS
@@ -176,9 +176,18 @@ Body:
 ```json
 {
   "destination_number": "+34612345678",
-  "from_number": "+34848819410"
+  "from_number": "+34848819410",
+  "user_id": "uuid-del-agente-opcional-pero-recomendado",
+  "rdn_user_id": "id-operativo-rdn-opcional",
+  "metadata": { "source": "rdn" }
 }
 ```
+
+Notas operativas:
+- Si se envia `user_id` o `rdn_user_id`, backend resuelve ownership de agente y crea flujo attach `client:<agent_id>`.
+- Fuente en `twilio_data.source`:
+  - `rdn` para comandos M2M por API key.
+  - `backend_outbound` para comandos iniciados por sesion web (panel), manteniendo backend como motor.
 
 ### POST `/api/v1/calls/{call_sid}/hangup`
 Cuelga llamada.
@@ -193,6 +202,10 @@ Valores:
 - `all` (default): cuelga ambas legs
 - `agent`: cuelga solo leg `call_sid`
 - `remote`: cuelga solo la otra leg
+
+Control de ownership:
+- Session `operator`: solo puede controlar llamadas propias (segun ownership backend).
+- Session `admin` y API key M2M: permitido.
 
 ### POST `/api/v1/calls/{call_sid}/hold`
 Pone en espera la otra leg.
@@ -242,6 +255,102 @@ Body:
 ```
 
 Tambien soporta destino navegador: `"destination": "client:<user_id>"`.
+
+Ownership: mismas reglas de control que en `hangup/hold/resume`.
+
+## 5.5 Estado canonico de agente (web + futuro Tauri)
+
+### GET `/api/v1/agent/me/state`
+Estado operativo canonico del agente desde backend (fuente de verdad).
+
+Sesion web:
+- usa el agente de la sesion actual.
+
+API key M2M:
+- requiere query `?user_id=<uuid>`.
+
+Respuesta (shape resumido):
+
+```json
+{
+  "user_id": "uuid",
+  "active": true,
+  "available": true,
+  "operational_status": "ready",
+  "active_calls_count": 1,
+  "active_calls": [
+    {
+      "call_record_id": "uuid",
+      "call_sid": "CAxxxx",
+      "status": "in_progress",
+      "direction": "outbound",
+      "from": "+34...",
+      "to": "+34..."
+    }
+  ],
+  "source_of_truth": "backend_call_records",
+  "generated_at": "2026-04-07T10:15:00.000Z"
+}
+```
+
+## 5.6 Stream canonico backend -> clientes (SSE)
+
+### GET `/api/v1/stream/events`
+Canal push canonico para clientes web y futuro cliente Tauri.
+
+Formato:
+- `Content-Type: text/event-stream`
+- Mensajes JSON en `data: ...`
+
+Auth y scope:
+- Sesion `operator`: `scope=mine` (solo eventos del agente de sesion).
+- Sesion `admin`: `scope=mine` (default), `scope=all` o `user_id=<uuid>`.
+- API key M2M: requiere `user_id=<uuid>` para evitar streams globales accidentales.
+
+Eventos canónicos:
+- `connected`
+- `snapshot` (incluye `agent_state` inicial)
+- `incoming_call`
+- `call_answered`
+- `call_updated`
+- `call_ended`
+- `call_transfer_completed`
+- `conference_updated` (reservado para acciones de conferencia)
+- `agent_state_changed`
+- `recording_ready`
+- `heartbeat`
+
+Shape base de evento:
+
+```json
+{
+  "id": "uuid",
+  "type": "call_updated",
+  "timestamp": "2026-04-07T10:40:00.000Z",
+  "domain_event": "call.hold",
+  "call_sid": "CAxxxx",
+  "agent_user_id": "uuid-agente",
+  "target_user_ids": ["uuid-agente"],
+  "payload": { "..." : "..." }
+}
+```
+
+## 5.7 Voice Agent Desktop (bootstrap + releases)
+
+### GET `/api/v1/voice-agent/bootstrap`
+Config pública para cliente desktop (Tauri):
+- base URL backend
+- rutas canónicas (`stream/events`, `agent/me/state`, comandos de llamada)
+- config pública de Supabase (`supabase_url`, `supabase_anon_key`)
+- URLs de distribución y releases
+
+### GET `/api/v1/voice-agent/releases/latest`
+Devuelve manifest JSON de la última release desktop
+(fuente: `apps/voice-agent-tauri/releases/latest.json`).
+
+### Descargas web
+- Índice: `/voice-agent/download`
+- Artefactos públicos: `/downloads/voice-agent/...`
 
 ## 5.3 Consultas de historico
 

@@ -2,6 +2,8 @@ import { NextRequest } from 'next/server';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
+import { requireCallControlPermission } from '@/lib/calls/ownership';
+import { auditLog } from '@/lib/api/audit';
 
 /**
  * POST /api/v1/calls/:id/hangup
@@ -21,6 +23,9 @@ export async function POST(
 
   const { id: callSid } = await params;
   if (!callSid) return apiBadRequest('callSid es requerido');
+
+  const permissionCheck = await requireCallControlPermission(auth, callSid);
+  if (permissionCheck !== true) return permissionCheck;
 
   let body: { target?: string } = {};
   try {
@@ -59,6 +64,13 @@ export async function POST(
     if (remoteSid && (target === 'all' || target === 'remote')) {
       await client.calls(remoteSid).update({ status: 'completed' });
     }
+
+    await auditLog('call.hangup', 'call_record', callSid, auth.userId, {
+      call_sid: callSid,
+      remote_call_sid: remoteSid,
+      target,
+      auth_method: auth.authMethod,
+    });
 
     return apiSuccess({ hungup: true, callSid, target, remote_call_sid: remoteSid });
   } catch (err) {

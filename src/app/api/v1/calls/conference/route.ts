@@ -1,8 +1,12 @@
 import { NextRequest } from 'next/server';
+import crypto from 'crypto';
 import twilio from 'twilio';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
+import { requireCallControlPermission } from '@/lib/calls/ownership';
+import { auditLog } from '@/lib/api/audit';
+import { publishCanonicalClientEvent } from '@/lib/events/client-stream';
 
 /**
  * POST /api/v1/calls/conference
@@ -41,6 +45,18 @@ export async function POST(req: NextRequest) {
   const client = getTwilioClient();
 
   try {
+    const publishConferenceUpdated = (payload: Record<string, unknown>) => {
+      publishCanonicalClientEvent({
+        id: crypto.randomUUID(),
+        type: 'conference_updated',
+        timestamp: new Date().toISOString(),
+        call_sid: typeof payload.call_sid === 'string' ? payload.call_sid : null,
+        agent_user_id: auth.userId ?? null,
+        target_user_ids: auth.userId ? [auth.userId] : [],
+        payload,
+      });
+    };
+
     switch (action) {
       case 'create': {
         // Mover una llamada existente a una conferencia.
@@ -49,6 +65,9 @@ export async function POST(req: NextRequest) {
         if (!callSid || !conferenceName) {
           return apiBadRequest('callSid y conferenceName son requeridos para create');
         }
+
+        const permissionCheck = await requireCallControlPermission(auth, callSid);
+        if (permissionCheck !== true) return permissionCheck;
 
         // Resolver la leg del interlocutor remoto
         const callInfo = await client.calls(callSid).fetch();
@@ -92,6 +111,20 @@ export async function POST(req: NextRequest) {
         );
         await Promise.all(redirects);
 
+        await auditLog('call.conference', 'call_record', callSid, auth.userId, {
+          action: 'create',
+          conference_name: conferenceName,
+          remote_call_sid: remoteSid,
+          auth_method: auth.authMethod,
+        });
+
+        publishConferenceUpdated({
+          action: 'create',
+          conference_name: conferenceName,
+          call_sid: callSid,
+          remote_call_sid: remoteSid,
+        });
+
         return apiSuccess({ conferenceName, callSid, remoteSid });
       }
 
@@ -132,6 +165,21 @@ export async function POST(req: NextRequest) {
             statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           });
 
+        await auditLog('call.conference', 'call_record', null, auth.userId, {
+          action: 'add',
+          conference_name: conferenceName,
+          destination,
+          participant_sid: participant.callSid,
+          auth_method: auth.authMethod,
+        });
+
+        publishConferenceUpdated({
+          action: 'add',
+          conference_name: conferenceName,
+          destination,
+          participant_sid: participant.callSid,
+        });
+
         return apiSuccess({
           conferenceName,
           participantSid: participant.callSid,
@@ -144,6 +192,9 @@ export async function POST(req: NextRequest) {
         if (!conferenceName || !participantSid) {
           return apiBadRequest('conferenceName y participantSid son requeridos para leave');
         }
+
+        const permissionCheck = await requireCallControlPermission(auth, participantSid);
+        if (permissionCheck !== true) return permissionCheck;
 
         const conferences = await client.conferences.list({
           friendlyName: conferenceName,
@@ -160,6 +211,20 @@ export async function POST(req: NextRequest) {
           .participants(participantSid)
           .remove();
 
+        await auditLog('call.conference', 'call_record', participantSid, auth.userId, {
+          action: 'leave',
+          conference_name: conferenceName,
+          participant_sid: participantSid,
+          auth_method: auth.authMethod,
+        });
+
+        publishConferenceUpdated({
+          action: 'leave',
+          conference_name: conferenceName,
+          participant_sid: participantSid,
+          call_sid: participantSid,
+        });
+
         return apiSuccess({ left: true, conferenceName });
       }
 
@@ -168,6 +233,9 @@ export async function POST(req: NextRequest) {
         if (!conferenceName || !participantSid) {
           return apiBadRequest('conferenceName y participantSid son requeridos para kick');
         }
+
+        const permissionCheck = await requireCallControlPermission(auth, participantSid);
+        if (permissionCheck !== true) return permissionCheck;
 
         const conferences = await client.conferences.list({
           friendlyName: conferenceName,
@@ -183,6 +251,20 @@ export async function POST(req: NextRequest) {
           .participants(participantSid)
           .remove();
 
+        await auditLog('call.conference', 'call_record', participantSid, auth.userId, {
+          action: 'kick',
+          conference_name: conferenceName,
+          participant_sid: participantSid,
+          auth_method: auth.authMethod,
+        });
+
+        publishConferenceUpdated({
+          action: 'kick',
+          conference_name: conferenceName,
+          participant_sid: participantSid,
+          call_sid: participantSid,
+        });
+
         return apiSuccess({ kicked: true, participantSid });
       }
 
@@ -194,3 +276,4 @@ export async function POST(req: NextRequest) {
     return apiInternalError('Error gestionando conferencia');
   }
 }
+

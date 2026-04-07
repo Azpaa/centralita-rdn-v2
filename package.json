@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "voice-agent:dev": "npm --prefix apps/voice-agent-tauri run tauri:dev",
+    "voice-agent:build": "npm --prefix apps/voice-agent-tauri run tauri:build",
+    "voice-agent:publish": "node scripts/voice-agent/publish-release.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.3.0",

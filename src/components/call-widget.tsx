@@ -37,6 +37,8 @@ import type { CallRecord, PhoneNumber, User } from '@/lib/types/database';
 
 type WidgetState = 'idle' | 'connecting' | 'incoming' | 'active' | 'disconnected';
 type SoftphoneStatus = 'connected' | 'reconnecting' | 'degraded' | 'disconnected' | 'needs_intervention';
+type BackendStreamStatus = 'connecting' | 'connected' | 'disconnected';
+type BackendOperationalStatus = 'inactive' | 'unavailable' | 'ready' | 'ringing' | 'busy_in_call';
 
 type CallSlot = {
   id: string;
@@ -59,6 +61,50 @@ type TransferTarget = {
 
 type OverlayMode = 'none' | 'transfer' | 'consult' | 'dialpad' | 'conference-actions';
 
+type BackendAgentSnapshot = {
+  user_id: string;
+  operational_status: BackendOperationalStatus;
+  active_calls_count: number;
+};
+
+type CanonicalStreamEvent = {
+  id: string;
+  type: string;
+  domain_event?: string;
+  call_sid?: string | null;
+  agent_user_id?: string | null;
+  payload?: {
+    agent_state?: BackendAgentSnapshot | null;
+    [key: string]: unknown;
+  };
+};
+
+const DEVICE_REGISTER_TIMEOUT_MS = 20_000;
+const WATCHDOG_INTERVAL_MS = 30_000;
+const WATCHDOG_SLEEP_DRIFT_MS = 120_000;
+const HEALTH_STALE_MS = 4 * 60 * 1000;
+const REGISTER_STALE_MS = 3 * 60 * 1000;
+const REGISTERING_STUCK_MS = 45_000;
+const NEEDS_INTERVENTION_RETRY_MS = 45_000;
+const BACKEND_SNAPSHOT_FALLBACK_MS = 60_000;
+
+async function registerDeviceWithTimeout(device: Device, reason: string): Promise<void> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    await Promise.race([
+      device.register(),
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`register_timeout:${reason}`));
+        }, DEVICE_REGISTER_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export function CallWidget() {
@@ -71,6 +117,10 @@ export function CallWidget() {
   const [softphoneReason, setSoftphoneReason] = useState('Inicializando...');
   const [error, setError] = useState('');
   const [identity, setIdentity] = useState('');
+  const [backendStreamStatus, setBackendStreamStatus] = useState<BackendStreamStatus>('connecting');
+  const [backendOperationalStatus, setBackendOperationalStatus] = useState<BackendOperationalStatus>('inactive');
+  const [backendActiveCallsCount, setBackendActiveCallsCount] = useState(0);
+  const [backendLastEventType, setBackendLastEventType] = useState('none');
 
   // Call slots — supports multiple simultaneous calls
   const [calls, setCalls] = useState<CallSlot[]>([]);
@@ -109,10 +159,15 @@ export function CallWidget() {
   activeCallIdRef.current = activeCallId;
   const reconnectingRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const needsInterventionRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const healthCheckInFlightRef = useRef(false);
   const reconnectAttemptRef = useRef(0);
   const initDeviceRef = useRef<(() => Promise<void>) | null>(null);
   const lastHealthyAtRef = useRef(0);
+  const lastHealthCheckAtRef = useRef(Date.now());
+  const registeringSinceRef = useRef(0);
+  const lastWatchdogTickAtRef = useRef(Date.now());
+  const hiddenSinceRef = useRef<number | null>(null);
   const consecutiveInitFailuresRef = useRef(0);
 
   // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -240,6 +295,7 @@ export function CallWidget() {
       const isRdnOutbound = record.direction === 'outbound'
         && (
           source === 'rdn'
+          || source === 'backend_outbound'
           || source === 'rdn_adopted'
           || source === 'rdn_adopted_browser'
         );
@@ -252,6 +308,51 @@ export function CallWidget() {
 
     return null;
   }, []);
+
+  const applyBackendSnapshot = useCallback((snapshot: BackendAgentSnapshot | null, reason: string) => {
+    if (!snapshot) return;
+
+    setBackendOperationalStatus(snapshot.operational_status);
+    setBackendActiveCallsCount(snapshot.active_calls_count);
+    setBackendLastEventType(`snapshot:${reason}`);
+  }, []);
+
+  const refreshBackendSnapshot = useCallback(async (reason: string) => {
+    const res = await api.get<BackendAgentSnapshot>('/agent/me/state');
+    if (!res.ok) {
+      console.warn(`[CallWidget] Backend snapshot refresh failed (${reason}): ${res.error || 'unknown'}`);
+      return;
+    }
+
+    applyBackendSnapshot(res.data, reason);
+  }, [applyBackendSnapshot]);
+
+  const handleCanonicalStreamEvent = useCallback((event: CanonicalStreamEvent) => {
+    if (!event || typeof event !== 'object') return;
+
+    setBackendLastEventType(event.type || 'unknown');
+
+    if (event.type === 'snapshot') {
+      const snapshot = event.payload?.agent_state ?? null;
+      applyBackendSnapshot(snapshot, 'stream_snapshot');
+      return;
+    }
+
+    const triggersSnapshotRefresh = new Set([
+      'incoming_call',
+      'call_answered',
+      'call_updated',
+      'call_ended',
+      'call_transfer_started',
+      'call_transfer_completed',
+      'conference_updated',
+      'agent_state_changed',
+    ]);
+
+    if (triggersSnapshotRefresh.has(event.type)) {
+      void refreshBackendSnapshot(`event:${event.type}`);
+    }
+  }, [applyBackendSnapshot, refreshBackendSnapshot]);
 
   // ─── Setup call event handlers ─────────────────────────────────────────────
 
@@ -293,17 +394,25 @@ export function CallWidget() {
     reconnectTimerRef.current = null;
   }, []);
 
+  const clearNeedsInterventionRetryTimer = useCallback(() => {
+    if (!needsInterventionRetryTimerRef.current) return;
+    clearTimeout(needsInterventionRetryTimerRef.current);
+    needsInterventionRetryTimerRef.current = null;
+  }, []);
+
   const markSoftphoneHealthy = useCallback((reason: string) => {
     setRegistered(true);
     setSoftphoneStatus('connected');
     setSoftphoneReason(reason);
     setError('');
     lastHealthyAtRef.current = Date.now();
+    lastHealthCheckAtRef.current = Date.now();
     reconnectAttemptRef.current = 0;
     consecutiveInitFailuresRef.current = 0;
     clearReconnectTimer();
+    clearNeedsInterventionRetryTimer();
     reconnectingRef.current = false;
-  }, [clearReconnectTimer]);
+  }, [clearNeedsInterventionRetryTimer, clearReconnectTimer]);
 
   const markSoftphoneProblem = useCallback((status: Exclude<SoftphoneStatus, 'connected'>, reason: string) => {
     setRegistered(false);
@@ -311,11 +420,27 @@ export function CallWidget() {
     setSoftphoneReason(reason);
   }, []);
 
+  const scheduleNeedsInterventionRetry = useCallback((reason: string, delayMs = NEEDS_INTERVENTION_RETRY_MS) => {
+    if (needsInterventionRetryTimerRef.current) return;
+
+    console.warn(
+      `[CallWidget] Scheduling automatic recovery from needs_intervention in ${Math.round(delayMs / 1000)}s. reason=${reason}`
+    );
+
+    needsInterventionRetryTimerRef.current = setTimeout(() => {
+      needsInterventionRetryTimerRef.current = null;
+      reconnectingRef.current = false;
+      const runInit = initDeviceRef.current;
+      if (runInit) void runInit();
+    }, delayMs);
+  }, []);
+
   const scheduleReconnect = useCallback((reason: string, delayMs?: number) => {
     if (reconnectTimerRef.current) return;
 
     reconnectAttemptRef.current += 1;
     const computedDelay = delayMs ?? Math.min(20_000, 1_000 * 2 ** Math.min(reconnectAttemptRef.current, 4));
+    clearNeedsInterventionRetryTimer();
     markSoftphoneProblem('reconnecting', reason);
 
     console.warn(
@@ -328,12 +453,13 @@ export function CallWidget() {
       const runInit = initDeviceRef.current;
       if (runInit) void runInit();
     }, computedDelay);
-  }, [markSoftphoneProblem]);
+  }, [clearNeedsInterventionRetryTimer, markSoftphoneProblem]);
 
   const initDevice = useCallback(async () => {
     if (reconnectingRef.current) return; // prevent parallel reconnect attempts
     reconnectingRef.current = true;
     clearReconnectTimer();
+    clearNeedsInterventionRetryTimer();
     markSoftphoneProblem('reconnecting', 'Inicializando softphone');
 
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
@@ -353,6 +479,7 @@ export function CallWidget() {
         if (consecutiveInitFailuresRef.current >= 3) {
           markSoftphoneProblem('needs_intervention', 'No se pudo renovar el token de voz. Reintenta o revisa la sesion.');
           reconnectingRef.current = false;
+          scheduleNeedsInterventionRetry('token_fetch_failed_needs_intervention');
           return;
         }
 
@@ -369,7 +496,7 @@ export function CallWidget() {
         // Try to just update the token if the device exists and is usable
         try {
           deviceRef.current.updateToken(token);
-          await deviceRef.current.register();
+          await registerDeviceWithTimeout(deviceRef.current, 'refresh_existing_device');
           markSoftphoneHealthy('Registro renovado');
           return;
         } catch {
@@ -391,23 +518,27 @@ export function CallWidget() {
       });
 
       device.on('registering', () => {
+        registeringSinceRef.current = Date.now();
         markSoftphoneProblem('reconnecting', 'Registrando softphone');
         console.log('[CallWidget] Device registering...');
       });
 
       device.on('registered', () => {
         console.log('[CallWidget] Device registered');
+        registeringSinceRef.current = 0;
         markSoftphoneHealthy('Softphone registrado');
       });
 
       device.on('unregistered', () => {
         console.warn('[CallWidget] Device unregistered');
+        registeringSinceRef.current = 0;
         markSoftphoneProblem('degraded', 'Softphone desregistrado');
         scheduleReconnect('device_unregistered', 2500);
       });
 
       device.on('destroyed', () => {
         console.warn('[CallWidget] Device destroyed');
+        registeringSinceRef.current = 0;
         markSoftphoneProblem('degraded', 'Softphone destruido');
         scheduleReconnect('device_destroyed', 2500);
       });
@@ -491,7 +622,7 @@ export function CallWidget() {
       });
 
       deviceRef.current = device;
-      await device.register();
+      await registerDeviceWithTimeout(device, 'init_new_device');
     } catch (err) {
       console.error('[CallWidget] Init error:', err);
       setError('Error inicializando dispositivo de voz');
@@ -499,6 +630,7 @@ export function CallWidget() {
 
       if (consecutiveInitFailuresRef.current >= 3) {
         markSoftphoneProblem('needs_intervention', 'No se pudo levantar el softphone tras varios intentos.');
+        scheduleNeedsInterventionRetry('init_exception_needs_intervention');
       } else {
         markSoftphoneProblem('degraded', 'Error inicializando softphone');
         scheduleReconnect('init_exception', 5000);
@@ -506,7 +638,7 @@ export function CallWidget() {
     } finally {
       reconnectingRef.current = false;
     }
-  }, [addCallSlot, clearReconnectTimer, lookupRdnOutboundBySid, markSoftphoneHealthy, markSoftphoneProblem, scheduleReconnect, setupCallHandlers]);
+  }, [addCallSlot, clearNeedsInterventionRetryTimer, clearReconnectTimer, lookupRdnOutboundBySid, markSoftphoneHealthy, markSoftphoneProblem, scheduleNeedsInterventionRetry, scheduleReconnect, setupCallHandlers]);
   useEffect(() => {
     initDeviceRef.current = initDevice;
   }, [initDevice]);
@@ -514,6 +646,7 @@ export function CallWidget() {
   const runSoftphoneHealthCheck = useCallback(async (trigger: string, forceRegister = false) => {
     if (healthCheckInFlightRef.current) return;
     healthCheckInFlightRef.current = true;
+    lastHealthCheckAtRef.current = Date.now();
 
     try {
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
@@ -528,6 +661,20 @@ export function CallWidget() {
         return;
       }
 
+      if (device.state === 'registering') {
+        const registeringForMs = registeringSinceRef.current ? Date.now() - registeringSinceRef.current : 0;
+        markSoftphoneProblem('reconnecting', `Softphone registrando (${trigger})`);
+
+        if (registeringForMs > REGISTERING_STUCK_MS) {
+          console.warn(
+            `[CallWidget] Health check detected stuck registration (${trigger}). registeringForMs=${registeringForMs}`
+          );
+          scheduleReconnect(`registering_stuck_${trigger}`, 1500);
+        }
+
+        return;
+      }
+
       if (device.state !== 'registered') {
         markSoftphoneProblem('degraded', `Softphone ${device.state} (${trigger})`);
         scheduleReconnect(`state_${device.state}_${trigger}`, 1200);
@@ -535,14 +682,14 @@ export function CallWidget() {
       }
 
       const staleMs = Date.now() - lastHealthyAtRef.current;
-      const shouldReRegister = forceRegister || (staleMs > 7 * 60 * 1000);
+      const shouldReRegister = forceRegister || (staleMs > REGISTER_STALE_MS);
       if (shouldReRegister && callsRef.current.length === 0) {
         console.log(
           `[CallWidget] Health check (${trigger}) forcing register refresh. staleMs=${staleMs}`
         );
 
         try {
-          await device.register();
+          await registerDeviceWithTimeout(device, `healthcheck_${trigger}`);
           markSoftphoneHealthy(`Registro validado (${trigger})`);
         } catch (err) {
           console.warn(`[CallWidget] Health check register failed (${trigger})`, err);
@@ -556,6 +703,7 @@ export function CallWidget() {
         markSoftphoneHealthy(`Salud OK (${trigger})`);
       } else {
         lastHealthyAtRef.current = Date.now();
+        lastHealthCheckAtRef.current = Date.now();
       }
     } finally {
       healthCheckInFlightRef.current = false;
@@ -599,9 +747,29 @@ export function CallWidget() {
     else setWidgetState('active');
   }, []);
 
-  const hangupCall = useCallback((callId: string) => {
+  const hangupCall = useCallback(async (callId: string) => {
     const slot = callsRef.current.find(c => c.id === callId);
-    if (slot) slot.call.disconnect();
+    if (!slot) return;
+
+    try {
+      if (slot.callSid) {
+        const res = await api.post(`/calls/${slot.callSid}/hangup`, { target: 'all' });
+        if (!res.ok) {
+          setError(res.error || 'Error al colgar la llamada');
+          return;
+        }
+      }
+    } catch (err) {
+      console.error('[CallWidget] Hangup command error:', err);
+      setError('Error al colgar la llamada');
+      return;
+    }
+
+    try {
+      slot.call.disconnect();
+    } catch {
+      // Already disconnected on SDK side
+    }
     removeCallSlot(callId);
   }, [removeCallSlot]);
 
@@ -624,8 +792,8 @@ export function CallWidget() {
   // ─── Make outbound call ────────────────────────────────────────────────────
 
   const makeOutboundCall = useCallback(async (number: string, from?: string) => {
-    if (!deviceRef.current) {
-      setError('Dispositivo de voz no conectado.');
+    if (!deviceRef.current || softphoneStatus !== 'connected') {
+      setError('Softphone no operativo. Espera a estado "Conectado".');
       return;
     }
 
@@ -636,6 +804,15 @@ export function CallWidget() {
     }
 
     const callerIdToUse = from || fromNumber;
+    if (!callerIdToUse) {
+      setError('Selecciona un numero de origen para llamar');
+      return;
+    }
+
+    if (!identity) {
+      setError('No se pudo resolver la identidad del agente para iniciar la llamada');
+      return;
+    }
 
     // If there's an active call, mute it while we dial the new one
     const currentActive = callsRef.current.find(c => c.state === 'active');
@@ -647,23 +824,38 @@ export function CallWidget() {
     setOverlay('none');
 
     try {
-      const call = await deviceRef.current.connect({
-        params: {
-          To: formattedNumber,
-          CallerId: callerIdToUse,
-          UserId: identity,
+      const res = await api.post<{
+        call_sid: string;
+        call_record_id: string | null;
+        attach_mode: string;
+      }>('/calls/dial', {
+        destination_number: formattedNumber,
+        from_number: callerIdToUse,
+        user_id: identity,
+        metadata: {
+          source: 'web_panel',
+          initiated_from: 'call_widget',
         },
       });
 
-      const callId = addCallSlot(call, formattedNumber, 'outbound');
-      setupCallHandlers(call, callId);
+      if (!res.ok) {
+        throw new Error(res.error || 'No se pudo iniciar llamada saliente en backend');
+      }
+
+      console.log(
+        `[CallWidget] Outbound command accepted by backend call_sid=${res.data.call_sid} attach_mode=${res.data.attach_mode}`
+      );
       setShowNewCallDialpad(false);
       setDialNumber('');
     } catch (err) {
       console.error('[CallWidget] Dial error:', err);
+      if (currentActive) {
+        unmuteCall(currentActive.id);
+      }
+      setWidgetState(callsRef.current.length > 0 ? 'active' : 'idle');
       setError('Error al iniciar llamada');
     }
-  }, [fromNumber, identity, addCallSlot, setupCallHandlers, muteCall]);
+  }, [fromNumber, identity, muteCall, softphoneStatus, unmuteCall]);
 
   // ─── Transfer (cold) ──────────────────────────────────────────────────────
 
@@ -760,6 +952,52 @@ export function CallWidget() {
     registerDialHandler(externalDial);
   }, [registerDialHandler, externalDial]);
 
+  // ─── Canonical backend stream (SSE): source of truth for agent/call state ───
+  useEffect(() => {
+    let closed = false;
+    const source = new EventSource('/api/v1/stream/events?scope=mine');
+
+    setBackendStreamStatus('connecting');
+
+    source.onopen = () => {
+      if (closed) return;
+      setBackendStreamStatus('connected');
+      void refreshBackendSnapshot('stream_open');
+    };
+
+    source.onmessage = (message) => {
+      if (closed) return;
+      try {
+        const event = JSON.parse(message.data) as CanonicalStreamEvent;
+        handleCanonicalStreamEvent(event);
+      } catch (err) {
+        console.warn('[CallWidget] Invalid canonical stream event payload', err);
+      }
+    };
+
+    source.onerror = () => {
+      if (closed) return;
+      setBackendStreamStatus('disconnected');
+    };
+
+    return () => {
+      closed = true;
+      source.close();
+      setBackendStreamStatus('disconnected');
+    };
+  }, [handleCanonicalStreamEvent, refreshBackendSnapshot]);
+
+  // Fallback temporal: refresco periodico del snapshot canonico.
+  useEffect(() => {
+    void refreshBackendSnapshot('mount');
+
+    const interval = setInterval(() => {
+      void refreshBackendSnapshot('fallback_interval');
+    }, BACKEND_SNAPSHOT_FALLBACK_MS);
+
+    return () => clearInterval(interval);
+  }, [refreshBackendSnapshot]);
+
   // ─── Load phone numbers ────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -790,6 +1028,7 @@ export function CallWidget() {
     return () => {
       stopAllTimers();
       clearReconnectTimer();
+      clearNeedsInterventionRetryTimer();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -798,9 +1037,16 @@ export function CallWidget() {
 
   useEffect(() => {
     const onTabVisible = () => {
-      if (document.visibilityState !== 'visible') return;
-      console.log('[CallWidget] Tab visible: checking softphone health');
-      void runSoftphoneHealthCheck('tab_visible', true);
+      if (document.visibilityState === 'hidden') {
+        hiddenSinceRef.current = Date.now();
+        console.log('[CallWidget] Tab hidden: background watchdog active');
+        return;
+      }
+
+      const hiddenForMs = hiddenSinceRef.current ? Date.now() - hiddenSinceRef.current : 0;
+      hiddenSinceRef.current = null;
+      console.log(`[CallWidget] Tab visible: checking softphone health (hiddenForMs=${hiddenForMs})`);
+      void runSoftphoneHealthCheck(hiddenForMs > WATCHDOG_SLEEP_DRIFT_MS ? 'tab_visible_after_sleep' : 'tab_visible', true);
     };
 
     const onFocus = () => {
@@ -813,14 +1059,34 @@ export function CallWidget() {
       void runSoftphoneHealthCheck('pageshow', true);
     };
 
+    const onPageHide = () => {
+      if (!hiddenSinceRef.current) hiddenSinceRef.current = Date.now();
+    };
+
+    const onResume = () => {
+      console.log('[CallWidget] Document resumed: checking softphone health');
+      void runSoftphoneHealthCheck('document_resume', true);
+    };
+
+    const onFreeze = () => {
+      if (!hiddenSinceRef.current) hiddenSinceRef.current = Date.now();
+      console.warn('[CallWidget] Document freeze detected');
+    };
+
     document.addEventListener('visibilitychange', onTabVisible);
+    document.addEventListener('resume', onResume);
+    document.addEventListener('freeze', onFreeze);
     window.addEventListener('focus', onFocus);
     window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('pagehide', onPageHide);
 
     return () => {
       document.removeEventListener('visibilitychange', onTabVisible);
+      document.removeEventListener('resume', onResume);
+      document.removeEventListener('freeze', onFreeze);
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('pagehide', onPageHide);
     };
   }, [runSoftphoneHealthCheck]);
 
@@ -847,15 +1113,32 @@ export function CallWidget() {
   // ─── Keepalive: periodic check even in background ──────────────────────────
   // Browsers throttle timers heavily in background tabs.
   // Keepalive periodically validates the registration and forces recovery if needed.
-  // This is a lightweight safety net, not a voice heartbeat stream.
+  // Watchdog also detects long timer drifts (tab sleep/background freeze) and triggers
+  // a stronger recovery check without requiring manual foreground interaction.
 
   useEffect(() => {
-    const KEEPALIVE_INTERVAL = 90 * 1000; // 90 seconds (background tabs are throttled by the browser)
-
+    lastWatchdogTickAtRef.current = Date.now();
     const interval = setInterval(() => {
-      const forceRegister = document.visibilityState === 'visible';
-      void runSoftphoneHealthCheck('interval_keepalive', forceRegister);
-    }, KEEPALIVE_INTERVAL);
+      const now = Date.now();
+      const driftMs = now - lastWatchdogTickAtRef.current;
+      lastWatchdogTickAtRef.current = now;
+
+      const wasSuspended = driftMs > WATCHDOG_SLEEP_DRIFT_MS;
+      const healthStale = now - lastHealthCheckAtRef.current > HEALTH_STALE_MS;
+
+      if (wasSuspended) {
+        console.warn(`[CallWidget] Watchdog detected timer suspension. driftMs=${driftMs}`);
+      }
+
+      const forceRegister = document.visibilityState === 'visible' || wasSuspended || healthStale;
+      const trigger = wasSuspended
+        ? 'watchdog_resume'
+        : healthStale
+          ? 'watchdog_stale'
+          : 'watchdog_tick';
+
+      void runSoftphoneHealthCheck(trigger, forceRegister);
+    }, WATCHDOG_INTERVAL_MS);
 
     return () => clearInterval(interval);
   }, [runSoftphoneHealthCheck]);
@@ -885,6 +1168,22 @@ export function CallWidget() {
         : softphoneStatus === 'needs_intervention'
           ? 'Revisar sesion'
           : 'Desconectado';
+
+  const backendStreamLabel = backendStreamStatus === 'connected'
+    ? 'Stream OK'
+    : backendStreamStatus === 'connecting'
+      ? 'Stream conectando...'
+      : 'Stream reconectando';
+
+  const backendOperationalLabel = backendOperationalStatus === 'busy_in_call'
+    ? 'En llamada'
+    : backendOperationalStatus === 'ringing'
+      ? 'Entrante'
+      : backendOperationalStatus === 'ready'
+        ? 'Listo'
+        : backendOperationalStatus === 'unavailable'
+          ? 'No disponible'
+          : 'Inactivo';
 
   // ─── RENDER ────────────────────────────────────────────────────────────────
 
@@ -1405,14 +1704,26 @@ export function CallWidget() {
       {/* ── FAB button (idle state) ── */}
       {widgetState === 'idle' && !showNewCallDialpad && (
         <div className="flex items-center gap-2">
-          <div className={cn(
-            'flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium border shadow-sm',
-            softphoneBadgeClass
-          )} title={softphoneReason || undefined}>
-            {softphoneStatus === 'connected' ? <Wifi className="h-3 w-3" /> :
-              softphoneStatus === 'reconnecting' ? <Loader2 className="h-3 w-3 animate-spin" /> :
-              <WifiOff className="h-3 w-3" />}
-            {softphoneBadgeLabel}
+          <div className="flex flex-col gap-1">
+            <div className={cn(
+              'flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium border shadow-sm',
+              softphoneBadgeClass
+            )} title={softphoneReason || undefined}>
+              {softphoneStatus === 'connected' ? <Wifi className="h-3 w-3" /> :
+                softphoneStatus === 'reconnecting' ? <Loader2 className="h-3 w-3 animate-spin" /> :
+                <WifiOff className="h-3 w-3" />}
+              {softphoneBadgeLabel}
+            </div>
+            <div
+              className="rounded-full border border-border bg-background/90 px-2 py-1 text-[10px] text-muted-foreground shadow-sm"
+              title={`Ultimo evento backend: ${backendLastEventType}`}
+            >
+              <span className="font-medium">{backendStreamLabel}</span>
+              <span className="mx-1">·</span>
+              <span>{backendOperationalLabel}</span>
+              <span className="mx-1">·</span>
+              <span>{backendActiveCallsCount} activa{backendActiveCallsCount === 1 ? '' : 's'}</span>
+            </div>
           </div>
 
           <Button

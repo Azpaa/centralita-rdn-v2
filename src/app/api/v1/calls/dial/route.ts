@@ -44,6 +44,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const supabase = createAdminClient();
+    const commandSource = auth.authMethod === 'api_key' ? 'rdn' : 'backend_outbound';
 
     console.log(
       `[DIAL] Received auth=${auth.authMethod} destination=${destination_number} from=${from_number} user_id=${user_id ?? '-'} rdn_user_id=${rdn_user_id ?? '-'}`
@@ -135,7 +136,7 @@ export async function POST(req: NextRequest) {
       voiceUrl.searchParams.set('outbound_to', destination_number);
       voiceUrl.searchParams.set('caller_id', from_number);
       voiceUrl.searchParams.set('user_id', resolvedAgent.id);
-      voiceUrl.searchParams.set('source', 'rdn');
+      voiceUrl.searchParams.set('source', commandSource);
 
       console.log(
         `[DIAL] Resolved agent id=${resolvedAgent.id} name=${resolvedAgent.name} available=${resolvedAgent.available} active=${resolvedAgent.active} rdn_user_id=${resolvedAgent.rdn_user_id ?? '-'}`
@@ -163,7 +164,7 @@ export async function POST(req: NextRequest) {
         twilioData: {
           initiated_by: auth.userId || resolvedAgent.id,
           initiator_name: auth.userId ? initiatorName : resolvedAgent.name,
-          source: 'rdn',
+          source: commandSource,
           requested_user_id: user_id ?? '',
           requested_rdn_user_id: rdn_user_id ?? '',
           resolved_agent_id: resolvedAgent.id,
@@ -177,7 +178,7 @@ export async function POST(req: NextRequest) {
         destination: destination_number,
         from: from_number,
         initiator: auth.userId ? initiatorName : resolvedAgent.name,
-        source: 'rdn',
+        source: commandSource,
         requested_user_id: user_id ?? null,
         requested_rdn_user_id: rdn_user_id ?? null,
         resolved_agent_id: resolvedAgent.id,
@@ -191,6 +192,7 @@ export async function POST(req: NextRequest) {
         from: from_number,
         to: destination_number,
         attach_mode: 'twilio_client',
+        source: commandSource,
         agent: {
           id: resolvedAgent.id,
           rdn_user_id: resolvedAgent.rdn_user_id,

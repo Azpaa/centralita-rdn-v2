@@ -4,6 +4,8 @@ import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { emitEvent } from '@/lib/events/emitter';
+import { requireCallControlPermission } from '@/lib/calls/ownership';
+import { auditLog } from '@/lib/api/audit';
 
 /**
  * POST /api/v1/calls/:id/hold
@@ -23,6 +25,9 @@ export async function POST(
 
   const { id: callSid } = await params;
   if (!callSid) return apiBadRequest('callSid es requerido');
+
+  const permissionCheck = await requireCallControlPermission(auth, callSid);
+  if (permissionCheck !== true) return permissionCheck;
 
   let body: { music_url?: string } = {};
   try {
@@ -66,6 +71,13 @@ export async function POST(
       call_sid: callSid,
       remote_call_sid: remoteSid,
       by_user_id: auth.userId ?? 'api_key',
+    });
+
+    await auditLog('call.hold', 'call_record', callSid, auth.userId, {
+      call_sid: callSid,
+      remote_call_sid: remoteSid,
+      music_url: body.music_url ?? null,
+      auth_method: auth.authMethod,
     });
 
     return apiSuccess({ held: true, callSid, remoteSid });

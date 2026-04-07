@@ -3,6 +3,7 @@ import twilio from 'twilio';
 import { getQueueWithOperators } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { createAdminClient } from '@/lib/supabase/admin';
+import { emitEvent } from '@/lib/events/emitter';
 import type { CallRecord, PhoneNumber, Queue } from '@/lib/types/database';
 
 /**
@@ -138,6 +139,34 @@ export async function POST(req: NextRequest) {
     // queueData is guaranteed to have queue and operators at this point
     const activeQueue = queue!;
     const operators = queueData.operators;
+    const ringTargets = activeQueue.strategy === 'ring_all'
+      ? operators
+      : (operators[activeQueue.current_index % operators.length]
+        ? [operators[activeQueue.current_index % operators.length]]
+        : []);
+
+    if (ringTargets.length > 0) {
+      console.log(
+        `[QUEUE-RETRY] pre-answer routing call_sid=${callSid} strategy=${activeQueue.strategy} targets=${ringTargets.map((op) => op.id).join(',')}`
+      );
+
+      for (const target of ringTargets) {
+        emitEvent('call.ringing', {
+          call_sid: callSid,
+          direction: 'inbound',
+          status: 'ringing',
+          from: record.from_number,
+          to: record.to_number,
+          queue_id: activeQueue.id,
+          phone_number_id: record.phone_number_id ?? null,
+          ring_strategy: activeQueue.strategy,
+          user_id: target.id,
+          answered_by_user_id: target.id,
+          rdn_user_id: target.rdn_user_id ?? null,
+          retry: true,
+        });
+      }
+    }
 
     // 3. Mensaje breve de espera
     twiml.say(

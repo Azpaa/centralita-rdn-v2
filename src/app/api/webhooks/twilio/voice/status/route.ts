@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook } from '@/lib/api/twilio-auth';
 import { createAdminClient } from '@/lib/supabase/admin';
+import { emitEvent } from '@/lib/events/emitter';
 import type { CallRecord, CallStatus } from '@/lib/types/database';
 
 // Estados terminales — una vez que dial-action pone uno de estos, no lo sobrescribimos
@@ -38,7 +39,7 @@ export async function POST(req: NextRequest) {
     const supabase = createAdminClient();
     const { data: existing } = await supabase
       .from('call_records')
-      .select('status, duration, answered_at, ended_at')
+      .select('status, direction, from_number, to_number, queue_id, answered_by_user_id, duration, answered_at, ended_at')
       .eq('twilio_call_sid', callSid)
       .single();
 
@@ -88,6 +89,46 @@ export async function POST(req: NextRequest) {
     }
 
     await updateCallStatus(callSid, updates);
+
+    const isTerminalFromStatus = ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus);
+    if (isTerminalFromStatus) {
+      const direction = currentRecord?.direction || 'outbound';
+      const terminalStatus = mappedStatus;
+      const endedAt = updates.endedAt || currentRecord?.ended_at || timestamp;
+      const answeredAt = currentRecord?.answered_at || null;
+      const duration = updates.duration ?? currentRecord?.duration ?? 0;
+
+      console.log(
+        `[STATUS] terminal fallback emit call_sid=${callSid} direction=${direction} status=${terminalStatus}`
+      );
+
+      if (direction === 'inbound' && terminalStatus !== 'completed') {
+        emitEvent('call.missed', {
+          call_sid: callSid,
+          direction,
+          from: currentRecord?.from_number ?? null,
+          to: currentRecord?.to_number ?? null,
+          final_status: terminalStatus,
+          queue_id: currentRecord?.queue_id ?? null,
+          terminal_source: 'status_fallback',
+        });
+      } else {
+        emitEvent('call.completed', {
+          call_sid: callSid,
+          direction,
+          status: terminalStatus,
+          from: currentRecord?.from_number ?? null,
+          to: currentRecord?.to_number ?? null,
+          queue_id: currentRecord?.queue_id ?? null,
+          answered_by_user_id: currentRecord?.answered_by_user_id ?? null,
+          duration,
+          wait_time: null,
+          answered_at: answeredAt,
+          ended_at: endedAt,
+          terminal_source: 'status_fallback',
+        });
+      }
+    }
   } catch (err) {
     console.error('[STATUS] Error updating call status:', err);
   }

@@ -21,6 +21,13 @@ export type AuditAction =
   | 'call.started'
   | 'call.completed'
   | 'call.dial'
+  | 'call.hangup'
+  | 'call.hold'
+  | 'call.resume'
+  | 'call.transfer'
+  | 'call.mute'
+  | 'call.unmute'
+  | 'call.conference'
   | 'api_key.created'
   | 'api_key.deleted';
 

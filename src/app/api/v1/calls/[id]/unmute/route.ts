@@ -2,6 +2,8 @@ import { NextRequest } from 'next/server';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
+import { requireCallControlPermission } from '@/lib/calls/ownership';
+import { auditLog } from '@/lib/api/audit';
 
 /**
  * POST /api/v1/calls/:id/unmute
@@ -18,6 +20,9 @@ export async function POST(
 
   const { id: callSid } = await params;
   if (!callSid) return apiBadRequest('callSid es requerido');
+
+  const permissionCheck = await requireCallControlPermission(auth, callSid);
+  if (permissionCheck !== true) return permissionCheck;
 
   let body: { conference_name?: string } = {};
   try {
@@ -47,7 +52,7 @@ export async function POST(
       .conferences(conferences[0].sid)
       .participants.list();
 
-    const target = participants.find(p => p.callSid === callSid);
+    const target = participants.find((p) => p.callSid === callSid);
     if (!target) {
       return apiBadRequest('Participante no encontrado en la conferencia');
     }
@@ -57,9 +62,16 @@ export async function POST(
       .participants(target.callSid)
       .update({ muted: false });
 
+    await auditLog('call.unmute', 'call_record', callSid, auth.userId, {
+      call_sid: callSid,
+      conference_name: body.conference_name,
+      auth_method: auth.authMethod,
+    });
+
     return apiSuccess({ unmuted: true, callSid, conference: body.conference_name });
   } catch (err) {
     console.error(`[UNMUTE] Error unmuting ${callSid}:`, err);
     return apiInternalError('Error al reactivar audio');
   }
 }
+

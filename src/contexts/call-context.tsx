@@ -11,7 +11,7 @@ import {
 type DialFn = (number: string, fromNumber?: string) => void;
 
 type CallContextType = {
-  /** Trigger a call from the CallWidget via Voice SDK (WebRTC) */
+  /** Trigger a call from the CallWidget via backend command API. */
   dial: DialFn;
   /** Used internally by CallWidget to register its dial handler */
   registerDialHandler: (handler: DialFn) => void;

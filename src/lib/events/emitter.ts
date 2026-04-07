@@ -8,6 +8,7 @@
 import crypto from 'crypto';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { deliverWebhook, processPendingWebhookDeliveries } from '@/lib/events/delivery';
+import { publishCanonicalClientEventFromDomain } from '@/lib/events/client-stream';
 import type { WebhookSubscription } from '@/lib/types/database';
 
 export type EventType =
@@ -42,6 +43,10 @@ export async function emitEvent(
       console.error(`[EVENT] Skipping ${event}: payload.data vacio o invalido`);
       return;
     }
+
+    // Canal canónico backend -> clientes (web / futuro Tauri).
+    // Debe publicarse siempre, incluso cuando no haya webhooks externos activos.
+    publishCanonicalClientEventFromDomain(event, data);
 
     processPendingWebhookDeliveries().catch((err) => {
       console.error('[EVENT] Error processing pending deliveries:', err);
