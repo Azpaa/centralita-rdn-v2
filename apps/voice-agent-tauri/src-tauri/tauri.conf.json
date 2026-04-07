@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RDN Voice Agent",
+  "version": "0.1.0",
+  "identifier": "com.rdn.voice_agent",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "RDN Voice Agent",
+        "width": 1100,
+        "height": 820,
+        "minWidth": 920,
+        "minHeight": 700
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "shortDescription": "Cliente desktop de voz para Centralita/RDN"
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://centralita.reparacionesdelnorte.es/api/v1/voice-agent/releases/latest"
+      ],
+      "dialog": true,
+      "pubkey": "REEMPLAZAR_TAURI_UPDATER_PUBKEY"
+    }
+  }
+}

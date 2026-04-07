@@ -1,0 +1,591 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import {
+  callCommand,
+  consumeSseStream,
+  fetchAgentState,
+  fetchBootstrap,
+  normalizeBaseUrl,
+} from './lib/backend';
+import type {
+  AgentStateSnapshot,
+  BootstrapPayload,
+  CanonicalStreamEvent,
+  VoiceCallView,
+  VoiceDeviceStatus,
+} from './lib/types';
+import { useVoiceEngine } from './lib/voice-engine';
+
+const STORAGE_BASE_URL = 'voice_agent_backend_url';
+const STORAGE_SESSION_KEY = 'voice-agent-tauri-auth';
+
+type StreamStatus = 'connecting' | 'connected' | 'disconnected';
+
+function operationalLabel(status: AgentStateSnapshot['operational_status'] | 'unknown'): string {
+  switch (status) {
+    case 'busy_in_call':
+      return 'En llamada';
+    case 'ringing':
+      return 'Entrante';
+    case 'ready':
+      return 'Listo';
+    case 'unavailable':
+      return 'No disponible';
+    case 'inactive':
+      return 'Inactivo';
+    default:
+      return 'Sin estado';
+  }
+}
+
+function voiceStatusLabel(status: VoiceDeviceStatus): string {
+  switch (status) {
+    case 'connected':
+      return 'Conectado';
+    case 'registering':
+      return 'Registrando';
+    case 'reconnecting':
+      return 'Reconectando';
+    case 'degraded':
+      return 'Degradado';
+    case 'disconnected':
+    default:
+      return 'Desconectado';
+  }
+}
+
+function voiceStatusClass(status: VoiceDeviceStatus): string {
+  switch (status) {
+    case 'connected':
+      return 'status-pill status-ok';
+    case 'registering':
+    case 'reconnecting':
+      return 'status-pill status-warn';
+    case 'degraded':
+      return 'status-pill status-danger';
+    case 'disconnected':
+    default:
+      return 'status-pill status-neutral';
+  }
+}
+
+function upsertCall(list: VoiceCallView[], next: VoiceCallView): VoiceCallView[] {
+  const index = list.findIndex((item) => item.callSid === next.callSid);
+  if (index === -1) return [...list, next];
+
+  const updated = [...list];
+  updated[index] = {
+    ...updated[index],
+    ...next,
+  };
+  return updated;
+}
+
+export default function App() {
+  const [backendUrlInput, setBackendUrlInput] = useState(
+    localStorage.getItem(STORAGE_BASE_URL) || 'http://localhost:3000'
+  );
+  const [backendUrl, setBackendUrl] = useState(normalizeBaseUrl(backendUrlInput));
+  const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [accessToken, setAccessToken] = useState('');
+  const [agentState, setAgentState] = useState<AgentStateSnapshot | null>(null);
+  const [streamStatus, setStreamStatus] = useState<StreamStatus>('disconnected');
+  const [calls, setCalls] = useState<VoiceCallView[]>([]);
+  const [conferenceName, setConferenceName] = useState('');
+  const [lastEvent, setLastEvent] = useState('none');
+  const [message, setMessage] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+
+  const supabaseRef = useRef<SupabaseClient | null>(null);
+
+  const applySnapshot = useCallback((snapshot: AgentStateSnapshot | null) => {
+    setAgentState(snapshot);
+    if (!snapshot) {
+      setCalls([]);
+      return;
+    }
+
+    setCalls((prev) => {
+      const mutedBySid = new Map(prev.map((call) => [call.callSid, call.muted]));
+      return snapshot.active_calls
+        .filter((call) => typeof call.call_sid === 'string' && call.call_sid.length > 0)
+        .map((call) => ({
+          callSid: call.call_sid as string,
+          direction: call.direction,
+          status: call.status,
+          from: call.from || null,
+          to: call.to || null,
+          muted: mutedBySid.get(call.call_sid as string) ?? false,
+        }));
+    });
+  }, []);
+
+  const refreshAgentSnapshot = useCallback(async (reason: string) => {
+    if (!backendUrl || !accessToken) return;
+
+    const result = await fetchAgentState(backendUrl, accessToken);
+    if (!result.ok) {
+      setMessage(`No se pudo refrescar estado (${reason}): ${result.error}`);
+      return;
+    }
+    applySnapshot(result.data);
+  }, [accessToken, applySnapshot, backendUrl]);
+
+  const voice = useVoiceEngine({
+    baseUrl: backendUrl,
+    accessToken,
+    onIncomingCall: (event) => {
+      setCalls((prev) => upsertCall(prev, {
+        callSid: event.callSid,
+        direction: event.direction,
+        status: event.autoAdopted ? 'in_progress' : 'ringing',
+        from: event.from,
+        to: event.to,
+        muted: false,
+      }));
+    },
+    onCallAccepted: (callSid) => {
+      setCalls((prev) => prev.map((call) => (
+        call.callSid === callSid
+          ? { ...call, status: 'in_progress' }
+          : call
+      )));
+    },
+    onCallEnded: (callSid) => {
+      setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
+    },
+    onCallMutedChanged: (callSid, muted) => {
+      setCalls((prev) => prev.map((call) => (
+        call.callSid === callSid
+          ? { ...call, muted }
+          : call
+      )));
+    },
+    onInfo: (info) => {
+      setMessage(info);
+    },
+  });
+
+  const handleCanonicalEvent = useCallback((event: CanonicalStreamEvent) => {
+    setLastEvent(event.type || 'unknown');
+
+    if (event.type === 'snapshot') {
+      const snapshot = (event.payload?.agent_state as AgentStateSnapshot | undefined) ?? null;
+      applySnapshot(snapshot);
+      return;
+    }
+
+    const callSid = event.call_sid ?? null;
+    const payloadStatus = typeof event.payload?.status === 'string'
+      ? event.payload.status
+      : null;
+    const payloadFrom = typeof event.payload?.from === 'string'
+      ? event.payload.from
+      : null;
+    const payloadTo = typeof event.payload?.to === 'string'
+      ? event.payload.to
+      : null;
+
+    if (event.type === 'incoming_call' && callSid) {
+      setCalls((prev) => upsertCall(prev, {
+        callSid,
+        direction: 'inbound',
+        status: payloadStatus || 'ringing',
+        from: payloadFrom,
+        to: payloadTo,
+        muted: false,
+      }));
+    } else if (event.type === 'call_answered' && callSid) {
+      setCalls((prev) => prev.map((call) => (
+        call.callSid === callSid
+          ? { ...call, status: 'in_progress' }
+          : call
+      )));
+    } else if (event.type === 'call_updated' && callSid) {
+      setCalls((prev) => prev.map((call) => (
+        call.callSid === callSid
+          ? {
+              ...call,
+              status: payloadStatus || call.status,
+              from: payloadFrom ?? call.from,
+              to: payloadTo ?? call.to,
+            }
+          : call
+      )));
+    } else if (event.type === 'call_ended' && callSid) {
+      setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
+    }
+
+    const refreshEvents = new Set([
+      'incoming_call',
+      'call_answered',
+      'call_updated',
+      'call_ended',
+      'agent_state_changed',
+      'call_transfer_completed',
+      'conference_updated',
+    ]);
+
+    if (refreshEvents.has(event.type)) {
+      void refreshAgentSnapshot(`stream:${event.type}`);
+    }
+  }, [applySnapshot, refreshAgentSnapshot]);
+
+  const hydrateBootstrapAndSession = useCallback(async () => {
+    if (!backendUrl) return;
+
+    const bootstrapResult = await fetchBootstrap(backendUrl);
+    if (!bootstrapResult.ok) {
+      setMessage(`Error bootstrap: ${bootstrapResult.error}`);
+      return;
+    }
+    setBootstrap(bootstrapResult.data);
+
+    const supabase = createClient(
+      bootstrapResult.data.auth.supabase_url,
+      bootstrapResult.data.auth.supabase_anon_key,
+      {
+        auth: {
+          storageKey: STORAGE_SESSION_KEY,
+          autoRefreshToken: true,
+          persistSession: true,
+        },
+      }
+    );
+    supabaseRef.current = supabase;
+
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token || '';
+    if (token) setAccessToken(token);
+
+    supabase.auth.onAuthStateChange((_event, session) => {
+      setAccessToken(session?.access_token || '');
+    });
+  }, [backendUrl]);
+
+  useEffect(() => {
+    void hydrateBootstrapAndSession();
+  }, [hydrateBootstrapAndSession]);
+
+  useEffect(() => {
+    if (!accessToken || !backendUrl) return;
+    void refreshAgentSnapshot('session_ready');
+
+    const interval = setInterval(() => {
+      void refreshAgentSnapshot('fallback_interval');
+    }, 45_000);
+
+    return () => clearInterval(interval);
+  }, [accessToken, backendUrl, refreshAgentSnapshot]);
+
+  useEffect(() => {
+    if (!accessToken || !backendUrl) return;
+
+    let cancelled = false;
+    let attempt = 0;
+    let controller: AbortController | null = null;
+
+    const loop = async () => {
+      while (!cancelled) {
+        controller = new AbortController();
+
+        try {
+          await consumeSseStream({
+            baseUrl: backendUrl,
+            jwt: accessToken,
+            signal: controller.signal,
+            onStatus: setStreamStatus,
+            onEvent: handleCanonicalEvent,
+          });
+          attempt = 0;
+        } catch (err) {
+          setStreamStatus('disconnected');
+          if (cancelled) break;
+          const delay = Math.min(15_000, 1_000 * 2 ** Math.min(attempt, 4));
+          attempt += 1;
+          setMessage(`Stream reconectando en ${Math.round(delay / 1000)}s (${String(err)})`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    };
+
+    void loop();
+
+    return () => {
+      cancelled = true;
+      controller?.abort();
+      setStreamStatus('disconnected');
+    };
+  }, [accessToken, backendUrl, handleCanonicalEvent]);
+
+  const saveBackendUrl = useCallback(async () => {
+    const normalized = normalizeBaseUrl(backendUrlInput);
+    setBackendUrl(normalized);
+    localStorage.setItem(STORAGE_BASE_URL, normalized);
+    setMessage(`Backend configurado: ${normalized}`);
+  }, [backendUrlInput]);
+
+  const login = useCallback(async () => {
+    if (!supabaseRef.current) {
+      setMessage('Bootstrap no cargado todavia');
+      return;
+    }
+    setIsLoading(true);
+    setMessage('');
+    const { data, error } = await supabaseRef.current.auth.signInWithPassword({
+      email: email.trim(),
+      password,
+    });
+    setIsLoading(false);
+
+    if (error) {
+      setMessage(`Login invalido: ${error.message}`);
+      return;
+    }
+
+    setAccessToken(data.session?.access_token || '');
+    setMessage('Login correcto');
+  }, [email, password]);
+
+  const logout = useCallback(async () => {
+    await supabaseRef.current?.auth.signOut();
+    setAccessToken('');
+    setAgentState(null);
+    setCalls([]);
+    setMessage('Sesion cerrada');
+  }, []);
+
+  const executeCallAction = useCallback(async (
+    action: 'accept' | 'hangup' | 'mute' | 'unmute',
+    callSid: string,
+  ) => {
+    if (!backendUrl || !accessToken) return;
+
+    if (action === 'accept') {
+      const result = await voice.acceptCall(callSid);
+      if (!result.ok) {
+        setMessage(`No se pudo aceptar ${callSid}: ${result.error}`);
+        return;
+      }
+      setMessage(`Llamada ${callSid} aceptada en softphone`);
+      return;
+    }
+
+    if (action === 'hangup') {
+      const local = await voice.disconnectCall(callSid);
+      const backend = await callCommand(
+        backendUrl,
+        accessToken,
+        `/api/v1/calls/${callSid}/hangup`,
+        { target: 'all' }
+      );
+
+      if (!backend.ok) {
+        const localInfo = local.ok ? ' (audio local ya desconectado)' : '';
+        setMessage(`Error colgar ${callSid}: ${backend.error}${localInfo}`);
+        return;
+      }
+
+      setMessage(`Llamada ${callSid} colgada`);
+      void refreshAgentSnapshot('action:hangup');
+      return;
+    }
+
+    const wantsMute = action === 'mute';
+    const muteResult = await voice.setMuted(callSid, wantsMute);
+    if (!muteResult.ok) {
+      setMessage(muteResult.error);
+      return;
+    }
+
+    if (conferenceName.trim()) {
+      const path = wantsMute
+        ? `/api/v1/calls/${callSid}/mute`
+        : `/api/v1/calls/${callSid}/unmute`;
+
+      const backend = await callCommand(backendUrl, accessToken, path, {
+        conference_name: conferenceName.trim(),
+      });
+
+      if (!backend.ok) {
+        // Rollback local mute state if server mute in conference fails.
+        await voice.setMuted(callSid, !wantsMute);
+        setMessage(`Error ${action} en conferencia: ${backend.error}`);
+        return;
+      }
+    }
+
+    setMessage(`${wantsMute ? 'Mute' : 'Unmute'} aplicado en ${callSid}`);
+    void refreshAgentSnapshot(`action:${action}`);
+  }, [accessToken, backendUrl, conferenceName, refreshAgentSnapshot, voice]);
+
+  const streamBadge = useMemo(() => {
+    if (streamStatus === 'connected') return 'Stream conectado';
+    if (streamStatus === 'connecting') return 'Stream conectando...';
+    return 'Stream desconectado';
+  }, [streamStatus]);
+
+  const isLoggedIn = Boolean(accessToken);
+
+  return (
+    <div className="app-shell">
+      <header className="card">
+        <h1>RDN Voice Agent (Tauri)</h1>
+        <p className="muted">
+          Cliente desktop de voz real con estado canonico + media Twilio.
+        </p>
+      </header>
+
+      <section className="card grid">
+        <label>
+          Backend URL
+          <input
+            value={backendUrlInput}
+            onChange={(e) => setBackendUrlInput(e.target.value)}
+            placeholder="https://centralita.reparacionesdelnorte.es"
+          />
+        </label>
+        <button onClick={() => void saveBackendUrl()}>Guardar backend</button>
+        {bootstrap && (
+          <p className="muted">
+            Auth mode: {bootstrap.auth.mode} - API: {bootstrap.backend.api_base_path}
+          </p>
+        )}
+      </section>
+
+      {!isLoggedIn && (
+        <section className="card grid">
+          <h2>Login agente</h2>
+          <label>
+            Email
+            <input value={email} onChange={(e) => setEmail(e.target.value)} />
+          </label>
+          <label>
+            Password
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+          </label>
+          <button disabled={isLoading} onClick={() => void login()}>
+            {isLoading ? 'Entrando...' : 'Entrar'}
+          </button>
+        </section>
+      )}
+
+      {isLoggedIn && (
+        <>
+          <section className="card grid">
+            <h2>Estado operativo</h2>
+            <p><strong>Agente:</strong> {agentState?.user_id ?? 'desconocido'}</p>
+            <p><strong>Identidad Voice:</strong> {voice.identity || 'sin resolver'}</p>
+            <p><strong>Operativo:</strong> {operationalLabel(agentState?.operational_status ?? 'unknown')}</p>
+            <p><strong>Llamadas activas:</strong> {agentState?.active_calls_count ?? 0}</p>
+            <p><strong>Fuente:</strong> {agentState?.source_of_truth ?? 'n/a'}</p>
+            <p><strong>Canal:</strong> {streamBadge}</p>
+            <p><strong>Ultimo evento:</strong> {lastEvent}</p>
+            <div className="actions">
+              <button onClick={() => void refreshAgentSnapshot('manual')}>Refrescar estado</button>
+              <button onClick={() => void logout()}>Salir</button>
+            </div>
+          </section>
+
+          <section className="card grid">
+            <h2>Motor de voz</h2>
+            <p>
+              <strong>Device:</strong>{' '}
+              <span className={voiceStatusClass(voice.deviceStatus)}>
+                {voiceStatusLabel(voice.deviceStatus)}
+              </span>
+            </p>
+            <p><strong>Detalle:</strong> {voice.deviceReason}</p>
+            <p><strong>Token:</strong> {voice.tokenExpired ? 'expirado/renovando' : 'vigente'}</p>
+            <p><strong>Llamadas enlazadas al softphone:</strong> {voice.attachedCallSids.length}</p>
+            {voice.lastError && (
+              <p className="muted"><strong>Ultimo error:</strong> {voice.lastError}</p>
+            )}
+            <div className="actions">
+              <button onClick={() => void voice.reconnectNow()}>Reiniciar motor de voz</button>
+            </div>
+          </section>
+
+          <section className="card grid">
+            <h2>Llamadas</h2>
+            <label>
+              conference_name (opcional para mute/unmute en conferencia de backend)
+              <input
+                value={conferenceName}
+                onChange={(e) => setConferenceName(e.target.value)}
+                placeholder="conf-123"
+              />
+            </label>
+            {calls.length === 0 && (
+              <p className="muted">Sin llamadas activas/ringing.</p>
+            )}
+
+            {calls.map((call) => {
+              const attached = voice.isCallAttached(call.callSid);
+              const canAccept = attached && call.status !== 'in_progress';
+              const canToggleMute = attached && call.status === 'in_progress';
+              const muteNeedsConference = Boolean(conferenceName.trim());
+
+              return (
+                <article key={call.callSid} className="call-row">
+                  <div>
+                    <p><strong>{call.callSid}</strong></p>
+                    <p className="muted">
+                      {call.direction} - {call.status} - {call.from ?? '-'} -&gt; {call.to ?? '-'}
+                    </p>
+                    <p className="muted">
+                      Motor local: {attached ? 'media enlazada' : 'sin media local enlazada'}
+                    </p>
+                    {!attached && (
+                      <p className="muted">
+                        Aceptar/mute requiere que esta llamada llegue al softphone local.
+                      </p>
+                    )}
+                    {attached && !muteNeedsConference && (
+                      <p className="muted">
+                        Mute sin conference_name aplica mute local de microfono.
+                      </p>
+                    )}
+                    {attached && muteNeedsConference && (
+                      <p className="muted">
+                        Mute aplicara media local + endpoint de conferencia en backend.
+                      </p>
+                    )}
+                  </div>
+                  <div className="actions">
+                    <button
+                      disabled={!canAccept}
+                      onClick={() => void executeCallAction('accept', call.callSid)}
+                      title={canAccept ? 'Aceptar llamada real' : 'No hay incoming local para aceptar'}
+                    >
+                      Aceptar
+                    </button>
+                    <button onClick={() => void executeCallAction('hangup', call.callSid)}>
+                      Colgar
+                    </button>
+                    <button
+                      disabled={!canToggleMute}
+                      onClick={() => void executeCallAction(call.muted ? 'unmute' : 'mute', call.callSid)}
+                      title={canToggleMute ? 'Mutear/Desmutear llamada real' : 'Mute requiere llamada en media local activa'}
+                    >
+                      {call.muted ? 'Unmute' : 'Mute'}
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </section>
+        </>
+      )}
+
+      {message && (
+        <section className="card">
+          <p>{message}</p>
+        </section>
+      )}
+    </div>
+  );
+}
+

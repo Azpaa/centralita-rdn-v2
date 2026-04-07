@@ -1,0 +1,127 @@
+:root {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  color: #0f172a;
+  background: #f8fafc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.app-shell {
+  margin: 0 auto;
+  max-width: 960px;
+  padding: 20px;
+  display: grid;
+  gap: 16px;
+}
+
+.card {
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 14px;
+}
+
+.grid {
+  display: grid;
+  gap: 10px;
+}
+
+h1, h2, p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 1.25rem;
+}
+
+h2 {
+  font-size: 1rem;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  font-size: 0.86rem;
+}
+
+input {
+  border: 1px solid #94a3b8;
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 0.95rem;
+}
+
+button {
+  border: 1px solid #0f766e;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #0f766e;
+  color: #ffffff;
+  font-size: 0.86rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.muted {
+  color: #475569;
+  font-size: 0.84rem;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.call-row {
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #f8fbff;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  padding: 2px 10px;
+  font-size: 0.78rem;
+}
+
+.status-ok {
+  background: #dcfce7;
+  border-color: #22c55e;
+  color: #166534;
+}
+
+.status-warn {
+  background: #fef9c3;
+  border-color: #eab308;
+  color: #854d0e;
+}
+
+.status-danger {
+  background: #fee2e2;
+  border-color: #ef4444;
+  color: #991b1b;
+}
+
+.status-neutral {
+  background: #e2e8f0;
+  border-color: #94a3b8;
+  color: #334155;
+}
