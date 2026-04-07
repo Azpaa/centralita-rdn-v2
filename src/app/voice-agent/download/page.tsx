@@ -19,18 +19,69 @@ type VoiceAgentReleaseManifest = {
   assets: ReleaseAsset[];
 };
 
-const RELEASE_MANIFEST_PATH = path.resolve(
-  process.cwd(),
-  'apps/voice-agent-tauri/releases/latest.json'
-);
-const PUBLIC_ROOT = path.resolve(process.cwd(), 'public');
+type ManifestState =
+  | { status: 'ok'; manifest: VoiceAgentReleaseManifest }
+  | { status: 'missing' }
+  | { status: 'invalid' };
 
-async function getReleaseManifest(): Promise<VoiceAgentReleaseManifest | null> {
+const PUBLIC_ROOT = path.resolve(process.cwd(), 'public');
+const PUBLIC_RELEASE_MANIFEST_PATH = path.resolve(
+  process.cwd(),
+  'public/downloads/voice-agent/latest.json'
+);
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function parseManifest(input: unknown): VoiceAgentReleaseManifest | null {
+  if (!input || typeof input !== 'object') return null;
+  const raw = input as Record<string, unknown>;
+  if (!isNonEmptyString(raw.app_id)) return null;
+  if (!isNonEmptyString(raw.version)) return null;
+  if (!isNonEmptyString(raw.released_at)) return null;
+  if (!isNonEmptyString(raw.notes)) return null;
+  if (!Array.isArray(raw.assets)) return null;
+
+  const assets: ReleaseAsset[] = [];
+  for (const item of raw.assets) {
+    if (!item || typeof item !== 'object') return null;
+    const rawAsset = item as Record<string, unknown>;
+    if (!isNonEmptyString(rawAsset.platform)) return null;
+    if (!isNonEmptyString(rawAsset.arch)) return null;
+    if (!isNonEmptyString(rawAsset.file_name)) return null;
+    if (!isNonEmptyString(rawAsset.url)) return null;
+
+    assets.push({
+      platform: rawAsset.platform,
+      arch: rawAsset.arch,
+      file_name: rawAsset.file_name,
+      url: rawAsset.url,
+      signature_url: typeof rawAsset.signature_url === 'string' ? rawAsset.signature_url : null,
+      sha256: typeof rawAsset.sha256 === 'string' ? rawAsset.sha256 : null,
+    });
+  }
+
+  return {
+    app_id: raw.app_id,
+    version: raw.version,
+    released_at: raw.released_at,
+    notes: raw.notes,
+    assets,
+  };
+}
+
+async function loadManifestState(): Promise<ManifestState> {
   try {
-    const raw = await fs.readFile(RELEASE_MANIFEST_PATH, 'utf8');
-    return JSON.parse(raw) as VoiceAgentReleaseManifest;
-  } catch {
-    return null;
+    const raw = await fs.readFile(PUBLIC_RELEASE_MANIFEST_PATH, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    const manifest = parseManifest(parsed);
+    if (!manifest) return { status: 'invalid' };
+    return { status: 'ok', manifest };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return { status: 'missing' };
+    return { status: 'invalid' };
   }
 }
 
@@ -54,11 +105,11 @@ async function assetIsPublished(asset: ReleaseAsset): Promise<boolean> {
 }
 
 export default async function VoiceAgentDownloadPage() {
-  const manifest = await getReleaseManifest();
+  const manifestState = await loadManifestState();
   const publishedAssets: ReleaseAsset[] = [];
 
-  if (manifest) {
-    for (const asset of manifest.assets) {
+  if (manifestState.status === 'ok') {
+    for (const asset of manifestState.manifest.assets) {
       if (await assetIsPublished(asset)) {
         publishedAssets.push(asset);
       }
@@ -74,29 +125,36 @@ export default async function VoiceAgentDownloadPage() {
         </p>
       </header>
 
-      {!manifest && (
+      {manifestState.status === 'missing' && (
         <section className="rounded-lg border p-4 text-sm text-muted-foreground">
           No hay una release publicada todavia. Cuando se publique una build, aparecera aqui.
         </section>
       )}
 
-      {manifest && (
+      {manifestState.status === 'invalid' && (
+        <section className="rounded-lg border p-4 text-sm text-destructive">
+          El archivo <code>/public/downloads/voice-agent/latest.json</code> existe pero es invalido.
+          Revisa el formato del manifest de release.
+        </section>
+      )}
+
+      {manifestState.status === 'ok' && (
         <section className="space-y-4">
           <div className="rounded-lg border p-4">
             <p className="text-sm">
-              <span className="font-medium">Version:</span> {manifest.version}
+              <span className="font-medium">Version:</span> {manifestState.manifest.version}
             </p>
             <p className="text-sm text-muted-foreground">
-              Publicada: {new Date(manifest.released_at).toLocaleString('es-ES')}
+              Publicada: {new Date(manifestState.manifest.released_at).toLocaleString('es-ES')}
             </p>
-            <p className="mt-2 text-sm">{manifest.notes}</p>
+            <p className="mt-2 text-sm">{manifestState.manifest.notes}</p>
           </div>
 
           {publishedAssets.length === 0 && (
             <section className="rounded-lg border p-4 text-sm text-muted-foreground">
-              La release existe pero no hay instaladores publicados en
-              <code> /public/downloads/voice-agent/</code>. Cuando se publiquen artefactos reales,
-              el boton descargara directamente.
+              La release existe pero los binarios no estan disponibles en
+              <code> /public/downloads/voice-agent/v{manifestState.manifest.version}/</code>.
+              Publica el instalador y vuelve a cargar la pagina.
             </section>
           )}
 

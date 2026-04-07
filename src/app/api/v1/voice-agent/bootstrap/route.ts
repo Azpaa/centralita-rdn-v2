@@ -18,7 +18,7 @@ export async function GET(req: NextRequest) {
 
   return apiSuccess({
     app: {
-      id: 'com.rdn.voice_agent',
+      id: 'com.rdn.voiceagent',
       name: 'RDN Voice Agent',
     },
     backend: {

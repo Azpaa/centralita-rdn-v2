@@ -6,21 +6,10 @@ const ROOT = process.cwd();
 const TAURI_APP_DIR = path.resolve(ROOT, 'apps/voice-agent-tauri');
 const TAURI_PACKAGE_PATH = path.resolve(TAURI_APP_DIR, 'package.json');
 const BUNDLE_DIR = path.resolve(TAURI_APP_DIR, 'src-tauri/target/release/bundle');
-const RELEASES_MANIFEST_PATH = path.resolve(TAURI_APP_DIR, 'releases/latest.json');
+const TAURI_RELEASES_MANIFEST_PATH = path.resolve(TAURI_APP_DIR, 'releases/latest.json');
 const PUBLIC_DOWNLOADS_BASE = path.resolve(ROOT, 'public/downloads/voice-agent');
 const PUBLIC_LATEST_MANIFEST_PATH = path.resolve(PUBLIC_DOWNLOADS_BASE, 'latest.json');
-
-const ACCEPTED_EXTENSIONS = [
-  '.exe',
-  '.msi',
-  '.dmg',
-  '.appimage',
-  '.deb',
-  '.rpm',
-  '.app.tar.gz',
-  '.nsis.zip',
-  '.sig',
-];
+const APP_ID = 'com.rdn.voiceagent';
 
 async function readJson(filePath) {
   const raw = await fs.readFile(filePath, 'utf8');
@@ -47,19 +36,6 @@ async function listFilesRecursive(rootDir) {
   return files;
 }
 
-function fileExtMatches(fileName) {
-  const lower = fileName.toLowerCase();
-  return ACCEPTED_EXTENSIONS.some((ext) => lower.endsWith(ext));
-}
-
-function inferPlatform(filePath) {
-  const lower = filePath.toLowerCase();
-  if (lower.includes('windows')) return 'windows';
-  if (lower.includes('linux')) return 'linux';
-  if (lower.includes('macos') || lower.includes('darwin')) return 'macos';
-  return 'unknown';
-}
-
 function inferArch(fileName) {
   const lower = fileName.toLowerCase();
   if (lower.includes('x86_64') || lower.includes('x64') || lower.includes('amd64')) return 'x64';
@@ -67,74 +43,109 @@ function inferArch(fileName) {
   return 'unknown';
 }
 
+function toPosixPath(inputPath) {
+  return inputPath.replace(/\\/g, '/');
+}
+
+function pickPrimaryWindowsInstaller(files) {
+  const exeFiles = files.filter((file) => file.toLowerCase().endsWith('.exe'));
+  if (exeFiles.length === 0) return null;
+
+  const setupPreferred = exeFiles.filter((file) => {
+    const base = path.basename(file).toLowerCase();
+    return base.includes('setup') || base.includes('-nsis');
+  });
+
+  const candidates = setupPreferred.length > 0 ? setupPreferred : exeFiles;
+  candidates.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+  return candidates[0];
+}
+
+function findSignatureForInstaller(installerPath, files) {
+  const installerBase = path.basename(installerPath);
+  const exactSigName = `${installerBase}.sig`;
+  const exact = files.find((file) => path.basename(file) === exactSigName);
+  if (exact) return exact;
+
+  const sigFiles = files.filter((file) => file.toLowerCase().endsWith('.sig'));
+  if (sigFiles.length === 1) return sigFiles[0];
+  return null;
+}
+
 async function main() {
   const pkg = await readJson(TAURI_PACKAGE_PATH);
   const version = pkg.version;
   const releasedAt = new Date().toISOString();
-  const notes = process.env.VOICE_AGENT_RELEASE_NOTES || `Voice Agent release ${version}`;
-
-  const versionDir = path.resolve(PUBLIC_DOWNLOADS_BASE, `v${version}`);
-  await ensureDir(versionDir);
+  const notes = process.env.VOICE_AGENT_RELEASE_NOTES || `Release ${version}`;
 
   let files = [];
   try {
     files = await listFilesRecursive(BUNDLE_DIR);
   } catch {
-    console.error(`[voice-agent] No se encontró bundle dir: ${BUNDLE_DIR}`);
+    console.error(`[voice-agent] Bundle directory no encontrado: ${BUNDLE_DIR}`);
     process.exit(1);
   }
 
-  const artifactFiles = files.filter((file) => fileExtMatches(path.basename(file)));
-  if (artifactFiles.length === 0) {
-    console.error('[voice-agent] No se encontraron artefactos de build para publicar.');
+  const installerPath = pickPrimaryWindowsInstaller(files);
+  if (!installerPath) {
+    console.error('[voice-agent] No se encontro instalador .exe en bundle.');
+    console.error(`[voice-agent] Revisa que exista build en: ${BUNDLE_DIR}`);
     process.exit(1);
   }
 
-  const copied = [];
-  for (const sourceFile of artifactFiles) {
-    const fileName = path.basename(sourceFile);
-    const targetFile = path.resolve(versionDir, fileName);
-    await fs.copyFile(sourceFile, targetFile);
-    copied.push({
-      sourceFile,
-      fileName,
-      targetFile,
-    });
-  }
+  const signaturePath = findSignatureForInstaller(installerPath, files);
+  const installerFileName = path.basename(installerPath);
+  const arch = inferArch(installerFileName);
+  const versionDir = path.resolve(PUBLIC_DOWNLOADS_BASE, `v${version}`);
+  await ensureDir(versionDir);
 
-  const mainAssets = copied
-    .filter((asset) => !asset.fileName.toLowerCase().endsWith('.sig'))
-    .map((asset) => {
-      const sigFileName = `${asset.fileName}.sig`;
-      const hasSig = copied.some((candidate) => candidate.fileName === sigFileName);
-      return {
-        platform: inferPlatform(asset.sourceFile),
-        arch: inferArch(asset.fileName),
-        file_name: asset.fileName,
-        url: `/downloads/voice-agent/v${version}/${asset.fileName}`,
-        signature_url: hasSig ? `/downloads/voice-agent/v${version}/${sigFileName}` : null,
-        sha256: null,
-      };
-    });
+  const installerTarget = path.resolve(versionDir, installerFileName);
+  await fs.copyFile(installerPath, installerTarget);
+
+  let signatureFileName = null;
+  if (signaturePath) {
+    signatureFileName = path.basename(signaturePath);
+    const signatureTarget = path.resolve(versionDir, signatureFileName);
+    await fs.copyFile(signaturePath, signatureTarget);
+  }
 
   const manifest = {
-    app_id: 'com.rdn.voice_agent',
+    app_id: APP_ID,
     version,
     released_at: releasedAt,
     notes,
-    assets: mainAssets,
+    assets: [
+      {
+        platform: 'windows',
+        arch,
+        file_name: installerFileName,
+        url: toPosixPath(`/downloads/voice-agent/v${version}/${installerFileName}`),
+        ...(signatureFileName
+          ? {
+              signature_url: toPosixPath(`/downloads/voice-agent/v${version}/${signatureFileName}`),
+            }
+          : {}),
+      },
+    ],
   };
 
-  await ensureDir(path.dirname(RELEASES_MANIFEST_PATH));
-  await fs.writeFile(RELEASES_MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  await ensureDir(path.dirname(TAURI_RELEASES_MANIFEST_PATH));
+  await fs.writeFile(TAURI_RELEASES_MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   await fs.writeFile(PUBLIC_LATEST_MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
-  console.log(`[voice-agent] Publicada release ${version}`);
-  console.log(`[voice-agent] Assets: ${mainAssets.length}`);
-  console.log(`[voice-agent] Manifest: ${RELEASES_MANIFEST_PATH}`);
+  console.log(`[voice-agent] Release publicada: ${version}`);
+  console.log(`[voice-agent] Instalador: ${installerFileName}`);
+  if (signatureFileName) {
+    console.log(`[voice-agent] Firma: ${signatureFileName}`);
+  } else {
+    console.log('[voice-agent] Firma no encontrada (opcional).');
+  }
+  console.log(`[voice-agent] Manifest actualizado: ${TAURI_RELEASES_MANIFEST_PATH}`);
+  console.log(`[voice-agent] Public manifest: ${PUBLIC_LATEST_MANIFEST_PATH}`);
 }
 
 main().catch((err) => {
   console.error('[voice-agent] Error publicando release:', err);
   process.exit(1);
 });
+
