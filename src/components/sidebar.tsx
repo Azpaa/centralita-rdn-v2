@@ -73,6 +73,7 @@ export function Sidebar() {
       <div className="border-t border-sidebar-border p-3">
         <form action={logout}>
           <Button
+            type="submit"
             variant="ghost"
             size="sm"
             className="w-full justify-start gap-2 rounded-lg border border-transparent text-sidebar-foreground/80 hover:border-white/10 hover:bg-white/10 hover:text-white"

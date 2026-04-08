@@ -1,4 +1,4 @@
-'use client';
+﻿'use client';
 
 import { useState } from 'react';
 import { changePassword, logout } from '@/lib/actions/auth';
@@ -38,26 +38,26 @@ export default function ChangePasswordPage() {
           <div className="mx-auto mb-2 flex h-12 w-12 items-center justify-center rounded-full bg-amber-100">
             <ShieldAlert className="h-6 w-6 text-amber-600" />
           </div>
-          <CardTitle className="text-2xl font-bold tracking-tight">Cambiar contraseña</CardTitle>
+          <CardTitle className="text-2xl font-bold tracking-tight">Cambiar contraseÃ±a</CardTitle>
           <CardDescription>
-            Es necesario cambiar tu contraseña provisional antes de continuar.
+            Es necesario cambiar tu contraseÃ±a provisional antes de continuar.
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form action={handleSubmit} className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="currentPassword">Contraseña actual (provisional)</Label>
+              <Label htmlFor="currentPassword">ContraseÃ±a actual (provisional)</Label>
               <Input
                 id="currentPassword"
                 name="currentPassword"
                 type="password"
                 required
                 autoComplete="current-password"
-                placeholder="La contraseña que te proporcionaron"
+                placeholder="La contraseÃ±a que te proporcionaron"
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="newPassword">Nueva contraseña</Label>
+              <Label htmlFor="newPassword">Nueva contraseÃ±a</Label>
               <Input
                 id="newPassword"
                 name="newPassword"
@@ -65,11 +65,11 @@ export default function ChangePasswordPage() {
                 required
                 minLength={8}
                 autoComplete="new-password"
-                placeholder="Mínimo 8 caracteres"
+                placeholder="MÃ­nimo 8 caracteres"
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="confirmPassword">Confirmar nueva contraseña</Label>
+              <Label htmlFor="confirmPassword">Confirmar nueva contraseÃ±a</Label>
               <Input
                 id="confirmPassword"
                 name="confirmPassword"
@@ -77,20 +77,20 @@ export default function ChangePasswordPage() {
                 required
                 minLength={8}
                 autoComplete="new-password"
-                placeholder="Repite la nueva contraseña"
+                placeholder="Repite la nueva contraseÃ±a"
               />
             </div>
             {error && <p className="text-sm text-destructive">{error}</p>}
             <Button type="submit" className="mt-1 w-full" disabled={loading}>
-              {loading ? 'Cambiando...' : 'Cambiar contraseña'}
+              {loading ? 'Cambiando...' : 'Cambiar contraseÃ±a'}
             </Button>
             <Button
-              type="button"
+              type="submit"
+              formAction={logout}
               variant="ghost"
               className="w-full text-muted-foreground"
-              onClick={() => logout()}
             >
-              Cerrar sesión
+              Cerrar sesiÃ³n
             </Button>
           </form>
         </CardContent>
@@ -98,3 +98,4 @@ export default function ChangePasswordPage() {
     </div>
   );
 }
+
