@@ -16,7 +16,7 @@ import {
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
-import { Search, ChevronLeft, ChevronRight, PhoneOutgoing, AlertCircle } from 'lucide-react';
+import { Search, ChevronLeft, ChevronRight, PhoneOutgoing, Phone, AlertCircle } from 'lucide-react';
 import { toast } from 'sonner';
 import { useCall } from '@/contexts/call-context';
 
@@ -402,6 +402,7 @@ export default function CallsPage() {
           <DialogFooter>
             <Button variant="outline" onClick={() => setDialOpen(false)}>Cancelar</Button>
             <Button onClick={handleDial} disabled={!dialNumber || !dialFromNumber}>
+              <Phone className="mr-2 h-4 w-4" aria-hidden="true" />
               Llamar
             </Button>
           </DialogFooter>
