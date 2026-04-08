@@ -16,7 +16,12 @@ import type {
 } from './lib/types';
 import { useVoiceEngine } from './lib/voice-engine';
 
-const STORAGE_BASE_URL = 'voice_agent_backend_url';
+const DEFAULT_BACKEND_URL = 'https://centralita.reparacionesdelnorte.es';
+const BOOTSTRAP_BACKEND_URL = normalizeBaseUrl(
+  import.meta.env.VITE_VOICE_AGENT_BACKEND_URL
+    || import.meta.env.VITE_BACKEND_URL
+    || DEFAULT_BACKEND_URL
+);
 const STORAGE_SESSION_KEY = 'voice-agent-tauri-auth';
 
 type StreamStatus = 'connecting' | 'connected' | 'disconnected';
@@ -82,10 +87,7 @@ function upsertCall(list: VoiceCallView[], next: VoiceCallView): VoiceCallView[]
 }
 
 export default function App() {
-  const [backendUrlInput, setBackendUrlInput] = useState(
-    localStorage.getItem(STORAGE_BASE_URL) || 'http://localhost:3000'
-  );
-  const [backendUrl, setBackendUrl] = useState(normalizeBaseUrl(backendUrlInput));
+  const backendUrl = BOOTSTRAP_BACKEND_URL;
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -266,18 +268,27 @@ export default function App() {
   }, [backendUrl]);
 
   useEffect(() => {
-    void hydrateBootstrapAndSession();
+    const bootstrapTimer = window.setTimeout(() => {
+      void hydrateBootstrapAndSession();
+    }, 0);
+
+    return () => window.clearTimeout(bootstrapTimer);
   }, [hydrateBootstrapAndSession]);
 
   useEffect(() => {
     if (!accessToken || !backendUrl) return;
-    void refreshAgentSnapshot('session_ready');
+    const snapshotTimer = window.setTimeout(() => {
+      void refreshAgentSnapshot('session_ready');
+    }, 0);
 
     const interval = setInterval(() => {
       void refreshAgentSnapshot('fallback_interval');
     }, 45_000);
 
-    return () => clearInterval(interval);
+    return () => {
+      window.clearTimeout(snapshotTimer);
+      clearInterval(interval);
+    };
   }, [accessToken, backendUrl, refreshAgentSnapshot]);
 
   useEffect(() => {
@@ -319,13 +330,6 @@ export default function App() {
       setStreamStatus('disconnected');
     };
   }, [accessToken, backendUrl, handleCanonicalEvent]);
-
-  const saveBackendUrl = useCallback(async () => {
-    const normalized = normalizeBaseUrl(backendUrlInput);
-    setBackendUrl(normalized);
-    localStorage.setItem(STORAGE_BASE_URL, normalized);
-    setMessage(`Backend configurado: ${normalized}`);
-  }, [backendUrlInput]);
 
   const login = useCallback(async () => {
     if (!supabaseRef.current) {
@@ -427,165 +431,195 @@ export default function App() {
     return 'Stream desconectado';
   }, [streamStatus]);
 
+  const messageTone = useMemo(() => {
+    const text = message.toLowerCase();
+    if (
+      text.includes('error')
+      || text.includes('no se pudo')
+      || text.includes('invalido')
+      || text.includes('failed')
+    ) {
+      return 'message-error';
+    }
+    if (text.includes('reconectando') || text.includes('expirado')) {
+      return 'message-warn';
+    }
+    if (text.includes('correcto') || text.includes('aplicado') || text.includes('aceptada')) {
+      return 'message-success';
+    }
+    return 'message-info';
+  }, [message]);
+
   const isLoggedIn = Boolean(accessToken);
 
   return (
     <div className="app-shell">
-      <header className="card">
-        <h1>RDN Voice Agent (Tauri)</h1>
-        <p className="muted">
-          Cliente desktop de voz real con estado canonico + media Twilio.
-        </p>
-      </header>
+      <div className="halo halo-left" aria-hidden />
+      <div className="halo halo-right" aria-hidden />
 
-      <section className="card grid">
-        <label>
-          Backend URL
-          <input
-            value={backendUrlInput}
-            onChange={(e) => setBackendUrlInput(e.target.value)}
-            placeholder="https://centralita.reparacionesdelnorte.es"
-          />
-        </label>
-        <button onClick={() => void saveBackendUrl()}>Guardar backend</button>
-        {bootstrap && (
+      <main className={isLoggedIn ? 'layout layout-live' : 'layout layout-login'}>
+        <header className="card hero-card">
+          <p className="eyebrow">Centralita RDN</p>
+          <h1>RDN Voice Agent</h1>
           <p className="muted">
-            Auth mode: {bootstrap.auth.mode} - API: {bootstrap.backend.api_base_path}
+            Cliente desktop de voz real con estado canonico + media Twilio.
           </p>
-        )}
-      </section>
-
-      {!isLoggedIn && (
-        <section className="card grid">
-          <h2>Login agente</h2>
-          <label>
-            Email
-            <input value={email} onChange={(e) => setEmail(e.target.value)} />
-          </label>
-          <label>
-            Password
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-          </label>
-          <button disabled={isLoading} onClick={() => void login()}>
-            {isLoading ? 'Entrando...' : 'Entrar'}
-          </button>
-        </section>
-      )}
-
-      {isLoggedIn && (
-        <>
-          <section className="card grid">
-            <h2>Estado operativo</h2>
-            <p><strong>Agente:</strong> {agentState?.user_id ?? 'desconocido'}</p>
-            <p><strong>Identidad Voice:</strong> {voice.identity || 'sin resolver'}</p>
-            <p><strong>Operativo:</strong> {operationalLabel(agentState?.operational_status ?? 'unknown')}</p>
-            <p><strong>Llamadas activas:</strong> {agentState?.active_calls_count ?? 0}</p>
-            <p><strong>Fuente:</strong> {agentState?.source_of_truth ?? 'n/a'}</p>
-            <p><strong>Canal:</strong> {streamBadge}</p>
-            <p><strong>Ultimo evento:</strong> {lastEvent}</p>
-            <div className="actions">
-              <button onClick={() => void refreshAgentSnapshot('manual')}>Refrescar estado</button>
-              <button onClick={() => void logout()}>Salir</button>
-            </div>
-          </section>
-
-          <section className="card grid">
-            <h2>Motor de voz</h2>
-            <p>
-              <strong>Device:</strong>{' '}
-              <span className={voiceStatusClass(voice.deviceStatus)}>
-                {voiceStatusLabel(voice.deviceStatus)}
-              </span>
+          {bootstrap && (
+            <p className="muted muted-compact">
+              Auth: {bootstrap.auth.mode} - API: {bootstrap.backend.api_base_path}
             </p>
-            <p><strong>Detalle:</strong> {voice.deviceReason}</p>
-            <p><strong>Token:</strong> {voice.tokenExpired ? 'expirado/renovando' : 'vigente'}</p>
-            <p><strong>Llamadas enlazadas al softphone:</strong> {voice.attachedCallSids.length}</p>
-            {voice.lastError && (
-              <p className="muted"><strong>Ultimo error:</strong> {voice.lastError}</p>
-            )}
-            <div className="actions">
-              <button onClick={() => void voice.reconnectNow()}>Reiniciar motor de voz</button>
+          )}
+        </header>
+
+        {!isLoggedIn && (
+          <section className="card login-card">
+            <h2>Acceso de agente</h2>
+            <p className="muted">Usa las mismas credenciales de la web de Centralita.</p>
+            <div className="grid">
+              <label>
+                Email
+                <input
+                  autoComplete="username"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="agente@empresa.com"
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      void login();
+                    }
+                  }}
+                />
+              </label>
+              <button disabled={isLoading} onClick={() => void login()}>
+                {isLoading ? 'Entrando...' : 'Entrar'}
+              </button>
             </div>
           </section>
+        )}
 
-          <section className="card grid">
-            <h2>Llamadas</h2>
-            <label>
-              conference_name (opcional para mute/unmute en conferencia de backend)
-              <input
-                value={conferenceName}
-                onChange={(e) => setConferenceName(e.target.value)}
-                placeholder="conf-123"
-              />
-            </label>
-            {calls.length === 0 && (
-              <p className="muted">Sin llamadas activas/ringing.</p>
-            )}
+        {isLoggedIn && (
+          <>
+            <section className="card grid">
+              <h2>Estado operativo</h2>
+              <p><strong>Agente:</strong> {agentState?.user_id ?? 'desconocido'}</p>
+              <p><strong>Identidad Voice:</strong> {voice.identity || 'sin resolver'}</p>
+              <p><strong>Operativo:</strong> {operationalLabel(agentState?.operational_status ?? 'unknown')}</p>
+              <p><strong>Llamadas activas:</strong> {agentState?.active_calls_count ?? 0}</p>
+              <p><strong>Fuente:</strong> {agentState?.source_of_truth ?? 'n/a'}</p>
+              <p><strong>Canal:</strong> {streamBadge}</p>
+              <p><strong>Ultimo evento:</strong> {lastEvent}</p>
+              <div className="actions">
+                <button onClick={() => void refreshAgentSnapshot('manual')}>Refrescar estado</button>
+                <button onClick={() => void logout()}>Salir</button>
+              </div>
+            </section>
 
-            {calls.map((call) => {
-              const attached = voice.isCallAttached(call.callSid);
-              const canAccept = attached && call.status !== 'in_progress';
-              const canToggleMute = attached && call.status === 'in_progress';
-              const muteNeedsConference = Boolean(conferenceName.trim());
+            <section className="card grid">
+              <h2>Motor de voz</h2>
+              <p>
+                <strong>Device:</strong>{' '}
+                <span className={voiceStatusClass(voice.deviceStatus)}>
+                  {voiceStatusLabel(voice.deviceStatus)}
+                </span>
+              </p>
+              <p><strong>Detalle:</strong> {voice.deviceReason}</p>
+              <p><strong>Token:</strong> {voice.tokenExpired ? 'expirado/renovando' : 'vigente'}</p>
+              <p><strong>Llamadas enlazadas al softphone:</strong> {voice.attachedCallSids.length}</p>
+              {voice.lastError && (
+                <p className="muted"><strong>Ultimo error:</strong> {voice.lastError}</p>
+              )}
+              <div className="actions">
+                <button onClick={() => void voice.reconnectNow()}>Reiniciar motor de voz</button>
+              </div>
+            </section>
 
-              return (
-                <article key={call.callSid} className="call-row">
-                  <div>
-                    <p><strong>{call.callSid}</strong></p>
-                    <p className="muted">
-                      {call.direction} - {call.status} - {call.from ?? '-'} -&gt; {call.to ?? '-'}
-                    </p>
-                    <p className="muted">
-                      Motor local: {attached ? 'media enlazada' : 'sin media local enlazada'}
-                    </p>
-                    {!attached && (
+            <section className="card grid">
+              <h2>Llamadas</h2>
+              <label>
+                conference_name (opcional para mute/unmute en conferencia de backend)
+                <input
+                  value={conferenceName}
+                  onChange={(e) => setConferenceName(e.target.value)}
+                  placeholder="conf-123"
+                />
+              </label>
+              {calls.length === 0 && (
+                <p className="muted">Sin llamadas activas/ringing.</p>
+              )}
+
+              {calls.map((call) => {
+                const attached = voice.isCallAttached(call.callSid);
+                const canAccept = attached && call.status !== 'in_progress';
+                const canToggleMute = attached && call.status === 'in_progress';
+                const muteNeedsConference = Boolean(conferenceName.trim());
+
+                return (
+                  <article key={call.callSid} className="call-row">
+                    <div>
+                      <p><strong>{call.callSid}</strong></p>
                       <p className="muted">
-                        Aceptar/mute requiere que esta llamada llegue al softphone local.
+                        {call.direction} - {call.status} - {call.from ?? '-'} -&gt; {call.to ?? '-'}
                       </p>
-                    )}
-                    {attached && !muteNeedsConference && (
                       <p className="muted">
-                        Mute sin conference_name aplica mute local de microfono.
+                        Motor local: {attached ? 'media enlazada' : 'sin media local enlazada'}
                       </p>
-                    )}
-                    {attached && muteNeedsConference && (
-                      <p className="muted">
-                        Mute aplicara media local + endpoint de conferencia en backend.
-                      </p>
-                    )}
-                  </div>
-                  <div className="actions">
-                    <button
-                      disabled={!canAccept}
-                      onClick={() => void executeCallAction('accept', call.callSid)}
-                      title={canAccept ? 'Aceptar llamada real' : 'No hay incoming local para aceptar'}
-                    >
-                      Aceptar
-                    </button>
-                    <button onClick={() => void executeCallAction('hangup', call.callSid)}>
-                      Colgar
-                    </button>
-                    <button
-                      disabled={!canToggleMute}
-                      onClick={() => void executeCallAction(call.muted ? 'unmute' : 'mute', call.callSid)}
-                      title={canToggleMute ? 'Mutear/Desmutear llamada real' : 'Mute requiere llamada en media local activa'}
-                    >
-                      {call.muted ? 'Unmute' : 'Mute'}
-                    </button>
-                  </div>
-                </article>
-              );
-            })}
+                      {!attached && (
+                        <p className="muted">
+                          Aceptar/mute requiere que esta llamada llegue al softphone local.
+                        </p>
+                      )}
+                      {attached && !muteNeedsConference && (
+                        <p className="muted">
+                          Mute sin conference_name aplica mute local de microfono.
+                        </p>
+                      )}
+                      {attached && muteNeedsConference && (
+                        <p className="muted">
+                          Mute aplicara media local + endpoint de conferencia en backend.
+                        </p>
+                      )}
+                    </div>
+                    <div className="actions">
+                      <button
+                        disabled={!canAccept}
+                        onClick={() => void executeCallAction('accept', call.callSid)}
+                        title={canAccept ? 'Aceptar llamada real' : 'No hay incoming local para aceptar'}
+                      >
+                        Aceptar
+                      </button>
+                      <button onClick={() => void executeCallAction('hangup', call.callSid)}>
+                        Colgar
+                      </button>
+                      <button
+                        disabled={!canToggleMute}
+                        onClick={() => void executeCallAction(call.muted ? 'unmute' : 'mute', call.callSid)}
+                        title={canToggleMute ? 'Mutear/Desmutear llamada real' : 'Mute requiere llamada en media local activa'}
+                      >
+                        {call.muted ? 'Unmute' : 'Mute'}
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+            </section>
+          </>
+        )}
+
+        {message && (
+          <section className={`card message-card ${messageTone}`}>
+            <p>{message}</p>
           </section>
-        </>
-      )}
-
-      {message && (
-        <section className="card">
-          <p>{message}</p>
-        </section>
-      )}
+        )}
+      </main>
     </div>
   );
 }
-

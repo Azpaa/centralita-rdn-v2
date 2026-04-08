@@ -6,6 +6,8 @@ const apiCorsAllowOrigin =
   "*";
 
 const nextConfig: NextConfig = {
+  // Evita que Next intente inferir un root superior por lockfiles externos.
+  outputFileTracingRoot: process.cwd(),
   /**
    * Cabeceras de seguridad y CORS para la API REST.
    * Permite restringir origen en produccion via API_CORS_ALLOW_ORIGIN.

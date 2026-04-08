@@ -38,10 +38,17 @@ npm run tauri:dev
 
 En el primer arranque, el runtime pedira permiso de microfono para levantar media WebRTC.
 
-Backend local recomendado:
+Por defecto, la app usa este backend:
 
-- Centralita: `http://localhost:3000`
-- En la app, configura `Backend URL` a esa base.
+- `https://centralita.reparacionesdelnorte.es`
+
+Para apuntar a otro backend (por ejemplo local), define variable de entorno antes de arrancar.
+PowerShell (Windows):
+
+```powershell
+$env:VITE_VOICE_AGENT_BACKEND_URL="http://localhost:3000"
+npm run tauri:dev
+```
 
 ## Build
 
@@ -66,4 +73,3 @@ y actualiza manifests en:
 
 - `apps/voice-agent-tauri/releases/latest.json`
 - `public/downloads/voice-agent/latest.json`
-
