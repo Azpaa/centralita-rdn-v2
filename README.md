@@ -20,7 +20,12 @@ You can start editing the page by modifying `app/page.tsx`. The page auto-update
 
 ## Voice Agent Desktop Download
 
-Set `VOICE_AGENT_DOWNLOAD_URL` with the public installer URL used by `/api/download-agent`.
+`/api/download-agent` resolves download URL in this order:
+
+1. `public/downloads/voice-agent/latest.json` (preferred, same source as updater endpoint).
+2. `VOICE_AGENT_DOWNLOAD_URL` (fallback).
+
+Set `VOICE_AGENT_DOWNLOAD_URL` only as fallback/default URL.
 Example:
 
 ```bash
