@@ -23,7 +23,13 @@ const publicRoutes = [
   '/downloads/',
 ]
 
-const defaultDesktopOrigins = ['tauri://localhost', 'http://localhost:1420', 'http://127.0.0.1:1420']
+const defaultDesktopOrigins = [
+  'tauri://localhost',
+  'https://tauri.localhost',
+  'http://tauri.localhost',
+  'http://localhost:1420',
+  'http://127.0.0.1:1420',
+]
 
 function getAllowedDesktopOrigins(): string[] {
   const fromEnv = (process.env.TAURI_ALLOWED_ORIGINS || '')
