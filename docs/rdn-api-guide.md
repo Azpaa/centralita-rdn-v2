@@ -189,6 +189,24 @@ Notas operativas:
   - `rdn` para comandos M2M por API key.
   - `backend_outbound` para comandos iniciados por sesion web (panel), manteniendo backend como motor.
 
+### POST `/api/v1/calls/{call_sid}/accept`
+Solicita aceptacion remota de llamada al cliente agente conectado (ej. Tauri).
+
+Body opcional:
+
+```json
+{
+  "user_id": "uuid-del-agente-opcional",
+  "rdn_user_id": "id-operativo-rdn-opcional"
+}
+```
+
+Notas operativas:
+- Con sesion web/operator, si no se envia body, se intenta usar el usuario de sesion.
+- Con API key M2M, se recomienda enviar `user_id` o `rdn_user_id`.
+- Si backend no puede resolver agente destino, responde `400 BAD_REQUEST` (esperado, no incidente de plataforma).
+- Este endpoint publica un comando en el stream canónico; la aceptacion final depende de cliente conectado con softphone registrado y media local disponible.
+
 ### POST `/api/v1/calls/{call_sid}/hangup`
 Cuelga llamada.
 
@@ -268,6 +286,7 @@ Sesion web:
 
 API key M2M:
 - requiere query `?user_id=<uuid>`.
+- sin `user_id` responde `400 BAD_REQUEST` (validacion contractual).
 
 Respuesta (shape resumido):
 
@@ -306,6 +325,7 @@ Auth y scope:
 - Sesion `operator`: `scope=mine` (solo eventos del agente de sesion).
 - Sesion `admin`: `scope=mine` (default), `scope=all` o `user_id=<uuid>`.
 - API key M2M: requiere `user_id=<uuid>` para evitar streams globales accidentales.
+- API key M2M sin `user_id` => `400 BAD_REQUEST` (validacion contractual).
 
 Eventos canónicos:
 - `connected`
@@ -524,6 +544,16 @@ Formato error:
 
 Todas las respuestas API incluyen header `X-Request-Id`.
 
+## 10.1 Errores esperados (no incidentes)
+
+- `GET /api/v1/agent/me/state` con API key M2M y sin `user_id` -> `400 BAD_REQUEST`.
+- `GET /api/v1/stream/events` con API key M2M y sin `user_id` -> `400 BAD_REQUEST`.
+- Receptor webhook RDN:
+  - Sin `X-Centralita-Delivery-Id` -> `400 BAD_REQUEST`.
+  - Firma invalida en `X-Centralita-Signature` -> `401 UNAUTHORIZED`.
+- Para responder llamada en remoto, endpoint contractual es `POST /api/v1/calls/{call_sid}/accept`.
+  - `.../answer` y `.../pickup` no forman parte del contrato.
+
 ## 11. Seguridad operativa minima
 
 ## 11.1 API keys
@@ -579,7 +609,16 @@ curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/calls/CAxxxx/han
   -d '{"target":"all"}'
 ```
 
-### 14.2 Retry de pendientes (cron)
+### 14.2 Accept remoto de llamada
+
+```bash
+curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/calls/CAxxxx/accept" \
+  -H "Authorization: Bearer ck_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"rdn_user_id":"emp-1"}'
+```
+
+### 14.3 Retry de pendientes (cron)
 
 ```bash
 curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/webhooks/retry-deliveries" \
@@ -588,7 +627,7 @@ curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/webhooks/retry-d
   -d '{"limit":100}'
 ```
 
-### 14.3 Bulk sync
+### 14.4 Bulk sync
 
 ```bash
 curl -X POST "https://centralita.reparacionesdelnorte.es/api/v1/users/bulk-sync" \

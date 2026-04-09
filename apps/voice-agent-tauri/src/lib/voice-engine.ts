@@ -3,8 +3,9 @@ import { Call, Device } from '@twilio/voice-sdk';
 import { fetchCallByTwilioSid, fetchVoiceToken, type ApiResult } from './backend';
 import type { VoiceDeviceStatus } from './types';
 
-const DEVICE_REGISTER_TIMEOUT_MS = 20_000;
+const DEVICE_REGISTER_TIMEOUT_MS = 30_000;
 const HEALTH_CHECK_INTERVAL_MS = 30_000;
+const WAKE_HEALTH_GAP_MS = 75_000;
 const ADOPTION_LOOKUP_RETRIES = 3;
 const ADOPTION_LOOKUP_RETRY_DELAY_MS = 150;
 
@@ -145,11 +146,25 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
   const deviceStatusRef = useRef<VoiceDeviceStatus>('disconnected');
   const baseUrlRef = useRef(baseUrl);
   const accessTokenRef = useRef(accessToken);
+  const lastHealthTickRef = useRef<number>(Date.now());
+  const onIncomingCallRef = useRef(onIncomingCall);
+  const onCallAcceptedRef = useRef(onCallAccepted);
+  const onCallEndedRef = useRef(onCallEnded);
+  const onCallMutedChangedRef = useRef(onCallMutedChanged);
+  const onInfoRef = useRef(onInfo);
 
   useEffect(() => {
     baseUrlRef.current = baseUrl;
     accessTokenRef.current = accessToken;
   }, [baseUrl, accessToken]);
+
+  useEffect(() => {
+    onIncomingCallRef.current = onIncomingCall;
+    onCallAcceptedRef.current = onCallAccepted;
+    onCallEndedRef.current = onCallEnded;
+    onCallMutedChangedRef.current = onCallMutedChanged;
+    onInfoRef.current = onInfo;
+  }, [onIncomingCall, onCallAccepted, onCallEnded, onCallMutedChanged, onInfo]);
 
   useEffect(() => {
     deviceStatusRef.current = deviceStatus;
@@ -218,8 +233,8 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     if (!callsRef.current.has(callSid)) return;
     callsRef.current.delete(callSid);
     syncAttachedCallSids();
-    onCallEnded?.(callSid);
-  }, [onCallEnded, syncAttachedCallSids]);
+    onCallEndedRef.current?.(callSid);
+  }, [syncAttachedCallSids]);
 
   const evaluateAutoAdopt = useCallback(async (callSid: string): Promise<{
     autoAdopt: boolean;
@@ -261,7 +276,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
 
   const wireCallLifecycle = useCallback((call: Call, callSid: string) => {
     call.on('accept', () => {
-      onCallAccepted?.(callSid);
+      onCallAcceptedRef.current?.(callSid);
     });
 
     call.on('disconnect', () => {
@@ -279,10 +294,10 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     call.on('error', (err: { message?: string }) => {
       const message = err.message || 'Error en llamada de voz';
       setLastError(message);
-      onInfo?.(`Error de llamada ${callSid}: ${message}`);
+      onInfoRef.current?.(`Error de llamada ${callSid}: ${message}`);
       removeManagedCall(callSid);
     });
-  }, [onCallAccepted, onInfo, removeManagedCall]);
+  }, [removeManagedCall]);
 
   const handleIncomingCall = useCallback(async (call: Call) => {
     const callSid = readCallParameter(call, 'CallSid');
@@ -313,22 +328,22 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         autoAdopted = true;
         direction = 'outbound';
         toNumber = adoption.toNumber;
-        onInfo?.(`Auto-adopcion activada para llamada ${callSid}`);
+        onInfoRef.current?.(`Auto-adopcion activada para llamada ${callSid}`);
         call.accept();
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'lookup_adoption_failed';
-      onInfo?.(`No se pudo evaluar adopcion de llamada ${callSid}: ${message}`);
+      onInfoRef.current?.(`No se pudo evaluar adopcion de llamada ${callSid}: ${message}`);
     }
 
-    onIncomingCall?.({
+    onIncomingCallRef.current?.({
       callSid,
       from: readCallParameter(call, 'From') || null,
       to: toNumber,
       direction,
       autoAdopted,
     });
-  }, [evaluateAutoAdopt, onIncomingCall, onInfo, syncAttachedCallSids, wireCallLifecycle]);
+  }, [evaluateAutoAdopt, syncAttachedCallSids, wireCallLifecycle]);
 
   const wireDeviceLifecycle = useCallback((device: Device) => {
     device.on('registering', () => {
@@ -363,7 +378,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       const code = err.code ?? 0;
       const message = err.message || `Error de device (${code})`;
       setLastError(message);
-      onInfo?.(`Error de softphone ${code}: ${message}`);
+      onInfoRef.current?.(`Error de softphone ${code}: ${message}`);
 
       if (code === 31204 || code === 31205 || code === 31009) {
         setTokenExpired(true);
@@ -378,7 +393,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
 
     device.on('tokenWillExpire', async () => {
       setTokenExpired(true);
-      onInfo?.('Token de voz proximo a expirar; refrescando');
+      onInfoRef.current?.('Token de voz proximo a expirar; refrescando');
 
       const refresh = await fetchVoiceToken(baseUrlRef.current, accessTokenRef.current);
       if (!refresh.ok) {
@@ -403,7 +418,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     device.on('incoming', (call: Call) => {
       void handleIncomingCall(call);
     });
-  }, [handleIncomingCall, onInfo, scheduleReconnect, setHealthy, setProblem]);
+  }, [handleIncomingCall, scheduleReconnect, setHealthy, setProblem]);
 
   const initializeDevice = useCallback(async (trigger: string) => {
     if (!enabledRef.current) return;
@@ -436,7 +451,8 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
 
         if (isAuthOrSessionError(tokenResult.error)) {
           setTokenExpired(true);
-          setProblem('degraded', 'Sesion invalida para token de voz');
+          setProblem('degraded', 'Sesion invalida para token de voz; esperando renovacion');
+          scheduleReconnect('session_invalid_token', 5_000);
           return;
         }
 
@@ -500,10 +516,21 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     }
 
     enabledRef.current = true;
+    lastHealthTickRef.current = Date.now();
     void initializeDevice('session_ready');
 
     const healthInterval = setInterval(() => {
       if (!enabledRef.current) return;
+
+      const now = Date.now();
+      const healthGap = now - lastHealthTickRef.current;
+      lastHealthTickRef.current = now;
+
+      if (healthGap >= WAKE_HEALTH_GAP_MS) {
+        onInfoRef.current?.(`Reanudacion detectada (${Math.round(healthGap / 1000)}s). Revalidando softphone...`);
+        void initializeDevice('wake_gap_healthcheck');
+        return;
+      }
 
       const device = deviceRef.current;
       if (!device) {
@@ -532,17 +559,31 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       void initializeDevice('browser_online');
     };
 
+    const onFocus = () => {
+      void initializeDevice('window_focus');
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void initializeDevice('visibility_visible');
+      }
+    };
+
     const onOffline = () => {
       setProblem('degraded', 'Sin conectividad de red');
     };
 
     window.addEventListener('online', onOnline);
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
     window.addEventListener('offline', onOffline);
 
     return () => {
       enabledRef.current = false;
       clearInterval(healthInterval);
       window.removeEventListener('online', onOnline);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('offline', onOffline);
       clearReconnectTimer();
       softResetDevice();
@@ -607,17 +648,26 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     try {
       managed.call.mute(muted);
       managed.muted = muted;
-      onCallMutedChanged?.(callSid, muted);
+      onCallMutedChangedRef.current?.(callSid, muted);
       return { ok: true, data: { call_sid: callSid } };
     } catch (err) {
       const message = err instanceof Error ? err.message : 'mute_toggle_failed';
       setLastError(message);
       return { ok: false, error: message };
     }
-  }, [onCallMutedChanged]);
+  }, []);
 
   const reconnectNow = useCallback(async () => {
-    if (!enabledRef.current) return;
+    if (!enabledRef.current) {
+      const message = 'No se puede reiniciar el motor: sesion no activa o backend no configurado.';
+      setLastError(message);
+      onInfoRef.current?.(message);
+      return;
+    }
+    if (initInFlightRef.current) {
+      onInfoRef.current?.('El motor de voz ya se esta inicializando.');
+      return;
+    }
     reconnectAttemptsRef.current = 0;
     clearReconnectTimer();
     softResetDevice();

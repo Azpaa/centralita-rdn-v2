@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { createClient, type Session, type SupabaseClient } from '@supabase/supabase-js';
 import {
+  type ApiResult,
   callCommand,
   consumeSseStream,
   fetchAgentState,
@@ -23,6 +24,16 @@ const BOOTSTRAP_BACKEND_URL = normalizeBaseUrl(
     || DEFAULT_BACKEND_URL
 );
 const STORAGE_SESSION_KEY = 'voice-agent-tauri-auth';
+const SESSION_REFRESH_INTERVAL_MS = 45_000;
+const SESSION_REFRESH_SKEW_SECONDS = 120;
+const STREAM_STALE_TIMEOUT_MS = 85_000;
+const STREAM_WATCHDOG_INTERVAL_MS = 12_000;
+const WAKE_GAP_DETECT_MS = 15_000;
+const WAKE_GAP_THRESHOLD_MS = 55_000;
+const REMOTE_ACCEPT_RETRY_DELAY_MS = 350;
+const REMOTE_ACCEPT_MAX_ATTEMPTS = 5;
+const REMOTE_COMMAND_TTL_MS = 10 * 60_000;
+const REMOTE_COMMAND_MAX_TRACKED = 200;
 
 type StreamStatus = 'connecting' | 'connected' | 'disconnected';
 
@@ -86,6 +97,22 @@ function upsertCall(list: VoiceCallView[], next: VoiceCallView): VoiceCallView[]
   return updated;
 }
 
+function isJwtOrAuthError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('jwt')
+    || normalized.includes('unauthorized')
+    || normalized.includes('no valido')
+    || normalized.includes('sesion')
+    || normalized.includes('session')
+    || normalized.includes('401')
+  );
+}
+
+function getSessionToken(session: Session | null): string {
+  return session?.access_token || '';
+}
+
 export default function App() {
   const backendUrl = BOOTSTRAP_BACKEND_URL;
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null);
@@ -101,6 +128,18 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
 
   const supabaseRef = useRef<SupabaseClient | null>(null);
+  const authSubscriptionRef = useRef<{ unsubscribe: () => void } | null>(null);
+  const accessTokenRef = useRef(accessToken);
+  const sseControllerRef = useRef<AbortController | null>(null);
+  const processedRemoteCommandIdsRef = useRef<Map<string, number>>(new Map());
+  const remoteAcceptInFlightRef = useRef<Set<string>>(new Set());
+  const lastStreamEventAtRef = useRef<number>(Date.now());
+  const lastWakeTickRef = useRef<number>(Date.now());
+  const reconnectVoiceRef = useRef<() => Promise<void>>(async () => {});
+
+  useEffect(() => {
+    accessTokenRef.current = accessToken;
+  }, [accessToken]);
 
   const applySnapshot = useCallback((snapshot: AgentStateSnapshot | null) => {
     setAgentState(snapshot);
@@ -124,53 +163,203 @@ export default function App() {
     });
   }, []);
 
-  const refreshAgentSnapshot = useCallback(async (reason: string) => {
-    if (!backendUrl || !accessToken) return;
+  const ensureFreshSession = useCallback(async (
+    reason: string,
+    options?: {
+      forceRefresh?: boolean;
+      silent?: boolean;
+    },
+  ): Promise<string> => {
+    const supabase = supabaseRef.current;
+    if (!supabase) return '';
 
-    const result = await fetchAgentState(backendUrl, accessToken);
+    const forceRefresh = Boolean(options?.forceRefresh);
+    const silent = Boolean(options?.silent);
+
+    const sessionResult = await supabase.auth.getSession();
+    if (sessionResult.error) {
+      if (!silent) {
+        setMessage(`No se pudo leer sesion (${reason}): ${sessionResult.error.message}`);
+      }
+      return '';
+    }
+
+    let session = sessionResult.data.session;
+    const token = getSessionToken(session);
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = session?.expires_at ?? 0;
+    const isNearExpiry = expiresAt > 0 && expiresAt - now <= SESSION_REFRESH_SKEW_SECONDS;
+
+    if (forceRefresh || !token || isNearExpiry) {
+      const refreshResult = await supabase.auth.refreshSession();
+      if (refreshResult.error || !refreshResult.data.session) {
+        if (!silent) {
+          setMessage(
+            `Sesion no valida (${reason}): ${refreshResult.error?.message || 'sin session'}`
+          );
+        }
+        setAccessToken('');
+        return '';
+      }
+      session = refreshResult.data.session;
+    }
+
+    const freshToken = getSessionToken(session);
+    if (freshToken && freshToken !== accessTokenRef.current) {
+      setAccessToken(freshToken);
+    }
+
+    return freshToken;
+  }, []);
+
+  const withJwtRetry = useCallback(async <T,>(
+    reason: string,
+    request: (jwt: string) => Promise<ApiResult<T>>,
+  ): Promise<ApiResult<T>> => {
+    const token = await ensureFreshSession(`${reason}:initial`, { silent: true });
+    if (!token) {
+      return { ok: false, error: 'Sesion no valida' };
+    }
+
+    let result = await request(token);
+    if (!result.ok && isJwtOrAuthError(result.error)) {
+      const refreshed = await ensureFreshSession(`${reason}:retry`, {
+        forceRefresh: true,
+        silent: true,
+      });
+      if (!refreshed) return result;
+      result = await request(refreshed);
+    }
+    return result;
+  }, [ensureFreshSession]);
+
+  const refreshAgentSnapshot = useCallback(async (reason: string) => {
+    if (!backendUrl || !accessTokenRef.current) return;
+
+    const result = await withJwtRetry(
+      `agent_state:${reason}`,
+      (jwt) => fetchAgentState(backendUrl, jwt),
+    );
     if (!result.ok) {
       setMessage(`No se pudo refrescar estado (${reason}): ${result.error}`);
       return;
     }
     applySnapshot(result.data);
-  }, [accessToken, applySnapshot, backendUrl]);
+  }, [applySnapshot, backendUrl, withJwtRetry]);
+
+  const handleVoiceIncoming = useCallback((event: {
+    callSid: string;
+    from: string | null;
+    to: string | null;
+    direction: 'inbound' | 'outbound';
+    autoAdopted: boolean;
+  }) => {
+    setCalls((prev) => upsertCall(prev, {
+      callSid: event.callSid,
+      direction: event.direction,
+      status: event.autoAdopted ? 'in_progress' : 'ringing',
+      from: event.from,
+      to: event.to,
+      muted: false,
+    }));
+  }, []);
+
+  const handleVoiceAccepted = useCallback((callSid: string) => {
+    setCalls((prev) => prev.map((call) => (
+      call.callSid === callSid
+        ? { ...call, status: 'in_progress' }
+        : call
+    )));
+  }, []);
+
+  const handleVoiceEnded = useCallback((callSid: string) => {
+    setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
+  }, []);
+
+  const handleVoiceMutedChanged = useCallback((callSid: string, muted: boolean) => {
+    setCalls((prev) => prev.map((call) => (
+      call.callSid === callSid
+        ? { ...call, muted }
+        : call
+    )));
+  }, []);
+
+  const handleVoiceInfo = useCallback((info: string) => {
+    setMessage(info);
+  }, []);
 
   const voice = useVoiceEngine({
     baseUrl: backendUrl,
     accessToken,
-    onIncomingCall: (event) => {
-      setCalls((prev) => upsertCall(prev, {
-        callSid: event.callSid,
-        direction: event.direction,
-        status: event.autoAdopted ? 'in_progress' : 'ringing',
-        from: event.from,
-        to: event.to,
-        muted: false,
-      }));
-    },
-    onCallAccepted: (callSid) => {
-      setCalls((prev) => prev.map((call) => (
-        call.callSid === callSid
-          ? { ...call, status: 'in_progress' }
-          : call
-      )));
-    },
-    onCallEnded: (callSid) => {
-      setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
-    },
-    onCallMutedChanged: (callSid, muted) => {
-      setCalls((prev) => prev.map((call) => (
-        call.callSid === callSid
-          ? { ...call, muted }
-          : call
-      )));
-    },
-    onInfo: (info) => {
-      setMessage(info);
-    },
+    onIncomingCall: handleVoiceIncoming,
+    onCallAccepted: handleVoiceAccepted,
+    onCallEnded: handleVoiceEnded,
+    onCallMutedChanged: handleVoiceMutedChanged,
+    onInfo: handleVoiceInfo,
   });
 
+  useEffect(() => {
+    reconnectVoiceRef.current = voice.reconnectNow;
+  }, [voice.reconnectNow]);
+
+  const wasRemoteCommandProcessed = useCallback((commandId: string): boolean => {
+    const now = Date.now();
+    const tracked = processedRemoteCommandIdsRef.current;
+
+    for (const [knownId, timestamp] of tracked.entries()) {
+      if (now - timestamp > REMOTE_COMMAND_TTL_MS) {
+        tracked.delete(knownId);
+      }
+    }
+
+    return tracked.has(commandId);
+  }, []);
+
+  const markRemoteCommandProcessed = useCallback((commandId: string) => {
+    const tracked = processedRemoteCommandIdsRef.current;
+    tracked.set(commandId, Date.now());
+
+    if (tracked.size <= REMOTE_COMMAND_MAX_TRACKED) return;
+
+    const ordered = [...tracked.entries()].sort((a, b) => a[1] - b[1]);
+    const overflow = ordered.length - REMOTE_COMMAND_MAX_TRACKED;
+    for (let index = 0; index < overflow; index += 1) {
+      tracked.delete(ordered[index][0]);
+    }
+  }, []);
+
+  const executeRemoteAccept = useCallback(async (callSid: string, commandId: string | null) => {
+    if (commandId && wasRemoteCommandProcessed(commandId)) return;
+    if (remoteAcceptInFlightRef.current.has(callSid)) return;
+
+    remoteAcceptInFlightRef.current.add(callSid);
+    try {
+      for (let attempt = 1; attempt <= REMOTE_ACCEPT_MAX_ATTEMPTS; attempt += 1) {
+        const result = await voice.acceptCall(callSid);
+        if (result.ok) {
+          if (commandId) markRemoteCommandProcessed(commandId);
+          setMessage(`Orden remota ejecutada: llamada ${callSid} aceptada.`);
+          return;
+        }
+
+        const shouldRetry = !voice.isCallAttached(callSid) && attempt < REMOTE_ACCEPT_MAX_ATTEMPTS;
+        if (shouldRetry) {
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, REMOTE_ACCEPT_RETRY_DELAY_MS);
+          });
+          continue;
+        }
+
+        setMessage(`No se pudo ejecutar accept remoto en ${callSid}: ${result.error}`);
+        return;
+      }
+    } finally {
+      remoteAcceptInFlightRef.current.delete(callSid);
+    }
+  }, [markRemoteCommandProcessed, voice, wasRemoteCommandProcessed]);
+
   const handleCanonicalEvent = useCallback((event: CanonicalStreamEvent) => {
+    lastStreamEventAtRef.current = Date.now();
     setLastEvent(event.type || 'unknown');
 
     if (event.type === 'snapshot') {
@@ -188,6 +377,12 @@ export default function App() {
       : null;
     const payloadTo = typeof event.payload?.to === 'string'
       ? event.payload.to
+      : null;
+    const payloadCommand = typeof event.payload?.command === 'string'
+      ? event.payload.command
+      : null;
+    const payloadCommandId = typeof event.payload?.command_id === 'string'
+      ? event.payload.command_id
       : null;
 
     if (event.type === 'incoming_call' && callSid) {
@@ -216,6 +411,10 @@ export default function App() {
             }
           : call
       )));
+
+      if (payloadCommand === 'accept') {
+        void executeRemoteAccept(callSid, payloadCommandId);
+      }
     } else if (event.type === 'call_ended' && callSid) {
       setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
     }
@@ -233,7 +432,7 @@ export default function App() {
     if (refreshEvents.has(event.type)) {
       void refreshAgentSnapshot(`stream:${event.type}`);
     }
-  }, [applySnapshot, refreshAgentSnapshot]);
+  }, [applySnapshot, executeRemoteAccept, refreshAgentSnapshot]);
 
   const hydrateBootstrapAndSession = useCallback(async () => {
     if (!backendUrl) return;
@@ -257,14 +456,17 @@ export default function App() {
       }
     );
     supabaseRef.current = supabase;
+    (supabase.auth as typeof supabase.auth & { startAutoRefresh?: () => void }).startAutoRefresh?.();
 
     const { data } = await supabase.auth.getSession();
-    const token = data.session?.access_token || '';
+    const token = getSessionToken(data.session);
     if (token) setAccessToken(token);
 
-    supabase.auth.onAuthStateChange((_event, session) => {
-      setAccessToken(session?.access_token || '');
+    authSubscriptionRef.current?.unsubscribe();
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setAccessToken(getSessionToken(session));
     });
+    authSubscriptionRef.current = authListener.subscription;
   }, [backendUrl]);
 
   useEffect(() => {
@@ -292,32 +494,151 @@ export default function App() {
   }, [accessToken, backendUrl, refreshAgentSnapshot]);
 
   useEffect(() => {
+    if (!accessToken || streamStatus !== 'connected') return;
+
+    const interval = setInterval(() => {
+      const silentForMs = Date.now() - lastStreamEventAtRef.current;
+      if (silentForMs < STREAM_STALE_TIMEOUT_MS) return;
+
+      setMessage(
+        `Stream sin heartbeat/eventos (${Math.round(silentForMs / 1000)}s). Forzando reconexion...`
+      );
+      sseControllerRef.current?.abort();
+    }, STREAM_WATCHDOG_INTERVAL_MS);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, [accessToken, streamStatus]);
+
+  useEffect(() => {
+    if (!accessToken || !backendUrl) return;
+    lastWakeTickRef.current = Date.now();
+
+    const interval = setInterval(() => {
+      const now = Date.now();
+      const gap = now - lastWakeTickRef.current;
+      lastWakeTickRef.current = now;
+
+      if (gap < WAKE_GAP_THRESHOLD_MS) return;
+
+      setMessage(
+        `Reanudacion detectada tras ${Math.round(gap / 1000)}s. Recuperando sesion y softphone...`
+      );
+      sseControllerRef.current?.abort();
+      void ensureFreshSession('wake_gap', {
+        forceRefresh: true,
+        silent: true,
+      });
+      void refreshAgentSnapshot('wake_gap');
+      void reconnectVoiceRef.current();
+    }, WAKE_GAP_DETECT_MS);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, [accessToken, backendUrl, ensureFreshSession, refreshAgentSnapshot]);
+
+  useEffect(() => {
+    if (!supabaseRef.current || !backendUrl) return;
+    let cancelled = false;
+
+    const keepAlive = async (reason: string, forceRefresh = false) => {
+      if (cancelled) return;
+      await ensureFreshSession(`keepalive:${reason}`, {
+        forceRefresh,
+        silent: true,
+      });
+    };
+
+    void keepAlive('startup', false);
+
+    const interval = setInterval(() => {
+      void keepAlive('interval', false);
+    }, SESSION_REFRESH_INTERVAL_MS);
+
+    const onFocus = () => {
+      void keepAlive('focus', true);
+    };
+
+    const onOnline = () => {
+      void keepAlive('online', true);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void keepAlive('visibility_visible', true);
+      }
+    };
+
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('online', onOnline);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('online', onOnline);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [backendUrl, ensureFreshSession]);
+
+  useEffect(() => {
     if (!accessToken || !backendUrl) return;
 
     let cancelled = false;
     let attempt = 0;
     let controller: AbortController | null = null;
+    let waitTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const wait = (ms: number) => new Promise<void>((resolve) => {
+      waitTimer = setTimeout(() => {
+        waitTimer = null;
+        resolve();
+      }, ms);
+    });
 
     const loop = async () => {
       while (!cancelled) {
         controller = new AbortController();
+        sseControllerRef.current = controller;
+        const streamToken = await ensureFreshSession('stream:connect', { silent: true });
+
+        if (!streamToken) {
+          setStreamStatus('disconnected');
+          await wait(3_000);
+          continue;
+        }
 
         try {
           await consumeSseStream({
             baseUrl: backendUrl,
-            jwt: accessToken,
+            jwt: streamToken,
             signal: controller.signal,
-            onStatus: setStreamStatus,
+            onStatus: (status) => {
+              setStreamStatus(status);
+              if (status === 'connected') {
+                lastStreamEventAtRef.current = Date.now();
+              }
+            },
             onEvent: handleCanonicalEvent,
           });
           attempt = 0;
         } catch (err) {
           setStreamStatus('disconnected');
           if (cancelled) break;
+          const message = String(err);
+          if (isJwtOrAuthError(message)) {
+            await ensureFreshSession('stream:auth_error', {
+              forceRefresh: true,
+              silent: true,
+            });
+          }
           const delay = Math.min(15_000, 1_000 * 2 ** Math.min(attempt, 4));
           attempt += 1;
-          setMessage(`Stream reconectando en ${Math.round(delay / 1000)}s (${String(err)})`);
-          await new Promise((resolve) => setTimeout(resolve, delay));
+          setMessage(`Stream reconectando en ${Math.round(delay / 1000)}s (${message})`);
+          await wait(delay);
         }
       }
     };
@@ -327,9 +648,13 @@ export default function App() {
     return () => {
       cancelled = true;
       controller?.abort();
+      sseControllerRef.current = null;
+      if (waitTimer) {
+        clearTimeout(waitTimer);
+      }
       setStreamStatus('disconnected');
     };
-  }, [accessToken, backendUrl, handleCanonicalEvent]);
+  }, [accessToken, backendUrl, ensureFreshSession, handleCanonicalEvent]);
 
   const login = useCallback(async () => {
     if (!supabaseRef.current) {
@@ -349,7 +674,7 @@ export default function App() {
       return;
     }
 
-    setAccessToken(data.session?.access_token || '');
+    setAccessToken(getSessionToken(data.session));
     setMessage('Login correcto');
   }, [email, password]);
 
@@ -365,7 +690,7 @@ export default function App() {
     action: 'accept' | 'hangup' | 'mute' | 'unmute',
     callSid: string,
   ) => {
-    if (!backendUrl || !accessToken) return;
+    if (!backendUrl || !accessTokenRef.current) return;
 
     if (action === 'accept') {
       const result = await voice.acceptCall(callSid);
@@ -379,11 +704,14 @@ export default function App() {
 
     if (action === 'hangup') {
       const local = await voice.disconnectCall(callSid);
-      const backend = await callCommand(
-        backendUrl,
-        accessToken,
-        `/api/v1/calls/${callSid}/hangup`,
-        { target: 'all' }
+      const backend = await withJwtRetry(
+        `call_hangup:${callSid}`,
+        (jwt) => callCommand(
+          backendUrl,
+          jwt,
+          `/api/v1/calls/${callSid}/hangup`,
+          { target: 'all' }
+        )
       );
 
       if (!backend.ok) {
@@ -409,9 +737,12 @@ export default function App() {
         ? `/api/v1/calls/${callSid}/mute`
         : `/api/v1/calls/${callSid}/unmute`;
 
-      const backend = await callCommand(backendUrl, accessToken, path, {
-        conference_name: conferenceName.trim(),
-      });
+      const backend = await withJwtRetry(
+        `call_${action}:${callSid}`,
+        (jwt) => callCommand(backendUrl, jwt, path, {
+          conference_name: conferenceName.trim(),
+        })
+      );
 
       if (!backend.ok) {
         // Rollback local mute state if server mute in conference fails.
@@ -423,7 +754,16 @@ export default function App() {
 
     setMessage(`${wantsMute ? 'Mute' : 'Unmute'} aplicado en ${callSid}`);
     void refreshAgentSnapshot(`action:${action}`);
-  }, [accessToken, backendUrl, conferenceName, refreshAgentSnapshot, voice]);
+  }, [backendUrl, conferenceName, refreshAgentSnapshot, voice, withJwtRetry]);
+
+  useEffect(() => () => {
+    authSubscriptionRef.current?.unsubscribe();
+    authSubscriptionRef.current = null;
+    const supabase = supabaseRef.current;
+    if (supabase) {
+      (supabase.auth as typeof supabase.auth & { stopAutoRefresh?: () => void }).stopAutoRefresh?.();
+    }
+  }, []);
 
   const streamBadge = useMemo(() => {
     if (streamStatus === 'connected') return 'Stream conectado';

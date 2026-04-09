@@ -25,6 +25,7 @@ export type AuditAction =
   | 'call.hold'
   | 'call.resume'
   | 'call.transfer'
+  | 'call.accept_requested'
   | 'call.mute'
   | 'call.unmute'
   | 'call.conference'
