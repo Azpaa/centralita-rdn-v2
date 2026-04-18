@@ -99,6 +99,38 @@ export async function getScheduleWithSlots(scheduleId: string): Promise<(Schedul
   };
 }
 
+// --- Obtener IDs de agentes que están en llamada activa ---
+
+const ACTIVE_CALL_STATUSES = ['ringing', 'in_queue', 'in_progress'];
+
+async function getBusyAgentIds(): Promise<Set<string>> {
+  const supabase = createAdminClient();
+
+  // Buscar call_records activas y recoger los user IDs implicados
+  const { data: activeCalls } = await supabase
+    .from('call_records')
+    .select('answered_by_user_id, twilio_data')
+    .in('status', ACTIVE_CALL_STATUSES);
+
+  const busyIds = new Set<string>();
+  if (!activeCalls) return busyIds;
+
+  for (const call of activeCalls as Array<{ answered_by_user_id: string | null; twilio_data: Record<string, unknown> | null }>) {
+    if (call.answered_by_user_id) {
+      busyIds.add(call.answered_by_user_id);
+    }
+    // También comprobar resolved_agent_id en twilio_data
+    if (call.twilio_data && typeof call.twilio_data === 'object') {
+      const resolvedId = call.twilio_data.resolved_agent_id;
+      if (typeof resolvedId === 'string' && resolvedId.length > 0) {
+        busyIds.add(resolvedId);
+      }
+    }
+  }
+
+  return busyIds;
+}
+
 // --- Obtener cola con operadores disponibles ---
 
 export async function getQueueWithOperators(queueId: string): Promise<{
@@ -142,8 +174,11 @@ export async function getQueueWithOperators(queueId: string): Promise<{
 
   // Combinar con prioridad (ya no filtramos solo los que tienen teléfono,
   // porque también pueden recibir llamadas en el navegador vía Twilio Client)
+  // Excluir agentes que ya están en una llamada activa
+  const busyAgentIds = await getBusyAgentIds();
   const priorityMap = new Map((queueUsers as QueueUser[]).map(qu => [qu.user_id, qu.priority]));
   const operators = (users as User[])
+    .filter(u => !busyAgentIds.has(u.id))
     .map(u => ({
       ...u,
       priority: priorityMap.get(u.id) ?? 0,

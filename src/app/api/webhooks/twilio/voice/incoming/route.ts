@@ -147,7 +147,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Si no hay cola ni operadores → reenvío directo si está configurado
-    if (!route.queue || !route.operators || route.operators.length === 0) {
+    if (!route.queue) {
       if (route.phoneNumber.forward_to) {
         const dial = twiml.dial({
           callerId: toNumber,
@@ -173,7 +173,30 @@ export async function POST(req: NextRequest) {
 
     // --- Enrutar a cola de operadores ---
     const queue = route.queue;
-    const operators = route.operators;
+    const operators = route.operators ?? [];
+
+    // Actualizar estado a "en cola"
+    const { createAdminClient } = await import('@/lib/supabase/admin');
+    const supabase = createAdminClient();
+    await supabase
+      .from('call_records')
+      .update({ status: 'in_queue' })
+      .eq('twilio_call_sid', callSid);
+
+    // Si no hay operadores libres en este momento, enviar al bucle de espera
+    if (operators.length === 0) {
+      console.log(`[INCOMING] No free operators for queue ${queue.id}, sending to retry loop`);
+      twiml.say(
+        { language: 'es-ES', voice: 'Polly.Conchita' },
+        'Todos nuestros operadores están ocupados. Por favor, espere un momento.'
+      );
+      twiml.pause({ length: 5 });
+      twiml.redirect(
+        { method: 'POST' },
+        `${baseUrl}/api/webhooks/twilio/voice/queue-retry`
+      );
+      return twimlResponse(twiml);
+    }
 
     // Actualizar estado a "en cola"
     const { createAdminClient } = await import('@/lib/supabase/admin');
