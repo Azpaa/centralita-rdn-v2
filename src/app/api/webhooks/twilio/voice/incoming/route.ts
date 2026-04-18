@@ -198,14 +198,6 @@ export async function POST(req: NextRequest) {
       return twimlResponse(twiml);
     }
 
-    // Actualizar estado a "en cola"
-    const { createAdminClient } = await import('@/lib/supabase/admin');
-    const supabase = createAdminClient();
-    await supabase
-      .from('call_records')
-      .update({ status: 'in_queue' })
-      .eq('twilio_call_sid', callSid);
-
     const ringTargets = queue.strategy === 'ring_all'
       ? operators
       : (operators[queue.current_index % operators.length]
