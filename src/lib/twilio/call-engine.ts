@@ -46,7 +46,7 @@ export function isWithinSchedule(
     weekday: 'short',
     hour: '2-digit',
     minute: '2-digit',
-    hour12: false,
+    hourCycle: 'h23',
   });
 
   const parts = formatter.formatToParts(currentDate);
