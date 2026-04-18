@@ -7,6 +7,9 @@
  * Variables requeridas en .env.local:
  *   NEXT_PUBLIC_SUPABASE_URL
  *   SUPABASE_SERVICE_ROLE_KEY
+ *   ADMIN_EMAIL          (ej: admin@tudominio.com)
+ *   ADMIN_PASSWORD       (ej: una contraseña segura)
+ *   ADMIN_NAME           (ej: Admin)
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
@@ -16,13 +19,19 @@ declare const process: { env: Record<string, string | undefined>; exit(code: num
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
-const ADMIN_EMAIL = 'admin@rdn.com';
-const ADMIN_PASSWORD = 'Admin1234!';
-const ADMIN_NAME = 'Admin RDN';
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL ?? '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? '';
+const ADMIN_NAME = process.env.ADMIN_NAME ?? 'Admin';
 
 async function seed() {
   if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
     console.error('❌ Faltan variables de entorno SUPABASE_URL / SERVICE_ROLE_KEY');
+    process.exit(1);
+  }
+
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+    console.error('❌ Faltan variables de entorno ADMIN_EMAIL / ADMIN_PASSWORD');
+    console.error('   Añádelas a .env.local antes de ejecutar este script.');
     process.exit(1);
   }
 

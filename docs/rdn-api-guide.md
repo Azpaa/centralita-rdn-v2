@@ -1,6 +1,6 @@
 ﻿# Guia contractual de integracion - Centralita <-> RDN
 
-> Version contrato: 2.2
+> Version contrato: 2.3
 > Estado: Canónico (externo para RDN)
 > Base URL: `https://centralita.reparacionesdelnorte.es`
 > Formato: JSON sobre HTTPS
@@ -176,7 +176,7 @@ Body:
 ```json
 {
   "destination_number": "+34612345678",
-  "from_number": "+34848819410",
+  "from_number": "+34848819226",
   "user_id": "uuid-del-agente-opcional-pero-recomendado",
   "rdn_user_id": "id-operativo-rdn-opcional",
   "metadata": { "source": "rdn" }
@@ -268,7 +268,7 @@ Body:
 {
   "callSid": "CAxxxxxxxx",
   "destination": "+34612345678",
-  "callerId": "+34848819410"
+  "callerId": "+34848819226"
 }
 ```
 
@@ -395,9 +395,9 @@ Body:
 
 ```json
 {
-  "url": "https://rdn.example.com/webhooks/centralita",
+  "url": "https://app.reparacionesdelnorte.es/api/centralita/webhook",
   "events": ["call.*", "agent.*", "recording.ready"],
-  "description": "RDN main webhook"
+  "description": "RDN PRO webhook"
 }
 ```
 
