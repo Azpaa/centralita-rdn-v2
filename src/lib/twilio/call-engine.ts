@@ -101,16 +101,27 @@ export async function getScheduleWithSlots(scheduleId: string): Promise<(Schedul
 
 // --- Obtener IDs de agentes que están en llamada activa ---
 
-const ACTIVE_CALL_STATUSES: CallStatus[] = ['ringing', 'in_queue', 'in_progress'];
-
-async function getBusyAgentIds(): Promise<Set<string>> {
+async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
   const supabase = createAdminClient();
 
-  // Buscar call_records activas y recoger los user IDs implicados
-  const { data: activeCalls } = await supabase
+  // Solo considerar llamadas en progreso real (ya contestadas)
+  // Las llamadas ringing/in_queue sin answered_by_user_id son llamadas esperando,
+  // no bloquean a ningún agente.
+  // Añadir filtro temporal: ignorar registros de más de 4 horas (posibles fantasmas)
+  const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+
+  let query = supabase
     .from('call_records')
-    .select('answered_by_user_id, twilio_data')
-    .in('status', ACTIVE_CALL_STATUSES);
+    .select('answered_by_user_id, twilio_data, twilio_call_sid')
+    .in('status', ['in_progress'] as CallStatus[])
+    .not('answered_by_user_id', 'is', null)
+    .gte('started_at', fourHoursAgo);
+
+  if (excludeCallSid) {
+    query = query.neq('twilio_call_sid', excludeCallSid);
+  }
+
+  const { data: activeCalls } = await query;
 
   const busyIds = new Set<string>();
   if (!activeCalls) return busyIds;
