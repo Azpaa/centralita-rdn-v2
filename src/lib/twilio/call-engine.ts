@@ -101,7 +101,7 @@ export async function getScheduleWithSlots(scheduleId: string): Promise<(Schedul
 
 // --- Obtener IDs de agentes que están en llamada activa ---
 
-const ACTIVE_CALL_STATUSES = ['ringing', 'in_queue', 'in_progress'];
+const ACTIVE_CALL_STATUSES: CallStatus[] = ['ringing', 'in_queue', 'in_progress'];
 
 async function getBusyAgentIds(): Promise<Set<string>> {
   const supabase = createAdminClient();
