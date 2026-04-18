@@ -33,7 +33,13 @@ function resolveAbsolutePublicPath(urlPath: string): string | null {
   return absolute;
 }
 
+function isExternalUrl(url: string): boolean {
+  return url.startsWith('https://') || url.startsWith('http://');
+}
+
 async function assetExists(urlPath: string): Promise<boolean> {
+  if (isExternalUrl(urlPath)) return true;
+
   const absolute = resolveAbsolutePublicPath(urlPath);
   if (!absolute) return false;
   try {

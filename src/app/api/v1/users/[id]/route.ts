@@ -68,7 +68,7 @@ export async function PUT(req: NextRequest, { params }: Params) {
   return apiSuccess(data);
 }
 
-// DELETE /api/v1/users/:id (soft delete)
+// DELETE /api/v1/users/:id (hard delete en users + auth.users)
 export async function DELETE(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
@@ -78,22 +78,50 @@ export async function DELETE(req: NextRequest, { params }: Params) {
   const { id } = await params;
   const supabase = createAdminClient();
 
-  const { error } = await supabase
+  const { data: user, error: userError } = await supabase
     .from('users')
-    .update({
-      deleted_at: new Date().toISOString(),
-      active: false,
-      available: false,
-    })
+    .select('id, auth_id, email')
     .eq('id', id)
-    .is('deleted_at', null);
+    .is('deleted_at', null)
+    .maybeSingle();
 
-  if (error) {
-    console.error('Error deleting user:', error);
+  if (userError) {
+    console.error('Error loading user before delete:', userError);
     return apiInternalError();
   }
 
-  await auditLog('user.deleted', 'user', id, auth.userId);
+  if (!user) return apiNotFound('Usuario');
+
+  // 1) Eliminar cuenta de autenticación (si existe)
+  if (user.auth_id) {
+    const { error: authDeleteError } = await supabase.auth.admin.deleteUser(user.auth_id);
+
+    // Si en Auth ya no existe, continuamos igualmente para limpiar public.users.
+    const statusMaybe = (authDeleteError as { status?: unknown } | null)?.status;
+    const isNotFound = typeof statusMaybe === 'number' && statusMaybe === 404;
+
+    if (authDeleteError && !isNotFound) {
+      console.error('Error deleting auth user:', authDeleteError);
+      return apiInternalError('No se pudo eliminar el usuario en autenticación');
+    }
+  }
+
+  // 2) Borrado físico en tabla users
+  const { error: deleteError } = await supabase
+    .from('users')
+    .delete()
+    .eq('id', id);
+
+  if (deleteError) {
+    console.error('Error deleting user row:', deleteError);
+    return apiInternalError();
+  }
+
+  await auditLog('user.deleted', 'user', id, auth.userId, {
+    deleted_email: user.email,
+    auth_id: user.auth_id,
+    hard_delete: true,
+  });
 
   return apiNoContent();
 }

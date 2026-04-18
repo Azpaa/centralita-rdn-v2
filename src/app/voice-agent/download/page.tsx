@@ -93,7 +93,14 @@ function resolveAbsolutePublicPath(urlPath: string): string | null {
   return absolute;
 }
 
+function isExternalUrl(url: string): boolean {
+  return url.startsWith('https://') || url.startsWith('http://');
+}
+
 async function assetIsPublished(asset: ReleaseAsset): Promise<boolean> {
+  // External URLs (GitHub Releases, CDN) are considered published
+  if (isExternalUrl(asset.url)) return true;
+
   const absolute = resolveAbsolutePublicPath(asset.url);
   if (!absolute) return false;
   try {
@@ -184,9 +191,9 @@ export default async function VoiceAgentDownloadPage() {
                       <td className="px-3 py-2">{asset.arch}</td>
                       <td className="px-3 py-2 font-mono text-xs">{asset.file_name}</td>
                       <td className="px-3 py-2 text-right">
-                        <Link className="underline" href={asset.url} download={asset.file_name}>
+                        <a className="underline" href={asset.url} download={asset.file_name} rel="noopener noreferrer">
                           Descargar
-                        </Link>
+                        </a>
                       </td>
                     </tr>
                   ))}
