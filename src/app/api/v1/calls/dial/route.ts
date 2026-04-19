@@ -258,8 +258,11 @@ export async function POST(req: NextRequest) {
       to: destination_number,
       attach_mode: 'legacy_direct',
     });
-  } catch (err) {
-    console.error('[DIAL] Error creating outbound call:', err);
-    return apiInternalError('Error al iniciar la llamada');
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const errCode = (err as Record<string, unknown>)?.code ?? '';
+    const errStatus = (err as Record<string, unknown>)?.status ?? '';
+    console.error(`[DIAL] Error creating outbound call: ${errMsg} code=${errCode} status=${errStatus}`, err);
+    return apiInternalError(`Error al iniciar la llamada: ${errMsg}`);
   }
 }
