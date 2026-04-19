@@ -76,7 +76,7 @@ export async function POST(req: NextRequest) {
         .from('call_records')
         .select('twilio_call_sid, direction')
         .eq('answered_by_user_id', auth.userId)
-        .eq('status', 'in_progress' as string)
+        .eq('status', 'in_progress')
         .order('started_at', { ascending: false })
         .limit(1)
         .maybeSingle();
