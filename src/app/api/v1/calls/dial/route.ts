@@ -121,8 +121,9 @@ export async function POST(req: NextRequest) {
 
     const twilioClient = getTwilioClient();
 
-    // Agent-attached mode: call the DESTINATION directly from our Twilio number.
-    // The agent is linked to the call record but does NOT receive a phone call.
+    // Agent-attached mode: call the agent via Twilio Client (desktop app).
+    // When the agent answers in the app, the outbound-connect webhook
+    // generates <Dial> TwiML to bridge the agent with the destination.
     if (resolvedAgent) {
       let metadataJson = '';
       if (metadata) {
@@ -137,16 +138,23 @@ export async function POST(req: NextRequest) {
         `[DIAL] Resolved agent id=${resolvedAgent.id} name=${resolvedAgent.name} rdn_user_id=${resolvedAgent.rdn_user_id ?? '-'}`
       );
       console.log(
-        `[DIAL] Calling destination ${destination_number} directly from ${from_number}, agent ${resolvedAgent.name} linked to record`
+        `[DIAL] Calling agent via client:${resolvedAgent.id} (desktop app), will bridge to ${destination_number} on answer`
       );
 
+      // Build outbound-connect URL with all params needed to bridge
+      const connectUrl = new URL(`${baseUrl}/api/webhooks/twilio/voice/outbound-connect`);
+      connectUrl.searchParams.set('caller_id', from_number);
+      connectUrl.searchParams.set('destination', destination_number);
+      connectUrl.searchParams.set('user_id', resolvedAgent.id);
+      connectUrl.searchParams.set('source', commandSource);
+
       const call = await twilioClient.calls.create({
-        to: destination_number,
+        to: `client:${resolvedAgent.id}`,
         from: from_number,
-        url: `${baseUrl}/api/webhooks/twilio/voice/outbound-connect?caller_id=${encodeURIComponent(from_number)}`,
+        url: connectUrl.toString(),
         statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        timeout: 60,
+        timeout: 30,
       });
 
       const callRecordId = await createCallRecord({
@@ -178,7 +186,7 @@ export async function POST(req: NextRequest) {
         requested_user_id: user_id ?? null,
         requested_rdn_user_id: rdn_user_id ?? null,
         resolved_agent_id: resolvedAgent.id,
-        attach_mode: 'direct_to_destination',
+        attach_mode: 'twilio_client',
       });
 
       return apiSuccess({
@@ -187,7 +195,7 @@ export async function POST(req: NextRequest) {
         status: 'initiated',
         from: from_number,
         to: destination_number,
-        attach_mode: 'direct_to_destination',
+        attach_mode: 'twilio_client',
         source: commandSource,
         agent: {
           id: resolvedAgent.id,
