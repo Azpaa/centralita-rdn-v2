@@ -6,57 +6,99 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { emitEvent } from '@/lib/events/emitter';
 import type { CallRecord, CallStatus } from '@/lib/types/database';
 
-// Estados terminales — una vez que dial-action pone uno de estos, no lo sobrescribimos
+// Terminal states: once dial-action sets one of these, do not overwrite.
 const TERMINAL_STATUSES: CallStatus[] = ['completed', 'no_answer', 'busy', 'failed', 'canceled'];
+
+type StatusRecord = Pick<
+  CallRecord,
+  'status' | 'direction' | 'from_number' | 'to_number' | 'queue_id' | 'answered_by_user_id' | 'duration' | 'answered_at' | 'ended_at'
+>;
+
+function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
+  return [...new Set(values.map((value) => (value || '').trim()).filter(Boolean))];
+}
+
+async function resolveTrackedCallForStatus(params: {
+  callSid: string;
+  parentCallSid: string;
+}): Promise<{ trackedCallSid: string; currentRecord: StatusRecord | null }> {
+  const supabase = createAdminClient();
+  const candidates = uniqueNonEmpty([params.parentCallSid, params.callSid]);
+
+  for (const sid of candidates) {
+    const { data } = await supabase
+      .from('call_records')
+      .select('status, direction, from_number, to_number, queue_id, answered_by_user_id, duration, answered_at, ended_at')
+      .eq('twilio_call_sid', sid)
+      .maybeSingle();
+
+    if (data) {
+      return {
+        trackedCallSid: sid,
+        currentRecord: data as StatusRecord,
+      };
+    }
+  }
+
+  // Fallback: some callbacks may arrive using agent leg SID.
+  for (const sid of candidates) {
+    const { data } = await supabase
+      .from('call_records')
+      .select('twilio_call_sid, status, direction, from_number, to_number, queue_id, answered_by_user_id, duration, answered_at, ended_at')
+      .filter('twilio_data->>agent_call_sid', 'eq', sid)
+      .maybeSingle();
+
+    if (data?.twilio_call_sid) {
+      return {
+        trackedCallSid: data.twilio_call_sid,
+        currentRecord: data as unknown as StatusRecord,
+      };
+    }
+  }
+
+  const fallbackSid = candidates[0] || '';
+  return { trackedCallSid: fallbackSid, currentRecord: null };
+}
 
 /**
  * POST /api/webhooks/twilio/voice/status
- * Twilio llama aquí cuando cambia el estado de una llamada.
- *
- * IMPORTANTE: Este webhook NO es la fuente autoritativa del resultado final.
- * El dial-action webhook determina el resultado real (completada vs no contestada).
- * Este webhook solo actualiza estados intermedios (ringing, in_progress) y
- * pone ended_at como respaldo si dial-action no se ejecutó.
+ * Twilio notifies intermediate and terminal call status changes here.
  */
 export async function POST(req: NextRequest) {
-  // Validar firma + parsear body
   const webhook = await validateAndParseTwilioWebhook(req);
   if (!webhook.ok) return webhook.response;
   const params = webhook.params;
 
-  const callSid = params.CallSid || params.ParentCallSid || '';
+  const rawCallSid = params.CallSid || '';
+  const rawParentCallSid = params.ParentCallSid || '';
   const callStatus = params.CallStatus || '';
   const timestamp = params.Timestamp || new Date().toISOString();
 
-  console.log(`[STATUS] CallSid=${callSid} Status=${callStatus}`);
+  const { trackedCallSid, currentRecord } = await resolveTrackedCallForStatus({
+    callSid: rawCallSid,
+    parentCallSid: rawParentCallSid,
+  });
 
-  if (!callSid) {
+  console.log(
+    `[STATUS] raw_call_sid=${rawCallSid || '-'} raw_parent_call_sid=${rawParentCallSid || '-'} tracked_call_sid=${trackedCallSid || '-'} status=${callStatus}`
+  );
+
+  if (!trackedCallSid) {
     return new NextResponse('OK', { status: 200 });
   }
 
   try {
-    // Consultar estado actual de la llamada en DB
     const supabase = createAdminClient();
-    const { data: existing } = await supabase
-      .from('call_records')
-      .select('status, direction, from_number, to_number, queue_id, answered_by_user_id, duration, answered_at, ended_at')
-      .eq('twilio_call_sid', callSid)
-      .single();
-
-    const currentRecord = existing as CallRecord | null;
     const currentStatus = currentRecord?.status;
 
-    // Si dial-action ya puso un estado terminal, NO sobrescribir
     if (currentStatus && TERMINAL_STATUSES.includes(currentStatus)) {
-      // Solo actualizar ended_at si no lo tiene aún (respaldo)
       if (!currentRecord?.ended_at && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)) {
-        await updateCallStatus(callSid, { endedAt: timestamp });
+        await updateCallStatus(trackedCallSid, { endedAt: timestamp });
       }
-      console.log(`[STATUS] Skipping — dial-action already set terminal status: ${currentStatus}`);
+      console.log(`[STATUS] Skipping - dial-action already set terminal status: ${currentStatus}`);
       return new NextResponse('OK', { status: 200 });
     }
 
-    // Mapear estados de Twilio a nuestros estados
     const statusMap: Record<string, string> = {
       queued: 'ringing',
       ringing: 'ringing',
@@ -69,23 +111,18 @@ export async function POST(req: NextRequest) {
     };
 
     const mappedStatus = statusMap[callStatus] || callStatus;
-    const updates: Parameters<typeof updateCallStatus>[1] = {};
+    const updates: Parameters<typeof updateCallStatus>[1] = {
+      status: mappedStatus,
+    };
 
-    updates.status = mappedStatus;
-
-    // ── Emitir call.answered para outbound cuando el destino descuelga ────
-    // Twilio reporta 'in-progress' cuando la otra parte contesta.
-    // Para inbound esto ya se hace en agent-connect/whisper, pero para
-    // outbound NADIE lo emitía → RDN se quedaba en "Intentando".
+    // Outbound answered transition used by RDN/UI (ringing -> in_progress).
     if (callStatus === 'in-progress' && currentRecord?.direction === 'outbound') {
-      // Marcar answered_at si no lo tiene
       if (!currentRecord.answered_at) {
         updates.answeredAt = timestamp;
       }
 
       const agentUserId = currentRecord.answered_by_user_id ?? null;
 
-      // Resolver rdn_user_id del agente para que RDN pueda correlacionar
       let rdnUserId: string | null = null;
       if (agentUserId) {
         const { data: agentData } = await supabase
@@ -97,11 +134,11 @@ export async function POST(req: NextRequest) {
       }
 
       console.log(
-        `[STATUS] Outbound call answered — emitting call.answered call_sid=${callSid} agent=${agentUserId}`
+        `[STATUS] Outbound call answered - emitting call.answered call_sid=${trackedCallSid} agent=${agentUserId}`
       );
 
       emitEvent('call.answered', {
-        call_sid: callSid,
+        call_sid: trackedCallSid,
         direction: 'outbound',
         status: 'in_progress',
         from: currentRecord.from_number ?? null,
@@ -111,12 +148,11 @@ export async function POST(req: NextRequest) {
         rdn_user_id: rdnUserId,
       });
     }
+
     if (['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)) {
       if (!currentRecord?.ended_at) {
         updates.endedAt = timestamp;
       }
-      // NO sobrescribimos duration — dial-action pone la duración de conversación real
-      // Solo ponemos duration si no hay ninguna (respaldo)
       if (currentRecord?.duration === null || currentRecord?.duration === undefined) {
         const callDuration = params.CallDuration ? parseInt(params.CallDuration, 10) : undefined;
         if (callDuration !== undefined) {
@@ -125,7 +161,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    await updateCallStatus(callSid, updates);
+    await updateCallStatus(trackedCallSid, updates);
 
     const isTerminalFromStatus = ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus);
     if (isTerminalFromStatus) {
@@ -136,12 +172,12 @@ export async function POST(req: NextRequest) {
       const duration = updates.duration ?? currentRecord?.duration ?? 0;
 
       console.log(
-        `[STATUS] terminal fallback emit call_sid=${callSid} direction=${direction} status=${terminalStatus}`
+        `[STATUS] terminal fallback emit call_sid=${trackedCallSid} direction=${direction} status=${terminalStatus}`
       );
 
       if (direction === 'inbound' && terminalStatus !== 'completed') {
         emitEvent('call.missed', {
-          call_sid: callSid,
+          call_sid: trackedCallSid,
           direction,
           from: currentRecord?.from_number ?? null,
           to: currentRecord?.to_number ?? null,
@@ -151,7 +187,7 @@ export async function POST(req: NextRequest) {
         });
       } else {
         emitEvent('call.completed', {
-          call_sid: callSid,
+          call_sid: trackedCallSid,
           direction,
           status: terminalStatus,
           from: currentRecord?.from_number ?? null,
@@ -170,6 +206,5 @@ export async function POST(req: NextRequest) {
     console.error('[STATUS] Error updating call status:', err);
   }
 
-  // Twilio espera un 200 (no TwiML aquí)
   return new NextResponse('OK', { status: 200 });
 }

@@ -407,6 +407,10 @@ Body:
 
 Respuesta devuelve `secret` solo en esta llamada.
 
+Notas operativas de entorno:
+- En produccion usar URL estable HTTPS (no `ngrok`, `localhost` ni tunnels temporales).
+- Si una suscripcion apunta a URL temporal, actualizarla con `PUT /api/v1/webhooks/{id}` o recrearla y eliminar la anterior.
+
 ### GET `/api/v1/webhooks`
 Lista suscripciones.
 

@@ -32,6 +32,46 @@ const VALID_EVENT_PATTERNS = [
   'recording.*', 'recording.ready',
 ];
 
+function isLikelyEphemeralOrLocalHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return (
+    host === 'localhost'
+    || host === '127.0.0.1'
+    || host === '0.0.0.0'
+    || host.endsWith('.local')
+    || host.endsWith('.localhost')
+    || host.endsWith('.ngrok.io')
+    || host.endsWith('.ngrok-free.app')
+    || host.endsWith('.trycloudflare.com')
+  );
+}
+
+function isWebhookDevUrlAllowed(): boolean {
+  return process.env.WEBHOOK_ALLOW_DEV_URLS === 'true' || process.env.NODE_ENV !== 'production';
+}
+
+function validateWebhookTargetUrl(rawUrl: string): { ok: true } | { ok: false; message: string } {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return { ok: false, message: 'URL invalida' };
+  }
+
+  if (parsed.protocol !== 'https:') {
+    return { ok: false, message: 'La URL del webhook debe usar HTTPS' };
+  }
+
+  if (!isWebhookDevUrlAllowed() && isLikelyEphemeralOrLocalHost(parsed.hostname)) {
+    return {
+      ok: false,
+      message: 'URL de webhook bloqueada en produccion: usa un dominio estable (no localhost/ngrok/tunnel temporal)',
+    };
+  }
+
+  return { ok: true };
+}
+
 function normalizeWebhookUrl(rawUrl: string): string {
   const parsed = new URL(rawUrl.trim());
   const pathname = parsed.pathname === '/' ? '/' : parsed.pathname.replace(/\/+$/, '');
@@ -99,6 +139,11 @@ export async function POST(req: NextRequest) {
   const invalidEvents = parsed.data.events.filter(e => !VALID_EVENT_PATTERNS.includes(e));
   if (invalidEvents.length > 0) {
     return apiBadRequest(`Eventos inválidos: ${invalidEvents.join(', ')}. Eventos válidos: ${VALID_EVENT_PATTERNS.join(', ')}`);
+  }
+
+  const targetValidation = validateWebhookTargetUrl(parsed.data.url);
+  if (!targetValidation.ok) {
+    return apiBadRequest(targetValidation.message);
   }
 
   const normalizedUrl = normalizeWebhookUrl(parsed.data.url);
