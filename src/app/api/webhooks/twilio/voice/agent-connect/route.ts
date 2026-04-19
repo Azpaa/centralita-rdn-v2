@@ -88,7 +88,7 @@ export async function POST(req: NextRequest) {
   dial.conference(
     {
       startConferenceOnEnter: true,
-      endConferenceOnExit: false,
+      endConferenceOnExit: true,
       statusCallbackEvent: ['join', 'leave', 'end'],
       statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
     },

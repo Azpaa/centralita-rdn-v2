@@ -44,7 +44,10 @@ export async function POST(req: NextRequest) {
   const answeredByUserId = record?.answered_by_user_id ?? null;
 
   // Si la llamada fue contestada y completada → hubo conversación real
-  if (dialStatus === 'completed') {
+  // Para conferencias, el DialCallStatus puede no ser exactamente 'completed'
+  // pero si el record ya tiene answered_by_user_id, la llamada SÍ fue contestada.
+  const wasAnswered = !!answeredByUserId;
+  if (dialStatus === 'completed' || (wasAnswered && dialStatus !== 'no-answer' && dialStatus !== 'busy')) {
     const endedAt = new Date();
     // answered_at = momento en que empezó la conversación (backdated)
     const answeredAt = new Date(endedAt.getTime() - dialDuration * 1000);
