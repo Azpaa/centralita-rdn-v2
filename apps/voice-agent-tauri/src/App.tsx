@@ -123,6 +123,8 @@ export default function App() {
   const [streamStatus, setStreamStatus] = useState<StreamStatus>('disconnected');
   const [calls, setCalls] = useState<VoiceCallView[]>([]);
   const [conferenceName, setConferenceName] = useState('');
+  // Map of callSid → conference name for incoming calls (from SSE events)
+  const [incomingConferences, setIncomingConferences] = useState<Map<string, string>>(new Map());
   const [lastEvent, setLastEvent] = useState('none');
   const [message, setMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -160,6 +162,26 @@ export default function App() {
           to: call.to || null,
           muted: mutedBySid.get(call.call_sid as string) ?? false,
         }));
+    });
+
+    // Ensure ringing inbound calls have a known conference so Accept works
+    // even after reconnection (when the original SSE event was missed).
+    setIncomingConferences((prev) => {
+      let changed = false;
+      const next = new Map(prev);
+      for (const call of snapshot.active_calls) {
+        if (
+          call.direction === 'inbound'
+          && call.status === 'ringing'
+          && typeof call.call_sid === 'string'
+          && call.call_sid.length > 0
+          && !next.has(call.call_sid)
+        ) {
+          next.set(call.call_sid, `call-${call.call_sid}`);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
     });
   }, []);
 
@@ -247,19 +269,13 @@ export default function App() {
     applySnapshot(result.data);
   }, [applySnapshot, backendUrl, withJwtRetry]);
 
-  const handleVoiceIncoming = useCallback((event: {
-    callSid: string;
-    from: string | null;
-    to: string | null;
-    direction: 'inbound' | 'outbound';
-    autoAdopted: boolean;
-  }) => {
+  const handleVoiceCallStarted = useCallback((callSid: string, direction: 'inbound' | 'outbound', destination: string | null) => {
     setCalls((prev) => upsertCall(prev, {
-      callSid: event.callSid,
-      direction: event.direction,
-      status: event.autoAdopted ? 'in_progress' : 'ringing',
-      from: event.from,
-      to: event.to,
+      callSid,
+      direction,
+      status: 'in_progress',
+      from: null,
+      to: destination,
       muted: false,
     }));
   }, []);
@@ -291,7 +307,7 @@ export default function App() {
   const voice = useVoiceEngine({
     baseUrl: backendUrl,
     accessToken,
-    onIncomingCall: handleVoiceIncoming,
+    onCallStarted: handleVoiceCallStarted,
     onCallAccepted: handleVoiceAccepted,
     onCallEnded: handleVoiceEnded,
     onCallMutedChanged: handleVoiceMutedChanged,
@@ -334,29 +350,26 @@ export default function App() {
 
     remoteAcceptInFlightRef.current.add(callSid);
     try {
-      for (let attempt = 1; attempt <= REMOTE_ACCEPT_MAX_ATTEMPTS; attempt += 1) {
-        const result = await voice.acceptCall(callSid);
-        if (result.ok) {
-          if (commandId) markRemoteCommandProcessed(commandId);
-          setMessage(`Orden remota ejecutada: llamada ${callSid} aceptada.`);
-          return;
-        }
+      // For incoming calls, join the conference room
+      const confName = incomingConferences.get(callSid) || `call-${callSid}`;
+      const result = await voice.joinConference({
+        conferenceName: confName,
+        parentCallSid: callSid,
+      });
 
-        const shouldRetry = !voice.isCallAttached(callSid) && attempt < REMOTE_ACCEPT_MAX_ATTEMPTS;
-        if (shouldRetry) {
-          await new Promise<void>((resolve) => {
-            window.setTimeout(resolve, REMOTE_ACCEPT_RETRY_DELAY_MS);
-          });
-          continue;
-        }
-
-        setMessage(`No se pudo ejecutar accept remoto en ${callSid}: ${result.error}`);
-        return;
+      if (result.ok) {
+        if (commandId) markRemoteCommandProcessed(commandId);
+        setMessage(`Orden remota ejecutada: unido a conferencia para llamada ${callSid}.`);
+      } else {
+        setMessage(`No se pudo unir a conferencia para ${callSid}: ${result.error}`);
       }
     } finally {
       remoteAcceptInFlightRef.current.delete(callSid);
     }
-  }, [markRemoteCommandProcessed, voice, wasRemoteCommandProcessed]);
+  }, [incomingConferences, markRemoteCommandProcessed, voice, wasRemoteCommandProcessed]);
+
+  // Track outbound connect requests we've already processed
+  const processedOutboundRequestsRef = useRef<Set<string>>(new Set());
 
   const handleCanonicalEvent = useCallback((event: CanonicalStreamEvent) => {
     lastStreamEventAtRef.current = Date.now();
@@ -385,7 +398,53 @@ export default function App() {
       ? event.payload.command_id
       : null;
 
+    // Handle outbound connect requests from backend (RDN dial)
+    const isOutboundConnectRequest = Boolean(event.payload?.outbound_connect_request);
+    const destinationNumber = typeof event.payload?.destination_number === 'string'
+      ? event.payload.destination_number
+      : null;
+    const callerId = typeof event.payload?.caller_id === 'string'
+      ? event.payload.caller_id
+      : null;
+    const callRecordId = typeof event.payload?.call_record_id === 'string'
+      ? event.payload.call_record_id
+      : null;
+
+    if (isOutboundConnectRequest && destinationNumber && callerId) {
+      const requestKey = callRecordId || event.id;
+      if (!processedOutboundRequestsRef.current.has(requestKey)) {
+        processedOutboundRequestsRef.current.add(requestKey);
+        // Clean up old entries
+        if (processedOutboundRequestsRef.current.size > 100) {
+          const entries = [...processedOutboundRequestsRef.current];
+          processedOutboundRequestsRef.current = new Set(entries.slice(-50));
+        }
+
+        setMessage(`Llamada saliente solicitada: ${destinationNumber}`);
+
+        // Auto-connect: initiate the outbound call via device.connect()
+        void voice.connectOutbound({
+          destination: destinationNumber,
+          callerId,
+          callRecordId: callRecordId || undefined,
+        });
+      }
+      return;
+    }
+
     if (event.type === 'incoming_call' && callSid) {
+      // Store conference name if provided (for Tauri to join via device.connect)
+      const eventConferenceName = typeof event.payload?.conference_name === 'string'
+        ? event.payload.conference_name
+        : null;
+      if (eventConferenceName) {
+        setIncomingConferences((prev) => {
+          const next = new Map(prev);
+          next.set(callSid, eventConferenceName);
+          return next;
+        });
+      }
+
       setCalls((prev) => upsertCall(prev, {
         callSid,
         direction: 'inbound',
@@ -417,6 +476,12 @@ export default function App() {
       }
     } else if (event.type === 'call_ended' && callSid) {
       setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
+      setIncomingConferences((prev) => {
+        if (!prev.has(callSid)) return prev;
+        const next = new Map(prev);
+        next.delete(callSid);
+        return next;
+      });
     }
 
     const refreshEvents = new Set([
@@ -432,7 +497,7 @@ export default function App() {
     if (refreshEvents.has(event.type)) {
       void refreshAgentSnapshot(`stream:${event.type}`);
     }
-  }, [applySnapshot, executeRemoteAccept, refreshAgentSnapshot]);
+  }, [applySnapshot, executeRemoteAccept, refreshAgentSnapshot, voice]);
 
   const hydrateBootstrapAndSession = useCallback(async () => {
     if (!backendUrl) return;
@@ -693,12 +758,24 @@ export default function App() {
     if (!backendUrl || !accessTokenRef.current) return;
 
     if (action === 'accept') {
-      const result = await voice.acceptCall(callSid);
+      // Accept incoming call by joining the conference room
+      // Use the conference name from SSE event if available, otherwise derive from callSid
+      const confName = incomingConferences.get(callSid) || `call-${callSid}`;
+      const result = await voice.joinConference({
+        conferenceName: confName,
+        parentCallSid: callSid,
+      });
       if (!result.ok) {
-        setMessage(`No se pudo aceptar ${callSid}: ${result.error}`);
+        setMessage(`No se pudo unir a conferencia para ${callSid}: ${result.error}`);
         return;
       }
-      setMessage(`Llamada ${callSid} aceptada en softphone`);
+      // Clean up the incoming conference mapping
+      setIncomingConferences((prev) => {
+        const next = new Map(prev);
+        next.delete(callSid);
+        return next;
+      });
+      setMessage(`Unido a conferencia para llamada ${callSid}`);
       return;
     }
 
@@ -754,7 +831,7 @@ export default function App() {
 
     setMessage(`${wantsMute ? 'Mute' : 'Unmute'} aplicado en ${callSid}`);
     void refreshAgentSnapshot(`action:${action}`);
-  }, [backendUrl, conferenceName, refreshAgentSnapshot, voice, withJwtRetry]);
+  }, [backendUrl, conferenceName, incomingConferences, refreshAgentSnapshot, voice, withJwtRetry]);
 
   useEffect(() => () => {
     authSubscriptionRef.current?.unsubscribe();
@@ -898,7 +975,8 @@ export default function App() {
 
               {calls.map((call) => {
                 const attached = voice.isCallAttached(call.callSid);
-                const canAccept = attached && call.status !== 'in_progress';
+                const hasKnownConference = incomingConferences.has(call.callSid);
+                const canAccept = (attached || hasKnownConference) && call.status !== 'in_progress';
                 const canToggleMute = attached && call.status === 'in_progress';
                 const muteNeedsConference = Boolean(conferenceName.trim());
 

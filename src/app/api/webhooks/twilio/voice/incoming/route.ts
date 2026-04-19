@@ -3,6 +3,7 @@ import twilio from 'twilio';
 import { routeIncomingCall, createCallRecord } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { emitEvent } from '@/lib/events/emitter';
+import { getTwilioClient } from '@/lib/twilio/client';
 
 /**
  * POST /api/webhooks/twilio/voice/incoming
@@ -204,6 +205,9 @@ export async function POST(req: NextRequest) {
         ? [operators[queue.current_index % operators.length]]
         : []);
 
+    // Conference name for this call — used by SSE events, REST rings, and caller dial
+    const conferenceName = `call-${callSid}`;
+
     if (ringTargets.length > 0) {
       console.log(
         `[INCOMING] pre-answer routing call_sid=${callSid} strategy=${queue.strategy} targets=${ringTargets.map((op) => op.id).join(',')}`
@@ -223,73 +227,57 @@ export async function POST(req: NextRequest) {
           user_id: target.id,
           answered_by_user_id: target.id,
           rdn_user_id: target.rdn_user_id ?? null,
+          conference_name: conferenceName,
+          incoming_conference_request: true,
         });
       }
     }
 
-    // Configurar Dial según la estrategia de la cola
-    const dial = twiml.dial({
-      callerId: fromNumber,
-      timeout: queue.ring_timeout,
-      action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
-      record: route.phoneNumber.record_calls ? 'record-from-answer-dual' as const : 'do-not-record' as const,
-      recordingStatusCallback: route.phoneNumber.record_calls
-        ? `${baseUrl}/api/webhooks/twilio/recording/status`
-        : undefined,
-    });
+    // --- Conference-based approach ---
+    // Put the caller into a named conference. Agents join via:
+    //  a) REST API call to client:<agent_id> (rings browser Device)
+    //  b) SSE event → device.connect() from Tauri desktop app
+    // First agent to join connects with the caller.
 
-    if (queue.strategy === 'ring_all') {
-      // Ring All: llamar a todos los operadores simultáneamente
-      for (const op of operators) {
-        // Llamar al teléfono del operador
-        if (op.phone) {
-          dial.number(
-            {
-              statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-              statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
-              url: `${baseUrl}/api/webhooks/twilio/voice/whisper?operator_id=${op.id}&call_sid=${callSid}`,
-            },
-            op.phone
-          );
-        }
-        // También llamar al navegador del operador (Twilio Client)
-        dial.client(
-          {
-            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-            statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
-            url: `${baseUrl}/api/webhooks/twilio/voice/whisper?operator_id=${op.id}&call_sid=${callSid}`,
-          },
-          op.id // identity = userId
-        );
+    // Ring agents via REST API (async, fire-and-forget)
+    const twilioClient = getTwilioClient();
+    const agentConnectBase = `${baseUrl}/api/webhooks/twilio/voice/agent-connect`;
+
+    for (const target of ringTargets) {
+      const agentConnectUrl = new URL(agentConnectBase);
+      agentConnectUrl.searchParams.set('conference', conferenceName);
+      agentConnectUrl.searchParams.set('call_sid', callSid);
+      agentConnectUrl.searchParams.set('operator_id', target.id);
+
+      // Ring agent's browser Device (Twilio Client)
+      twilioClient.calls.create({
+        to: `client:${target.id}`,
+        from: fromNumber,
+        url: agentConnectUrl.toString(),
+        statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+        timeout: queue.ring_timeout,
+      }).catch((err) => {
+        console.warn(`[INCOMING] Failed to ring client:${target.id}: ${err.message}`);
+      });
+
+      // Also ring agent's phone if configured
+      if (target.phone) {
+        twilioClient.calls.create({
+          to: target.phone,
+          from: fromNumber,
+          url: agentConnectUrl.toString(),
+          statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+          timeout: queue.ring_timeout,
+        }).catch((err) => {
+          console.warn(`[INCOMING] Failed to ring phone ${target.phone}: ${err.message}`);
+        });
       }
-    } else {
-      // Round Robin: llamar al siguiente operador según rotación
-      const nextOperator = operators[queue.current_index % operators.length];
+    }
 
-      if (nextOperator) {
-        // Llamar al teléfono del operador
-        if (nextOperator.phone) {
-          dial.number(
-            {
-              statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-              statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
-              url: `${baseUrl}/api/webhooks/twilio/voice/whisper?operator_id=${nextOperator.id}&call_sid=${callSid}`,
-            },
-            nextOperator.phone
-          );
-        }
-        // También llamar al navegador del operador (Twilio Client)
-        dial.client(
-          {
-            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-            statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
-            url: `${baseUrl}/api/webhooks/twilio/voice/whisper?operator_id=${nextOperator.id}&call_sid=${callSid}`,
-          },
-          nextOperator.id
-        );
-      }
-
-      // Avanzar el índice de rotación
+    // Advance round-robin index
+    if (queue.strategy !== 'ring_all') {
       await supabase
         .from('queues')
         .update({
@@ -298,6 +286,28 @@ export async function POST(req: NextRequest) {
         })
         .eq('id', queue.id);
     }
+
+    // Put the caller into the conference (they hear hold music until agent joins)
+    const dial = twiml.dial({
+      action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
+      timeout: 120,
+      record: route.phoneNumber.record_calls ? 'record-from-answer-dual' as const : 'do-not-record' as const,
+      recordingStatusCallback: route.phoneNumber.record_calls
+        ? `${baseUrl}/api/webhooks/twilio/recording/status`
+        : undefined,
+    });
+    dial.conference(
+      {
+        startConferenceOnEnter: true,
+        endConferenceOnExit: true,
+        beep: 'false' as const,
+        waitUrl: 'http://twimlets.com/holdmusic?Bucket=com.twilio.music.ambient',
+        maxParticipants: 10,
+        statusCallbackEvent: ['join', 'leave', 'end'],
+        statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+      },
+      conferenceName,
+    );
 
     return twimlResponse(twiml);
   } catch (err) {

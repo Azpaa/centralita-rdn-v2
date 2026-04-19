@@ -3,6 +3,7 @@ import twilio from 'twilio';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { createCallRecord, updateCallStatus } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
+import { emitEvent } from '@/lib/events/emitter';
 import type { User, PhoneNumber } from '@/lib/types/database';
 
 /**
@@ -46,6 +47,28 @@ export async function POST(req: NextRequest) {
   try {
     const supabase = createAdminClient();
 
+    // Reconcile pending-* records: when Tauri does device.connect() with a
+    // CallRecordId from a prior dial/route.ts SSE event, update the original
+    // record's twilio_call_sid to the real Twilio CallSid.
+    const callRecordId = params.CallRecordId || searchParams.get('call_record_id') || '';
+    if (callRecordId && callSid) {
+      const { data: pendingRecord } = await supabase
+        .from('call_records')
+        .select('id, twilio_call_sid')
+        .eq('id', callRecordId)
+        .maybeSingle();
+
+      if (pendingRecord && typeof pendingRecord.twilio_call_sid === 'string' && pendingRecord.twilio_call_sid.startsWith('pending-')) {
+        console.log(
+          `[CLIENT-VOICE] Reconciling pending record id=${callRecordId} old_sid=${pendingRecord.twilio_call_sid} new_sid=${callSid}`
+        );
+        await supabase
+          .from('call_records')
+          .update({ twilio_call_sid: callSid, status: 'ringing' })
+          .eq('id', callRecordId);
+      }
+    }
+
     const ensureRecord = async (input: {
       direction: 'outbound' | 'inbound';
       fromNumber: string;
@@ -55,6 +78,21 @@ export async function POST(req: NextRequest) {
       twilioData?: Record<string, unknown>;
     }) => {
       if (!callSid) return null;
+
+      // If we already reconciled a pending record, reuse it
+      if (callRecordId) {
+        const { data: reconciled } = await supabase
+          .from('call_records')
+          .select('id')
+          .eq('id', callRecordId)
+          .eq('twilio_call_sid', callSid)
+          .maybeSingle();
+
+        if (reconciled?.id) {
+          console.log(`[CLIENT-VOICE] Using reconciled record id=${reconciled.id} for CallSid=${callSid}`);
+          return reconciled.id as string;
+        }
+      }
 
       const { data: existing } = await supabase
         .from('call_records')
@@ -73,7 +111,58 @@ export async function POST(req: NextRequest) {
       });
     };
 
-    if (to && to.startsWith('client:')) {
+    if (to && to.startsWith('conference:')) {
+      // Agent joining a conference via device.connect() from Tauri desktop app.
+      // Format: conference:<conference-name>
+      const conferenceRoom = to.replace('conference:', '');
+      const parentCallSid = params.ParentCallSid || searchParams.get('parent_call_sid') || '';
+      const operatorId = userId || '';
+
+      console.log(
+        `[CLIENT-VOICE] Conference join: room=${conferenceRoom} parentCallSid=${parentCallSid} operatorId=${operatorId}`
+      );
+
+      // Update call record if we have the parent call SID
+      if (parentCallSid && operatorId) {
+        try {
+          await updateCallStatus(parentCallSid, {
+            status: 'in_progress',
+            answeredAt: new Date().toISOString(),
+            answeredByUserId: operatorId,
+          });
+
+          const { data: userData } = await supabase
+            .from('users')
+            .select('id, rdn_user_id')
+            .eq('id', operatorId)
+            .single();
+
+          const user = userData as Pick<User, 'id' | 'rdn_user_id'> | null;
+
+          emitEvent('call.answered', {
+            call_sid: parentCallSid,
+            direction: 'inbound',
+            status: 'in_progress',
+            answered_by_user_id: operatorId,
+            user_id: operatorId,
+            rdn_user_id: user?.rdn_user_id ?? null,
+          });
+        } catch (err) {
+          console.error('[CLIENT-VOICE] Error updating call record for conference join:', err);
+        }
+      }
+
+      const dial = twiml.dial({
+        action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
+      });
+      dial.conference(
+        {
+          startConferenceOnEnter: true,
+          endConferenceOnExit: false,
+        },
+        conferenceRoom,
+      );
+    } else if (to && to.startsWith('client:')) {
       // Browser-to-browser internal call.
       const targetIdentity = to.replace('client:', '');
 

@@ -1,43 +1,41 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Call, Device } from '@twilio/voice-sdk';
-import { fetchCallByTwilioSid, fetchVoiceToken, type ApiResult } from './backend';
+import { fetchVoiceToken, type ApiResult } from './backend';
 import type { VoiceDeviceStatus } from './types';
 
-const DEVICE_REGISTER_TIMEOUT_MS = 30_000;
-const HEALTH_CHECK_INTERVAL_MS = 30_000;
-const WAKE_HEALTH_GAP_MS = 75_000;
-const ADOPTION_LOOKUP_RETRIES = 5;
-const ADOPTION_LOOKUP_RETRY_DELAY_MS = 400;
+/**
+ * Voice engine for Tauri desktop app.
+ *
+ * KEY DESIGN: This engine does NOT use device.register().
+ * WebView2 (Tauri) cannot reliably register Twilio Devices because
+ * the WebSocket-based signaling connection fails in the embedded browser.
+ *
+ * Instead, this engine:
+ *  1. Creates a Device with a valid token (for connect capability)
+ *  2. Listens for SSE events from the backend (incoming calls, outbound requests)
+ *  3. Uses device.connect() to initiate calls (outbound or conference join)
+ *
+ * device.connect() does NOT require device.register() — it just needs a valid token.
+ */
 
-const ADOPTABLE_SOURCES = new Set([
-  'rdn',
-  'backend_outbound',
-  'rdn_adopted',
-  'rdn_adopted_browser',
-]);
+const TOKEN_REFRESH_INTERVAL_MS = 25 * 60_000; // 25 minutes
 
 type VoiceActionResult = ApiResult<{
   call_sid: string;
 }>;
 
-type IncomingCallEvent = {
-  callSid: string;
-  from: string | null;
-  to: string | null;
-  direction: 'inbound' | 'outbound';
-  autoAdopted: boolean;
-};
-
 type ManagedCall = {
   call: Call;
   sid: string;
   muted: boolean;
+  direction: 'inbound' | 'outbound';
+  destination: string | null;
 };
 
 type UseVoiceEngineParams = {
   baseUrl: string;
   accessToken: string;
-  onIncomingCall?: (event: IncomingCallEvent) => void;
+  onCallStarted?: (callSid: string, direction: 'inbound' | 'outbound', destination: string | null) => void;
   onCallAccepted?: (callSid: string) => void;
   onCallEnded?: (callSid: string) => void;
   onCallMutedChanged?: (callSid: string, muted: boolean) => void;
@@ -51,7 +49,15 @@ type UseVoiceEngineResult = {
   tokenExpired: boolean;
   lastError: string | null;
   attachedCallSids: string[];
-  acceptCall: (callSid: string) => Promise<VoiceActionResult>;
+  connectOutbound: (params: {
+    destination: string;
+    callerId: string;
+    callRecordId?: string;
+  }) => Promise<VoiceActionResult>;
+  joinConference: (params: {
+    conferenceName: string;
+    parentCallSid?: string;
+  }) => Promise<VoiceActionResult>;
   disconnectCall: (callSid: string) => Promise<VoiceActionResult>;
   setMuted: (callSid: string, muted: boolean) => Promise<VoiceActionResult>;
   isCallAttached: (callSid: string) => boolean;
@@ -67,33 +73,6 @@ function isAuthOrSessionError(message: string): boolean {
     || normalized.includes('401')
     || normalized.includes('unauthorized')
   );
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function registerDeviceWithTimeout(device: Device, reason: string): Promise<void> {
-  let timeoutId: ReturnType<typeof setTimeout> | null = null;
-
-  try {
-    await Promise.race([
-      device.register(),
-      new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => {
-          reject(new Error(`register_timeout:${reason}`));
-        }, DEVICE_REGISTER_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
-  }
-}
-
-function readCallParameter(call: Call, key: string): string {
-  const parameters = call.parameters as Record<string, unknown> | undefined;
-  const value = parameters?.[key];
-  return typeof value === 'string' ? value : '';
 }
 
 async function ensureMicrophonePermission(): Promise<ApiResult<{ granted: true }>> {
@@ -119,7 +98,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
   const {
     baseUrl,
     accessToken,
-    onIncomingCall,
+    onCallStarted,
     onCallAccepted,
     onCallEnded,
     onCallMutedChanged,
@@ -127,7 +106,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
   } = params;
 
   const [deviceStatus, setDeviceStatus] = useState<VoiceDeviceStatus>('disconnected');
-  const [deviceReason, setDeviceReason] = useState('Softphone detenido');
+  const [deviceReason, setDeviceReason] = useState('Motor de voz detenido');
   const [identity, setIdentity] = useState('');
   const [tokenExpired, setTokenExpired] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -135,19 +114,14 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
 
   const deviceRef = useRef<Device | null>(null);
   const callsRef = useRef<Map<string, ManagedCall>>(new Map());
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectAttemptsRef = useRef(0);
-  const initInFlightRef = useRef(false);
-  const initializeDeviceRef = useRef<((trigger: string) => Promise<void>) | null>(null);
-  const suppressDestroyedReconnectRef = useRef(false);
-  const enabledRef = useRef(false);
-  const microphoneReadyRef = useRef(false);
   const identityRef = useRef('');
-  const deviceStatusRef = useRef<VoiceDeviceStatus>('disconnected');
   const baseUrlRef = useRef(baseUrl);
   const accessTokenRef = useRef(accessToken);
-  const lastHealthTickRef = useRef<number>(Date.now());
-  const onIncomingCallRef = useRef(onIncomingCall);
+  const microphoneReadyRef = useRef(false);
+  const initInFlightRef = useRef(false);
+  const enabledRef = useRef(false);
+  const tokenRefreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const onCallStartedRef = useRef(onCallStarted);
   const onCallAcceptedRef = useRef(onCallAccepted);
   const onCallEndedRef = useRef(onCallEnded);
   const onCallMutedChangedRef = useRef(onCallMutedChanged);
@@ -159,75 +133,28 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
   }, [baseUrl, accessToken]);
 
   useEffect(() => {
-    onIncomingCallRef.current = onIncomingCall;
+    onCallStartedRef.current = onCallStarted;
     onCallAcceptedRef.current = onCallAccepted;
     onCallEndedRef.current = onCallEnded;
     onCallMutedChangedRef.current = onCallMutedChanged;
     onInfoRef.current = onInfo;
-  }, [onIncomingCall, onCallAccepted, onCallEnded, onCallMutedChanged, onInfo]);
-
-  useEffect(() => {
-    deviceStatusRef.current = deviceStatus;
-  }, [deviceStatus]);
+  }, [onCallStarted, onCallAccepted, onCallEnded, onCallMutedChanged, onInfo]);
 
   const syncAttachedCallSids = useCallback(() => {
     setAttachedCallSids(Array.from(callsRef.current.keys()));
   }, []);
-
-  const clearReconnectTimer = useCallback(() => {
-    if (!reconnectTimerRef.current) return;
-    clearTimeout(reconnectTimerRef.current);
-    reconnectTimerRef.current = null;
-  }, []);
-
-  const softResetDevice = useCallback(() => {
-    if (!deviceRef.current) return;
-    suppressDestroyedReconnectRef.current = true;
-    try {
-      deviceRef.current?.destroy();
-    } catch {
-      // ignore destroy errors
-    }
-    deviceRef.current = null;
-    setTimeout(() => {
-      suppressDestroyedReconnectRef.current = false;
-    }, 0);
-  }, []);
-
-  const clearCalls = useCallback(() => {
-    callsRef.current.clear();
-    syncAttachedCallSids();
-  }, [syncAttachedCallSids]);
 
   const setHealthy = useCallback((reason: string) => {
     setDeviceStatus('connected');
     setDeviceReason(reason);
     setLastError(null);
     setTokenExpired(false);
-    reconnectAttemptsRef.current = 0;
-    clearReconnectTimer();
-  }, [clearReconnectTimer]);
+  }, []);
 
   const setProblem = useCallback((status: Exclude<VoiceDeviceStatus, 'connected'>, reason: string) => {
     setDeviceStatus(status);
     setDeviceReason(reason);
   }, []);
-
-  const scheduleReconnect = useCallback((reason: string, delayMs?: number) => {
-    if (!enabledRef.current) return;
-    if (reconnectTimerRef.current) return;
-
-    reconnectAttemptsRef.current += 1;
-    const retryInMs = delayMs ?? Math.min(20_000, 1_000 * 2 ** Math.min(reconnectAttemptsRef.current, 4));
-    setProblem('reconnecting', `Reintentando registro (${Math.round(retryInMs / 1000)}s): ${reason}`);
-
-    reconnectTimerRef.current = setTimeout(() => {
-      reconnectTimerRef.current = null;
-      const runInit = initializeDeviceRef.current;
-      if (!runInit) return;
-      void runInit(`reconnect:${reason}`);
-    }, retryInMs);
-  }, [setProblem]);
 
   const removeManagedCall = useCallback((callSid: string) => {
     if (!callsRef.current.has(callSid)) return;
@@ -236,45 +163,16 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     onCallEndedRef.current?.(callSid);
   }, [syncAttachedCallSids]);
 
-  const evaluateAutoAdopt = useCallback(async (callSid: string): Promise<{
-    autoAdopt: boolean;
-    toNumber: string | null;
-  }> => {
-    for (let attempt = 0; attempt < ADOPTION_LOOKUP_RETRIES; attempt += 1) {
-      const result = await fetchCallByTwilioSid(baseUrlRef.current, accessTokenRef.current, callSid);
-      if (!result.ok) {
-        if (attempt < ADOPTION_LOOKUP_RETRIES - 1) {
-          await delay(ADOPTION_LOOKUP_RETRY_DELAY_MS);
-          continue;
-        }
-        return { autoAdopt: false, toNumber: null };
-      }
+  const wireCallLifecycle = useCallback((call: Call, callSid: string, direction: 'inbound' | 'outbound', destination: string | null) => {
+    callsRef.current.set(callSid, {
+      call,
+      sid: callSid,
+      muted: false,
+      direction,
+      destination,
+    });
+    syncAttachedCallSids();
 
-      const record = result.data;
-      if (!record) {
-        if (attempt < ADOPTION_LOOKUP_RETRIES - 1) {
-          await delay(ADOPTION_LOOKUP_RETRY_DELAY_MS);
-          continue;
-        }
-        return { autoAdopt: false, toNumber: null };
-      }
-
-      const rawSource = record.twilio_data?.source;
-      const source = typeof rawSource === 'string' ? rawSource : '';
-      const isOutboundAdoptable = record.direction === 'outbound' && ADOPTABLE_SOURCES.has(source);
-      if (!isOutboundAdoptable) return { autoAdopt: false, toNumber: null };
-
-      if (record.answered_by_user_id && record.answered_by_user_id !== identityRef.current) {
-        return { autoAdopt: false, toNumber: null };
-      }
-
-      return { autoAdopt: true, toNumber: record.to_number || null };
-    }
-
-    return { autoAdopt: false, toNumber: null };
-  }, []);
-
-  const wireCallLifecycle = useCallback((call: Call, callSid: string) => {
     call.on('accept', () => {
       onCallAcceptedRef.current?.(callSid);
     });
@@ -297,150 +195,23 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       onInfoRef.current?.(`Error de llamada ${callSid}: ${message}`);
       removeManagedCall(callSid);
     });
-  }, [removeManagedCall]);
+  }, [removeManagedCall, syncAttachedCallSids]);
 
-  const handleIncomingCall = useCallback(async (call: Call) => {
-    const callSid = readCallParameter(call, 'CallSid');
-    if (!callSid) {
-      setLastError('Llamada entrante sin CallSid. No se puede enlazar.');
-      return;
-    }
-
-    if (callsRef.current.has(callSid)) {
-      return;
-    }
-
-    callsRef.current.set(callSid, {
-      call,
-      sid: callSid,
-      muted: false,
-    });
-    syncAttachedCallSids();
-    wireCallLifecycle(call, callSid);
-
-    let direction: 'inbound' | 'outbound' = 'inbound';
-    let toNumber = readCallParameter(call, 'To') || null;
-    let autoAdopted = false;
-
-    try {
-      const adoption = await evaluateAutoAdopt(callSid);
-      if (adoption.autoAdopt) {
-        autoAdopted = true;
-        direction = 'outbound';
-        toNumber = adoption.toNumber;
-        onInfoRef.current?.(`Auto-adopcion activada para llamada ${callSid}`);
-        call.accept();
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'lookup_adoption_failed';
-      onInfoRef.current?.(`No se pudo evaluar adopcion de llamada ${callSid}: ${message}`);
-    }
-
-    onIncomingCallRef.current?.({
-      callSid,
-      from: readCallParameter(call, 'From') || null,
-      to: toNumber,
-      direction,
-      autoAdopted,
-    });
-  }, [evaluateAutoAdopt, syncAttachedCallSids, wireCallLifecycle]);
-
-  const wireDeviceLifecycle = useCallback((device: Device) => {
-    device.on('registering', () => {
-      setProblem('registering', 'Registrando softphone...');
-    });
-
-    device.on('registered', () => {
-      setHealthy('Softphone registrado');
-    });
-
-    device.on('unregistered', () => {
-      setProblem('degraded', 'Softphone desregistrado');
-      scheduleReconnect('device_unregistered', 2_000);
-    });
-
-    device.on('destroyed', () => {
-      if (suppressDestroyedReconnectRef.current) {
-        suppressDestroyedReconnectRef.current = false;
-        return;
-      }
-
-      if (!enabledRef.current) {
-        setProblem('disconnected', 'Softphone detenido');
-        return;
-      }
-
-      setProblem('degraded', 'Softphone destruido');
-      scheduleReconnect('device_destroyed', 2_000);
-    });
-
-    device.on('error', (err: { code?: number; message?: string }) => {
-      const code = err.code ?? 0;
-      const message = err.message || `Error de device (${code})`;
-      setLastError(message);
-      onInfoRef.current?.(`Error de softphone ${code}: ${message}`);
-
-      if (code === 31204 || code === 31205 || code === 31009) {
-        setTokenExpired(true);
-        setProblem('degraded', 'Token o transporte invalido; reconectando');
-        scheduleReconnect(`device_error_${code}`, 2_000);
-        return;
-      }
-
-      setProblem('degraded', message);
-      scheduleReconnect(`device_error_${code}`, 3_000);
-    });
-
-    device.on('tokenWillExpire', async () => {
-      setTokenExpired(true);
-      onInfoRef.current?.('Token de voz proximo a expirar; refrescando');
-
-      const refresh = await fetchVoiceToken(baseUrlRef.current, accessTokenRef.current);
-      if (!refresh.ok) {
-        setLastError(refresh.error);
-        setProblem('degraded', `No se pudo refrescar token: ${refresh.error}`);
-        scheduleReconnect('token_refresh_failed', 2_000);
-        return;
-      }
-
-      try {
-        device.updateToken(refresh.data.token);
-        setTokenExpired(false);
-        setHealthy('Token renovado');
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'token_update_failed';
-        setLastError(message);
-        setProblem('degraded', `Error aplicando token: ${message}`);
-        scheduleReconnect('token_update_failed', 2_000);
-      }
-    });
-
-    device.on('incoming', (call: Call) => {
-      void handleIncomingCall(call);
-    });
-  }, [handleIncomingCall, scheduleReconnect, setHealthy, setProblem]);
-
-  const initializeDevice = useCallback(async (trigger: string) => {
-    if (!enabledRef.current) return;
-    if (initInFlightRef.current) return;
+  // Create or refresh the Device with a fresh token.
+  // We do NOT call device.register() — just keep a Device ready for connect().
+  const ensureDevice = useCallback(async (reason: string): Promise<Device | null> => {
+    if (initInFlightRef.current) return deviceRef.current;
     initInFlightRef.current = true;
 
     try {
-      clearReconnectTimer();
-      setProblem('reconnecting', `Inicializando softphone (${trigger})`);
-
-      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-        setProblem('degraded', 'Sin conectividad de red');
-        scheduleReconnect('offline', 3_000);
-        return;
-      }
+      setProblem('reconnecting', `Preparando motor de voz (${reason})`);
 
       if (!microphoneReadyRef.current) {
         const permission = await ensureMicrophonePermission();
         if (!permission.ok) {
           setLastError(permission.error);
           setProblem('degraded', `Microfono no disponible: ${permission.error}`);
-          return;
+          return null;
         }
         microphoneReadyRef.current = true;
       }
@@ -451,28 +222,27 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
 
         if (isAuthOrSessionError(tokenResult.error)) {
           setTokenExpired(true);
-          setProblem('degraded', 'Sesion invalida para token de voz; esperando renovacion');
-          scheduleReconnect('session_invalid_token', 5_000);
-          return;
+          setProblem('degraded', 'Sesion invalida para token de voz');
+          return null;
         }
 
         setProblem('degraded', `No se pudo obtener token de voz: ${tokenResult.error}`);
-        scheduleReconnect('token_fetch_failed');
-        return;
+        return null;
       }
 
       identityRef.current = tokenResult.data.identity;
       setIdentity(tokenResult.data.identity);
       setTokenExpired(false);
 
+      // Update existing device token or create a new one
       if (deviceRef.current) {
         try {
           deviceRef.current.updateToken(tokenResult.data.token);
-          setProblem('registering', 'Renovando registro del softphone...');
-          await registerDeviceWithTimeout(deviceRef.current, 'refresh_existing_device');
-          return;
+          setHealthy('Token renovado — listo para llamadas');
+          return deviceRef.current;
         } catch {
-          softResetDevice();
+          try { deviceRef.current.destroy(); } catch { /* ignore */ }
+          deviceRef.current = null;
         }
       }
 
@@ -482,30 +252,62 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         closeProtection: true,
       });
 
-      wireDeviceLifecycle(device);
+      device.on('error', (err: { code?: number; message?: string }) => {
+        const code = err.code ?? 0;
+        const message = err.message || `Error de device (${code})`;
+        setLastError(message);
+        onInfoRef.current?.(`Error de softphone ${code}: ${message}`);
+      });
+
+      device.on('tokenWillExpire', async () => {
+        setTokenExpired(true);
+        onInfoRef.current?.('Token de voz proximo a expirar; refrescando');
+
+        const refresh = await fetchVoiceToken(baseUrlRef.current, accessTokenRef.current);
+        if (!refresh.ok) {
+          setLastError(refresh.error);
+          setProblem('degraded', `No se pudo refrescar token: ${refresh.error}`);
+          return;
+        }
+
+        try {
+          device.updateToken(refresh.data.token);
+          setTokenExpired(false);
+          setHealthy('Token renovado');
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'token_update_failed';
+          setLastError(message);
+          setProblem('degraded', `Error aplicando token: ${message}`);
+        }
+      });
+
       deviceRef.current = device;
-      setProblem('registering', 'Registrando softphone...');
-      await registerDeviceWithTimeout(device, 'init_device');
+      setHealthy('Motor de voz listo (modo connect)');
+      return device;
     } catch (err) {
       const message = err instanceof Error ? err.message : 'init_device_failed';
       setLastError(message);
-      setProblem('degraded', `Error inicializando softphone: ${message}`);
-      scheduleReconnect('init_exception', 4_000);
+      setProblem('degraded', `Error inicializando motor de voz: ${message}`);
+      return null;
     } finally {
       initInFlightRef.current = false;
     }
-  }, [clearReconnectTimer, scheduleReconnect, setProblem, softResetDevice, wireDeviceLifecycle]);
+  }, [setHealthy, setProblem]);
 
-  useEffect(() => {
-    initializeDeviceRef.current = initializeDevice;
-  }, [initializeDevice]);
-
+  // Initialize device when session is ready
   useEffect(() => {
     if (!baseUrl || !accessToken) {
       enabledRef.current = false;
-      clearReconnectTimer();
-      softResetDevice();
-      clearCalls();
+      if (tokenRefreshTimerRef.current) {
+        clearInterval(tokenRefreshTimerRef.current);
+        tokenRefreshTimerRef.current = null;
+      }
+      if (deviceRef.current) {
+        try { deviceRef.current.destroy(); } catch { /* ignore */ }
+        deviceRef.current = null;
+      }
+      callsRef.current.clear();
+      syncAttachedCallSids();
       setIdentity('');
       setTokenExpired(false);
       setLastError(null);
@@ -516,112 +318,105 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     }
 
     enabledRef.current = true;
-    lastHealthTickRef.current = Date.now();
-    void initializeDevice('session_ready');
+    void ensureDevice('session_ready');
 
-    const healthInterval = setInterval(() => {
+    tokenRefreshTimerRef.current = setInterval(() => {
       if (!enabledRef.current) return;
-
-      const now = Date.now();
-      const healthGap = now - lastHealthTickRef.current;
-      lastHealthTickRef.current = now;
-
-      if (healthGap >= WAKE_HEALTH_GAP_MS) {
-        onInfoRef.current?.(`Reanudacion detectada (${Math.round(healthGap / 1000)}s). Revalidando softphone...`);
-        void initializeDevice('wake_gap_healthcheck');
-        return;
-      }
-
-      const device = deviceRef.current;
-      if (!device) {
-        setProblem('degraded', 'Softphone no inicializado');
-        scheduleReconnect('missing_device_healthcheck', 1_500);
-        return;
-      }
-
-      if (device.state === 'registering') {
-        setProblem('registering', 'Softphone registrando...');
-        return;
-      }
-
-      if (device.state !== 'registered') {
-        setProblem('degraded', `Softphone en estado ${device.state}`);
-        scheduleReconnect(`state_${device.state}`, 1_500);
-        return;
-      }
-
-      if (deviceStatusRef.current !== 'connected') {
-        setHealthy('Softphone operativo');
-      }
-    }, HEALTH_CHECK_INTERVAL_MS);
-
-    const onOnline = () => {
-      void initializeDevice('browser_online');
-    };
-
-    const onFocus = () => {
-      void initializeDevice('window_focus');
-    };
-
-    const onVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        void initializeDevice('visibility_visible');
-      }
-    };
-
-    const onOffline = () => {
-      setProblem('degraded', 'Sin conectividad de red');
-    };
-
-    window.addEventListener('online', onOnline);
-    window.addEventListener('focus', onFocus);
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    window.addEventListener('offline', onOffline);
+      void ensureDevice('token_refresh_interval');
+    }, TOKEN_REFRESH_INTERVAL_MS);
 
     return () => {
       enabledRef.current = false;
-      clearInterval(healthInterval);
-      window.removeEventListener('online', onOnline);
-      window.removeEventListener('focus', onFocus);
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-      window.removeEventListener('offline', onOffline);
-      clearReconnectTimer();
-      softResetDevice();
-      clearCalls();
+      if (tokenRefreshTimerRef.current) {
+        clearInterval(tokenRefreshTimerRef.current);
+        tokenRefreshTimerRef.current = null;
+      }
+      if (deviceRef.current) {
+        try { deviceRef.current.destroy(); } catch { /* ignore */ }
+        deviceRef.current = null;
+      }
+      callsRef.current.clear();
+      syncAttachedCallSids();
       setDeviceStatus('disconnected');
       setDeviceReason('Motor de voz detenido');
     };
-  }, [
-    accessToken,
-    baseUrl,
-    clearCalls,
-    clearReconnectTimer,
-    initializeDevice,
-    scheduleReconnect,
-    setHealthy,
-    setProblem,
-    softResetDevice,
-  ]);
+  }, [accessToken, baseUrl, ensureDevice, syncAttachedCallSids]);
 
-  const isCallAttached = useCallback((callSid: string) => {
-    return callsRef.current.has(callSid);
-  }, []);
+  // ─── Call actions ────────────────────────────────────────────────────────
 
-  const acceptCall = useCallback(async (callSid: string): Promise<VoiceActionResult> => {
-    const managed = callsRef.current.get(callSid);
-    if (!managed) {
-      return { ok: false, error: 'No hay llamada entrante enlazada al softphone.' };
-    }
-
+  const connectOutbound = useCallback(async (connectParams: {
+    destination: string;
+    callerId: string;
+    callRecordId?: string;
+  }): Promise<VoiceActionResult> => {
     try {
-      managed.call.accept();
+      let device = deviceRef.current;
+      if (!device) {
+        device = await ensureDevice('connect_outbound');
+        if (!device) {
+          return { ok: false, error: 'No se pudo preparar el motor de voz.' };
+        }
+      }
+
+      onInfoRef.current?.(`Conectando llamada saliente a ${connectParams.destination}`);
+
+      const call = await device.connect({
+        params: {
+          To: connectParams.destination,
+          CallerId: connectParams.callerId,
+          UserId: identityRef.current,
+          CallRecordId: connectParams.callRecordId || '',
+        },
+      });
+
+      const callSid = call.parameters?.CallSid || `outbound-${Date.now()}`;
+      wireCallLifecycle(call, callSid, 'outbound', connectParams.destination);
+      onCallStartedRef.current?.(callSid, 'outbound', connectParams.destination);
+
       return { ok: true, data: { call_sid: callSid } };
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'accept_failed';
+      const message = err instanceof Error ? err.message : 'connect_outbound_failed';
       setLastError(message);
+      onInfoRef.current?.(`Error conectando llamada saliente: ${message}`);
       return { ok: false, error: message };
     }
-  }, []);
+  }, [ensureDevice, wireCallLifecycle]);
+
+  const joinConference = useCallback(async (conferenceParams: {
+    conferenceName: string;
+    parentCallSid?: string;
+  }): Promise<VoiceActionResult> => {
+    try {
+      let device = deviceRef.current;
+      if (!device) {
+        device = await ensureDevice('join_conference');
+        if (!device) {
+          return { ok: false, error: 'No se pudo preparar el motor de voz.' };
+        }
+      }
+
+      onInfoRef.current?.(`Uniendose a conferencia ${conferenceParams.conferenceName}`);
+
+      const call = await device.connect({
+        params: {
+          To: `conference:${conferenceParams.conferenceName}`,
+          UserId: identityRef.current,
+          ParentCallSid: conferenceParams.parentCallSid || '',
+        },
+      });
+
+      const callSid = call.parameters?.CallSid || `conf-${Date.now()}`;
+      wireCallLifecycle(call, callSid, 'inbound', null);
+      onCallStartedRef.current?.(callSid, 'inbound', null);
+
+      return { ok: true, data: { call_sid: callSid } };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'join_conference_failed';
+      setLastError(message);
+      onInfoRef.current?.(`Error uniendose a conferencia: ${message}`);
+      return { ok: false, error: message };
+    }
+  }, [ensureDevice, wireCallLifecycle]);
 
   const disconnectCall = useCallback(async (callSid: string): Promise<VoiceActionResult> => {
     const managed = callsRef.current.get(callSid);
@@ -657,6 +452,10 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     }
   }, []);
 
+  const isCallAttached = useCallback((callSid: string) => {
+    return callsRef.current.has(callSid);
+  }, []);
+
   const reconnectNow = useCallback(async () => {
     if (!enabledRef.current) {
       const message = 'No se puede reiniciar el motor: sesion no activa o backend no configurado.';
@@ -668,11 +467,12 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       onInfoRef.current?.('El motor de voz ya se esta inicializando.');
       return;
     }
-    reconnectAttemptsRef.current = 0;
-    clearReconnectTimer();
-    softResetDevice();
-    await initializeDevice('manual');
-  }, [clearReconnectTimer, initializeDevice, softResetDevice]);
+    if (deviceRef.current) {
+      try { deviceRef.current.destroy(); } catch { /* ignore */ }
+      deviceRef.current = null;
+    }
+    await ensureDevice('manual');
+  }, [ensureDevice]);
 
   return useMemo(() => ({
     deviceStatus,
@@ -681,19 +481,21 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     tokenExpired,
     lastError,
     attachedCallSids,
-    acceptCall,
+    connectOutbound,
+    joinConference,
     disconnectCall,
     setMuted,
     isCallAttached,
     reconnectNow,
   }), [
-    acceptCall,
     attachedCallSids,
+    connectOutbound,
     deviceReason,
     deviceStatus,
     disconnectCall,
     identity,
     isCallAttached,
+    joinConference,
     lastError,
     reconnectNow,
     setMuted,

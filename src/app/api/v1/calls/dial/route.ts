@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { NextRequest } from 'next/server';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
@@ -6,6 +7,7 @@ import { getTwilioClient } from '@/lib/twilio/client';
 import { createCallRecord } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { auditLog } from '@/lib/api/audit';
+import { emitEvent } from '@/lib/events/emitter';
 import type { PhoneNumber, User } from '@/lib/types/database';
 
 /**
@@ -121,9 +123,10 @@ export async function POST(req: NextRequest) {
 
     const twilioClient = getTwilioClient();
 
-    // Agent-attached mode: call the agent via Twilio Client (desktop app).
-    // When the agent answers in the app, the outbound-connect webhook
-    // generates <Dial> TwiML to bridge the agent with the destination.
+    // Agent-attached mode: emit SSE event so the agent's Tauri desktop app
+    // (or browser) can initiate the call via device.connect().
+    // The agent's device.connect() triggers the TwiML App voice URL (/client)
+    // which generates <Dial><Number>destination</Number></Dial>.
     if (resolvedAgent) {
       let metadataJson = '';
       if (metadata) {
@@ -138,31 +141,15 @@ export async function POST(req: NextRequest) {
         `[DIAL] Resolved agent id=${resolvedAgent.id} name=${resolvedAgent.name} rdn_user_id=${resolvedAgent.rdn_user_id ?? '-'}`
       );
       console.log(
-        `[DIAL] Calling agent via client:${resolvedAgent.id} (desktop app), will bridge to ${destination_number} on answer`
+        `[DIAL] Emitting outbound_connect_request to agent ${resolvedAgent.id} for destination ${destination_number}`
       );
 
-      // Build outbound-connect URL with all params needed to bridge
-      const connectUrl = new URL(`${baseUrl}/api/webhooks/twilio/voice/outbound-connect`);
-      connectUrl.searchParams.set('caller_id', from_number);
-      connectUrl.searchParams.set('destination', destination_number);
-      connectUrl.searchParams.set('user_id', resolvedAgent.id);
-      connectUrl.searchParams.set('source', commandSource);
-
-      const call = await twilioClient.calls.create({
-        to: `client:${resolvedAgent.id}`,
-        from: from_number,
-        url: connectUrl.toString(),
-        statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
-        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        timeout: 30,
-      });
-
       const callRecordId = await createCallRecord({
-        twilioCallSid: call.sid,
+        twilioCallSid: `pending-${crypto.randomUUID().slice(0, 8)}`,
         direction: 'outbound',
         fromNumber: from_number,
         toNumber: destination_number,
-        status: 'ringing',
+        status: 'pending_agent',
         phoneNumberId: activeNumber.id,
         answeredByUserId: resolvedAgent.id,
         twilioData: {
@@ -178,6 +165,24 @@ export async function POST(req: NextRequest) {
         },
       });
 
+      // Emit SSE event for the agent's desktop app / browser to pick up
+      emitEvent('call.ringing', {
+        call_sid: `pending-dial-${(callRecordId ?? '').slice(0, 8)}`,
+        call_record_id: callRecordId,
+        direction: 'outbound',
+        status: 'pending_agent',
+        from: from_number,
+        to: destination_number,
+        user_id: resolvedAgent.id,
+        answered_by_user_id: resolvedAgent.id,
+        rdn_user_id: resolvedAgent.rdn_user_id ?? null,
+        source: commandSource,
+        outbound_connect_request: true,
+        destination_number,
+        caller_id: from_number,
+        metadata_json: metadataJson,
+      });
+
       await auditLog('call.dial', 'call_record', callRecordId, auth.userId, {
         destination: destination_number,
         from: from_number,
@@ -186,16 +191,15 @@ export async function POST(req: NextRequest) {
         requested_user_id: user_id ?? null,
         requested_rdn_user_id: rdn_user_id ?? null,
         resolved_agent_id: resolvedAgent.id,
-        attach_mode: 'twilio_client',
+        attach_mode: 'device_connect',
       });
 
       return apiSuccess({
-        call_sid: call.sid,
         call_record_id: callRecordId,
-        status: 'initiated',
+        status: 'pending_agent',
         from: from_number,
         to: destination_number,
-        attach_mode: 'twilio_client',
+        attach_mode: 'device_connect',
         source: commandSource,
         agent: {
           id: resolvedAgent.id,
