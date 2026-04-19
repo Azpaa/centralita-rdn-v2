@@ -845,6 +845,25 @@ export function CallWidget() {
       console.log(
         `[CallWidget] Outbound command accepted by backend call_sid=${res.data.call_sid} attach_mode=${res.data.attach_mode}`
       );
+
+      // Initiate the actual call via device.connect() — the backend only
+      // created the pending record and emitted the SSE event.
+      // We need to connect the Twilio Device to trigger the client webhook
+      // which generates the Dial TwiML to the destination.
+      if (res.data.attach_mode === 'device_connect' && deviceRef.current) {
+        const call = await deviceRef.current.connect({
+          params: {
+            To: formattedNumber,
+            CallerId: callerIdToUse,
+            UserId: identity,
+            CallRecordId: res.data.call_record_id || '',
+          },
+        });
+
+        const callId = addCallSlot(call, formattedNumber, 'outbound');
+        setupCallHandlers(call, callId);
+      }
+
       setShowNewCallDialpad(false);
       setDialNumber('');
     } catch (err) {
@@ -855,7 +874,7 @@ export function CallWidget() {
       setWidgetState(callsRef.current.length > 0 ? 'active' : 'idle');
       setError('Error al iniciar llamada');
     }
-  }, [fromNumber, identity, muteCall, softphoneStatus, unmuteCall]);
+  }, [addCallSlot, fromNumber, identity, muteCall, setupCallHandlers, softphoneStatus, unmuteCall]);
 
   // ─── Transfer (cold) ──────────────────────────────────────────────────────
 

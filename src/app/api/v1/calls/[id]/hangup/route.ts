@@ -4,6 +4,7 @@ import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response'
 import { getTwilioClient } from '@/lib/twilio/client';
 import { requireCallControlPermission } from '@/lib/calls/ownership';
 import { auditLog } from '@/lib/api/audit';
+import { createAdminClient } from '@/lib/supabase/admin';
 
 /**
  * POST /api/v1/calls/:id/hangup
@@ -38,21 +39,37 @@ export async function POST(
 
   try {
     const client = getTwilioClient();
+    const supabase = createAdminClient();
     let remoteSid: string | null = null;
 
-    // Resolver primero la otra leg para no perder referencia si colgamos callSid.
+    // Resolver la otra leg para colgar ambas si es necesario
     if (target === 'all' || target === 'remote') {
-      const callInfo = await client.calls(callSid).fetch().catch(() => null);
-      if (callInfo) {
-        if (callInfo.parentCallSid) {
-          remoteSid = callInfo.parentCallSid;
-        } else {
-          const children = await client.calls.list({
-            parentCallSid: callSid,
-            status: 'in-progress',
-            limit: 5,
-          });
-          if (children.length > 0) remoteSid = children[0].sid;
+      // Primero: buscar en DB si este callSid es un agent_call_sid (conferencia)
+      const { data: recordByAgent } = await supabase
+        .from('call_records')
+        .select('twilio_call_sid')
+        .filter('twilio_data->>agent_call_sid', 'eq', callSid)
+        .eq('status', 'in_progress')
+        .maybeSingle();
+
+      if (recordByAgent) {
+        // Encontramos el original — acabar la conferencia matando ambas legs
+        remoteSid = recordByAgent.twilio_call_sid;
+        console.log(`[HANGUP] Conference mode: agent=${callSid} caller=${remoteSid}`);
+      } else {
+        // Fallback: legacy parent/child
+        const callInfo = await client.calls(callSid).fetch().catch(() => null);
+        if (callInfo) {
+          if (callInfo.parentCallSid) {
+            remoteSid = callInfo.parentCallSid;
+          } else {
+            const children = await client.calls.list({
+              parentCallSid: callSid,
+              status: 'in-progress',
+              limit: 5,
+            });
+            if (children.length > 0) remoteSid = children[0].sid;
+          }
         }
       }
     }

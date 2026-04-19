@@ -22,14 +22,16 @@ import type { User } from '@/lib/types/database';
 export async function POST(req: NextRequest) {
   const webhook = await validateAndParseTwilioWebhook(req);
   if (!webhook.ok) return webhook.response;
+  const params = webhook.params;
 
   const { searchParams } = new URL(req.url);
   const conferenceName = searchParams.get('conference') || '';
   const parentCallSid = searchParams.get('call_sid') || '';
   const operatorId = searchParams.get('operator_id') || '';
+  const agentCallSid = params.CallSid || ''; // SID de la leg del agente (browser/phone)
 
   console.log(
-    `[AGENT-CONNECT] Agent answered. conference=${conferenceName} callSid=${parentCallSid} operatorId=${operatorId}`
+    `[AGENT-CONNECT] Agent answered. conference=${conferenceName} callSid=${parentCallSid} operatorId=${operatorId} agentLeg=${agentCallSid}`
   );
 
   // Update call record: agent answered
@@ -41,7 +43,23 @@ export async function POST(req: NextRequest) {
         answeredByUserId: operatorId,
       });
 
+      // Guardar el SID de la leg del agente en twilio_data para lookups inversos
+      // (transfer, hangup, etc. reciben el agentCallSid y necesitan encontrar el original)
       const supabase = createAdminClient();
+      if (agentCallSid) {
+        const { data: existing } = await supabase
+          .from('call_records')
+          .select('twilio_data')
+          .eq('twilio_call_sid', parentCallSid)
+          .single();
+        const merged = { ...((existing?.twilio_data as Record<string, unknown>) || {}), agent_call_sid: agentCallSid };
+        await supabase
+          .from('call_records')
+          .update({ twilio_data: merged })
+          .eq('twilio_call_sid', parentCallSid);
+        console.log(`[AGENT-CONNECT] Stored agent_call_sid=${agentCallSid} in call_record ${parentCallSid}`);
+      }
+
       const { data: userData } = await supabase
         .from('users')
         .select('id, rdn_user_id')

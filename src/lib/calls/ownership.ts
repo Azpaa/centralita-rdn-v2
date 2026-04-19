@@ -61,11 +61,24 @@ export async function requireCallControlPermission(
   }
 
   const supabase = createAdminClient();
-  const { data } = await supabase
+
+  // Buscar primero por twilio_call_sid directo
+  let { data } = await supabase
     .from('call_records')
     .select('id, twilio_call_sid, answered_by_user_id, twilio_data')
     .eq('twilio_call_sid', callSid)
     .maybeSingle();
+
+  // Si no se encuentra, buscar por agent_call_sid en twilio_data
+  // (en conferencias, el widget envía el SID de la leg del agente, no el del caller)
+  if (!data) {
+    const { data: agentMatch } = await supabase
+      .from('call_records')
+      .select('id, twilio_call_sid, answered_by_user_id, twilio_data')
+      .filter('twilio_data->>agent_call_sid', 'eq', callSid)
+      .maybeSingle();
+    data = agentMatch;
+  }
 
   if (!data) return apiNotFound('Llamada');
 

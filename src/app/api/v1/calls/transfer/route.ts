@@ -50,14 +50,48 @@ export async function POST(req: NextRequest) {
     const supabase = createAdminClient();
 
     // ── 1. Identificar la leg remota ──────────────────────────────────────
-    // Primero intentar vía conferencia (nueva arquitectura inbound):
-    // Buscar el call_record del callSid del agente para saber si está en
-    // una conferencia. Si sí, el caller original es el twilio_call_sid de
-    // otro call_record inbound asociado a la misma conferencia.
+    // El widget envía el callSid de su propia leg (browser/agent), que NO es
+    // el callSid original del caller. La conferencia se llama call-{originalSid}.
+    // Necesitamos buscar primero en DB qué call_record tiene este agentSid.
     let remoteCallSid: string | null = null;
+    let originalCallSid: string | null = null;
 
-    // Intentar encontrar la conferencia activa para este callSid
-    const conferenceName = `call-${callSid}`;
+    // Paso 0: Buscar en DB si este callSid es un agent_call_sid guardado
+    // por agent-connect. Si sí, obtenemos el twilio_call_sid original.
+    const { data: recordByAgent } = await supabase
+      .from('call_records')
+      .select('twilio_call_sid, direction')
+      .filter('twilio_data->>agent_call_sid', 'eq', callSid)
+      .eq('status', 'in_progress')
+      .maybeSingle();
+
+    if (recordByAgent) {
+      originalCallSid = recordByAgent.twilio_call_sid;
+      console.log(`[TRANSFER] Found original callSid=${originalCallSid} via agent_call_sid lookup`);
+    }
+
+    // Paso 0b: Si no lo encontramos por agent_call_sid, intentar por answered_by_user_id
+    if (!originalCallSid && auth.userId) {
+      const { data: recordByUser } = await supabase
+        .from('call_records')
+        .select('twilio_call_sid, direction')
+        .eq('answered_by_user_id', auth.userId)
+        .eq('status', 'in_progress' as string)
+        .order('started_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (recordByUser) {
+        originalCallSid = recordByUser.twilio_call_sid;
+        console.log(`[TRANSFER] Found original callSid=${originalCallSid} via answered_by_user_id lookup`);
+      }
+    }
+
+    // Si no encontramos mapping, el callSid podría ser el original directamente
+    const effectiveCallSid = originalCallSid || callSid;
+
+    // Intentar encontrar la conferencia activa
+    const conferenceName = `call-${effectiveCallSid}`;
     try {
       const conferences = await client.conferences.list({
         friendlyName: conferenceName,
@@ -97,29 +131,30 @@ export async function POST(req: NextRequest) {
       console.log(`[TRANSFER] No conference found for ${conferenceName}, trying DB lookup`);
     }
 
-    // Si no encontramos por conferencia directa, buscar en DB:
-    // El call_record inbound original tiene el twilio_call_sid del caller
+    // Si no encontramos por conferencia directa, intentar con el callSid
+    // original (ya lo tenemos en effectiveCallSid)
+    if (!remoteCallSid && effectiveCallSid !== callSid) {
+      // effectiveCallSid es el SID del caller original — ÉL es la remote leg
+      remoteCallSid = effectiveCallSid;
+      console.log(`[TRANSFER] Using original caller SID as remote: ${remoteCallSid}`);
+    }
+
     if (!remoteCallSid) {
       const { data: record } = await supabase
         .from('call_records')
         .select('twilio_call_sid, direction')
-        .eq('twilio_call_sid', callSid)
+        .eq('twilio_call_sid', effectiveCallSid)
         .maybeSingle();
 
       if (record?.direction === 'inbound') {
-        // Para inbound en conferencia, el callSid pasado por el widget
-        // es el del caller original. La conferencia se llama call-{callerSid}.
-        // Verificar si hay conferencia activa con ese nombre.
         try {
           const confs = await client.conferences.list({
-            friendlyName: `call-${callSid}`,
+            friendlyName: `call-${effectiveCallSid}`,
             status: 'in-progress',
             limit: 1,
           });
           if (confs.length > 0) {
-            // El callSid ES el del caller. remoteCallSid = callSid.
-            // Simplemente redirigimos este SID.
-            remoteCallSid = callSid;
+            remoteCallSid = effectiveCallSid;
             console.log(`[TRANSFER] Caller SID matches record: remoteSid=${remoteCallSid}`);
           }
         } catch {

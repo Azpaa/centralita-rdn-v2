@@ -152,13 +152,31 @@ export async function POST(req: NextRequest) {
         }
       }
 
+      // Guardar el SID de la leg del agente en twilio_data (igual que agent-connect)
+      const parentCallSidForRecord = conferenceRoom.replace('call-', '');
+      if (parentCallSidForRecord && callSid) {
+        const { data: existing } = await supabase
+          .from('call_records')
+          .select('twilio_data')
+          .eq('twilio_call_sid', parentCallSidForRecord)
+          .maybeSingle();
+        if (existing) {
+          const merged = { ...((existing.twilio_data as Record<string, unknown>) || {}), agent_call_sid: callSid };
+          await supabase
+            .from('call_records')
+            .update({ twilio_data: merged })
+            .eq('twilio_call_sid', parentCallSidForRecord);
+          console.log(`[CLIENT-VOICE] Stored agent_call_sid=${callSid} in call_record ${parentCallSidForRecord}`);
+        }
+      }
+
       const dial = twiml.dial({
         action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
       });
       dial.conference(
         {
           startConferenceOnEnter: true,
-          endConferenceOnExit: false,
+          endConferenceOnExit: true,
         },
         conferenceRoom,
       );
