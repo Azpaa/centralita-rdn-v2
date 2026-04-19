@@ -1,16 +1,15 @@
 {
   "app_id": "com.rdn.voiceagent",
-  "version": "0.1.1",
-  "released_at": "2026-04-18T00:00:00.000Z",
-  "notes": "Voice Agent v0.1.1 - mejoras y correcciones.",
+  "version": "0.1.2",
+  "released_at": "2026-04-19T17:13:12.022Z",
+  "notes": "Release 0.1.2",
   "assets": [
     {
       "platform": "windows",
       "arch": "x64",
-      "file_name": "RDN.Voice.Agent_0.1.0_x64-setup.exe",
-      "url": "https://github.com/Azpaa/centralita-rdn-v2/releases/download/v0.1.1/RDN.Voice.Agent_0.1.0_x64-setup.exe",
-      "signature_url": null,
-      "sha256": null
+      "file_name": "RDN Voice Agent_0.1.2_x64-setup.exe",
+      "url": "/downloads/voice-agent/v0.1.2/RDN Voice Agent_0.1.2_x64-setup.exe",
+      "signature_url": null
     }
   ]
 }
