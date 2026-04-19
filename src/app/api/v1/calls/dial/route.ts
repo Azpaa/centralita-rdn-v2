@@ -121,8 +121,8 @@ export async function POST(req: NextRequest) {
 
     const twilioClient = getTwilioClient();
 
-    // Agent-attached mode: call agent on phone + browser simultaneously,
-    // when they pick up → connect to destination via outbound-connect webhook.
+    // Agent-attached mode: call the DESTINATION directly from our Twilio number.
+    // The agent is linked to the call record but does NOT receive a phone call.
     if (resolvedAgent) {
       let metadataJson = '';
       if (metadata) {
@@ -134,43 +134,19 @@ export async function POST(req: NextRequest) {
       }
 
       console.log(
-        `[DIAL] Resolved agent id=${resolvedAgent.id} name=${resolvedAgent.name} phone=${resolvedAgent.phone ?? 'none'} available=${resolvedAgent.available} active=${resolvedAgent.active} rdn_user_id=${resolvedAgent.rdn_user_id ?? '-'}`
+        `[DIAL] Resolved agent id=${resolvedAgent.id} name=${resolvedAgent.name} rdn_user_id=${resolvedAgent.rdn_user_id ?? '-'}`
+      );
+      console.log(
+        `[DIAL] Calling destination ${destination_number} directly from ${from_number}, agent ${resolvedAgent.name} linked to record`
       );
 
-      // If agent has no phone and no client can be reached, we still try client
-      // (it will fail with SIP 480 if offline, but that's handled by dial-action)
-      let agentPhone = resolvedAgent.phone?.trim() || '';
-      // Normalize to E.164: if it doesn't start with '+', assume Spain (+34)
-      if (agentPhone && !agentPhone.startsWith('+')) {
-        agentPhone = `+34${agentPhone.replace(/^0+/, '')}`;
-      }
-      const hasPhone = Boolean(agentPhone);
-
-      if (!hasPhone) {
-        console.log(`[DIAL] Agent has no phone number, trying client:${resolvedAgent.id} only`);
-      } else {
-        console.log(`[DIAL] Calling agent on phone ${agentPhone} (raw: ${resolvedAgent.phone}) + client:${resolvedAgent.id}`);
-      }
-
-      // Use a TwiML-based approach: create the call to a TwiML URL that
-      // dials the agent on both channels. When agent picks up, connect to destination.
-      // We call the destination number directly, and use a whisper/connect URL.
-
-      // Create the parent call using TwiML that dials both agent endpoints
-      const twimlDialUrl = new URL(`${baseUrl}/api/webhooks/twilio/voice/agent-dial`);
-      twimlDialUrl.searchParams.set('agent_id', resolvedAgent.id);
-      twimlDialUrl.searchParams.set('agent_phone', agentPhone);
-      twimlDialUrl.searchParams.set('destination', destination_number);
-      twimlDialUrl.searchParams.set('caller_id', from_number);
-      twimlDialUrl.searchParams.set('source', commandSource);
-
       const call = await twilioClient.calls.create({
-        to: agentPhone || `client:${resolvedAgent.id}`,
+        to: destination_number,
         from: from_number,
-        url: `${baseUrl}/api/webhooks/twilio/voice/outbound-connect?caller_id=${encodeURIComponent(from_number)}&destination=${encodeURIComponent(destination_number)}&user_id=${encodeURIComponent(resolvedAgent.id)}&source=${encodeURIComponent(commandSource)}`,
+        url: `${baseUrl}/api/webhooks/twilio/voice/outbound-connect?caller_id=${encodeURIComponent(from_number)}`,
         statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        timeout: 30,
+        timeout: 60,
       });
 
       const callRecordId = await createCallRecord({
@@ -190,7 +166,6 @@ export async function POST(req: NextRequest) {
           resolved_agent_id: resolvedAgent.id,
           resolved_agent_name: resolvedAgent.name,
           resolved_agent_available: resolvedAgent.available,
-          agent_phone: resolvedAgent.phone ?? '',
           metadata_json: metadataJson,
         },
       });
@@ -203,7 +178,7 @@ export async function POST(req: NextRequest) {
         requested_user_id: user_id ?? null,
         requested_rdn_user_id: rdn_user_id ?? null,
         resolved_agent_id: resolvedAgent.id,
-        attach_mode: hasPhone ? 'phone_primary' : 'twilio_client',
+        attach_mode: 'direct_to_destination',
       });
 
       return apiSuccess({
@@ -212,7 +187,7 @@ export async function POST(req: NextRequest) {
         status: 'initiated',
         from: from_number,
         to: destination_number,
-        attach_mode: hasPhone ? 'phone_primary' : 'twilio_client',
+        attach_mode: 'direct_to_destination',
         source: commandSource,
         agent: {
           id: resolvedAgent.id,
