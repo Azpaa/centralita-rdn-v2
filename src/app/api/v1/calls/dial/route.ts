@@ -139,12 +139,17 @@ export async function POST(req: NextRequest) {
 
       // If agent has no phone and no client can be reached, we still try client
       // (it will fail with SIP 480 if offline, but that's handled by dial-action)
-      const hasPhone = Boolean(resolvedAgent.phone);
+      let agentPhone = resolvedAgent.phone?.trim() || '';
+      // Normalize to E.164: if it doesn't start with '+', assume Spain (+34)
+      if (agentPhone && !agentPhone.startsWith('+')) {
+        agentPhone = `+34${agentPhone.replace(/^0+/, '')}`;
+      }
+      const hasPhone = Boolean(agentPhone);
 
       if (!hasPhone) {
         console.log(`[DIAL] Agent has no phone number, trying client:${resolvedAgent.id} only`);
       } else {
-        console.log(`[DIAL] Calling agent on phone ${resolvedAgent.phone} + client:${resolvedAgent.id} simultaneously`);
+        console.log(`[DIAL] Calling agent on phone ${agentPhone} (raw: ${resolvedAgent.phone}) + client:${resolvedAgent.id}`);
       }
 
       // Use a TwiML-based approach: create the call to a TwiML URL that
@@ -154,13 +159,13 @@ export async function POST(req: NextRequest) {
       // Create the parent call using TwiML that dials both agent endpoints
       const twimlDialUrl = new URL(`${baseUrl}/api/webhooks/twilio/voice/agent-dial`);
       twimlDialUrl.searchParams.set('agent_id', resolvedAgent.id);
-      twimlDialUrl.searchParams.set('agent_phone', resolvedAgent.phone || '');
+      twimlDialUrl.searchParams.set('agent_phone', agentPhone);
       twimlDialUrl.searchParams.set('destination', destination_number);
       twimlDialUrl.searchParams.set('caller_id', from_number);
       twimlDialUrl.searchParams.set('source', commandSource);
 
       const call = await twilioClient.calls.create({
-        to: resolvedAgent.phone || `client:${resolvedAgent.id}`,
+        to: agentPhone || `client:${resolvedAgent.id}`,
         from: from_number,
         url: `${baseUrl}/api/webhooks/twilio/voice/outbound-connect?caller_id=${encodeURIComponent(from_number)}&destination=${encodeURIComponent(destination_number)}&user_id=${encodeURIComponent(resolvedAgent.id)}&source=${encodeURIComponent(commandSource)}`,
         statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
