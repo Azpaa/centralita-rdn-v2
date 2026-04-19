@@ -192,6 +192,9 @@ export async function POST(req: NextRequest) {
 
     // 5. Conference-based approach: ring agents via REST API, put caller back in conference
     const conferenceName = `call-${callSid}`;
+    // IMPORTANT: use our Twilio DID as callerId/from for re-ring attempts.
+    // Using the external caller number can make Twilio reject these outbound legs.
+    const ringCallerId = record.to_number || record.from_number;
     const twilioClient = getTwilioClient();
     const agentConnectBase = `${baseUrl}/api/webhooks/twilio/voice/agent-connect`;
 
@@ -204,7 +207,7 @@ export async function POST(req: NextRequest) {
       // Ring agent's browser Device
       twilioClient.calls.create({
         to: `client:${target.id}`,
-        from: record.from_number,
+        from: ringCallerId,
         url: agentConnectUrl.toString(),
         statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
@@ -217,7 +220,7 @@ export async function POST(req: NextRequest) {
       if (target.phone) {
         twilioClient.calls.create({
           to: target.phone,
-          from: record.from_number,
+          from: ringCallerId,
           url: agentConnectUrl.toString(),
           statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],

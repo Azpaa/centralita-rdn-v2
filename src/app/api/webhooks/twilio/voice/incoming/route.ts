@@ -240,6 +240,9 @@ export async function POST(req: NextRequest) {
     // First agent to join connects with the caller.
 
     // Ring agents via REST API (async, fire-and-forget)
+    // IMPORTANT: use our Twilio DID as callerId/from. Using the external caller's
+    // number here can make Twilio reject the outbound leg (especially PSTN fallback).
+    const ringCallerId = route.phoneNumber.phone_number || toNumber;
     const twilioClient = getTwilioClient();
     const agentConnectBase = `${baseUrl}/api/webhooks/twilio/voice/agent-connect`;
 
@@ -252,7 +255,7 @@ export async function POST(req: NextRequest) {
       // Ring agent's browser Device (Twilio Client)
       twilioClient.calls.create({
         to: `client:${target.id}`,
-        from: fromNumber,
+        from: ringCallerId,
         url: agentConnectUrl.toString(),
         statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
@@ -265,7 +268,7 @@ export async function POST(req: NextRequest) {
       if (target.phone) {
         twilioClient.calls.create({
           to: target.phone,
-          from: fromNumber,
+          from: ringCallerId,
           url: agentConnectUrl.toString(),
           statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],

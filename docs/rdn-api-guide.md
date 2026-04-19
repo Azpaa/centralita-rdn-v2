@@ -242,22 +242,26 @@ Body: vacio.
 ### POST `/api/v1/calls/{call_sid}/mute`
 Silencia participante en conferencia.
 
-Body obligatorio:
+Body opcional:
 
 ```json
 { "conference_name": "conf-abc" }
 ```
 
 No soportado para llamada directa no-conferencia.
+Si no se envia `conference_name`, backend intenta deducirla automaticamente.
+Se acepta `call_sid` principal o `agent_call_sid`; backend resuelve el participante real.
 
 ### POST `/api/v1/calls/{call_sid}/unmute`
 Reactiva audio de participante en conferencia.
 
-Body obligatorio:
+Body opcional:
 
 ```json
 { "conference_name": "conf-abc" }
 ```
+
+Mismas reglas de resolucion automatica que en `mute`.
 
 ### POST `/api/v1/calls/transfer`
 Transferencia en frio.
