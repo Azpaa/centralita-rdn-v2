@@ -105,6 +105,21 @@ export async function callCommand(
   });
 }
 
+export async function updateUserAvailability(
+  baseUrl: string,
+  jwt: string,
+  userId: string,
+  available: boolean,
+): Promise<ApiResult<Record<string, unknown>>> {
+  return requestJson<Record<string, unknown>>(`${baseUrl}/api/v1/users/${userId}/availability`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+    },
+    body: JSON.stringify({ available }),
+  });
+}
+
 function parseEventData(raw: string): CanonicalStreamEvent | null {
   try {
     const parsed = JSON.parse(raw) as CanonicalStreamEvent;

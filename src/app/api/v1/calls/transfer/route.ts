@@ -8,21 +8,25 @@ import { requireCallControlPermission } from '@/lib/calls/ownership';
 import { auditLog } from '@/lib/api/audit';
 import { createAdminClient } from '@/lib/supabase/admin';
 
+type TransferCallRecordRow = {
+  twilio_call_sid: string | null;
+  twilio_data: Record<string, unknown> | null;
+};
+
+function normalizeSid(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const sid = value.trim();
+  return sid.length > 0 ? sid : null;
+}
+
+function extractAgentCallSid(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return normalizeSid((value as Record<string, unknown>).agent_call_sid);
+}
+
 /**
  * POST /api/v1/calls/transfer
- * Transferencia en frío (blind transfer).
- *
- * Soporta DOS modos:
- *
- * A) **Conferencia** (llamadas entrantes con la nueva arquitectura):
- *    - El callSid del agente es una leg independiente en una conferencia.
- *    - No hay relación parent/child con el caller.
- *    - Buscamos el callSid original del caller en call_records (por twilio_call_sid
- *      del record que tiene conference call-{X}).
- *    - Sacamos al caller de la conferencia actualizando su call con TwiML inline.
- *
- * B) **Legacy parent/child** (llamadas salientes y entrantes pre-conferencia):
- *    - Funciona como antes: buscar parentCallSid o children.
+ * Transferencia en frio (blind transfer).
  *
  * Body: { callSid: string, destination: string, callerId?: string }
  */
@@ -34,7 +38,7 @@ export async function POST(req: NextRequest) {
   try {
     body = await req.json();
   } catch {
-    return apiBadRequest('Body JSON inválido');
+    return apiBadRequest('Body JSON invalido');
   }
 
   const { callSid, destination, callerId } = body;
@@ -49,32 +53,52 @@ export async function POST(req: NextRequest) {
     const client = getTwilioClient();
     const supabase = createAdminClient();
 
-    // ── 1. Identificar la leg remota ──────────────────────────────────────
-    // El widget envía el callSid de su propia leg (browser/agent), que NO es
-    // el callSid original del caller. La conferencia se llama call-{originalSid}.
-    // Necesitamos buscar primero en DB qué call_record tiene este agentSid.
+    // 1) Resolver caller leg (a transferir) y agent leg (a cerrar).
     let remoteCallSid: string | null = null;
     let originalCallSid: string | null = null;
+    let agentCallSid: string | null = null;
 
-    // Paso 0: Buscar en DB si este callSid es un agent_call_sid guardado
-    // por agent-connect. Si sí, obtenemos el twilio_call_sid original.
+    // A. SID recibido corresponde a la leg del agente.
     const { data: recordByAgent } = await supabase
       .from('call_records')
-      .select('twilio_call_sid, direction')
+      .select('twilio_call_sid, twilio_data')
       .filter('twilio_data->>agent_call_sid', 'eq', callSid)
       .eq('status', 'in_progress')
       .maybeSingle();
 
     if (recordByAgent) {
-      originalCallSid = recordByAgent.twilio_call_sid;
-      console.log(`[TRANSFER] Found original callSid=${originalCallSid} via agent_call_sid lookup`);
+      const row = recordByAgent as TransferCallRecordRow;
+      originalCallSid = normalizeSid(row.twilio_call_sid);
+      agentCallSid = normalizeSid(callSid) || extractAgentCallSid(row.twilio_data);
+      console.log(
+        `[TRANSFER] Resolved via agent_call_sid: caller=${originalCallSid ?? '-'} agent=${agentCallSid ?? '-'}`
+      );
     }
 
-    // Paso 0b: Si no lo encontramos por agent_call_sid, intentar por answered_by_user_id
+    // B. SID recibido ya es el caller original.
+    if (!originalCallSid) {
+      const { data: recordByOriginalSid } = await supabase
+        .from('call_records')
+        .select('twilio_call_sid, twilio_data')
+        .eq('twilio_call_sid', callSid)
+        .eq('status', 'in_progress')
+        .maybeSingle();
+
+      if (recordByOriginalSid) {
+        const row = recordByOriginalSid as TransferCallRecordRow;
+        originalCallSid = normalizeSid(row.twilio_call_sid);
+        agentCallSid = extractAgentCallSid(row.twilio_data);
+        console.log(
+          `[TRANSFER] Resolved via twilio_call_sid: caller=${originalCallSid ?? '-'} agent=${agentCallSid ?? '-'}`
+        );
+      }
+    }
+
+    // C. Fallback por agente autenticado.
     if (!originalCallSid && auth.userId) {
       const { data: recordByUser } = await supabase
         .from('call_records')
-        .select('twilio_call_sid, direction')
+        .select('twilio_call_sid, twilio_data')
         .eq('answered_by_user_id', auth.userId)
         .eq('status', 'in_progress')
         .order('started_at', { ascending: false })
@@ -82,15 +106,19 @@ export async function POST(req: NextRequest) {
         .maybeSingle();
 
       if (recordByUser) {
-        originalCallSid = recordByUser.twilio_call_sid;
-        console.log(`[TRANSFER] Found original callSid=${originalCallSid} via answered_by_user_id lookup`);
+        const row = recordByUser as TransferCallRecordRow;
+        originalCallSid = normalizeSid(row.twilio_call_sid);
+        agentCallSid = agentCallSid || extractAgentCallSid(row.twilio_data);
+        console.log(
+          `[TRANSFER] Resolved via answered_by_user_id: caller=${originalCallSid ?? '-'} agent=${agentCallSid ?? '-'}`
+        );
       }
     }
 
-    // Si no encontramos mapping, el callSid podría ser el original directamente
+    // Si no tenemos mapping explicito, usar el callSid recibido como referencia principal.
     const effectiveCallSid = originalCallSid || callSid;
 
-    // Intentar encontrar la conferencia activa
+    // 2) Intentar resolver en conferencia call-{effectiveCallSid}.
     const conferenceName = `call-${effectiveCallSid}`;
     try {
       const conferences = await client.conferences.list({
@@ -100,45 +128,53 @@ export async function POST(req: NextRequest) {
       });
 
       if (conferences.length > 0) {
-        // Conferencia encontrada — buscar participantes que NO sean el agente
         const participants = await client
           .conferences(conferences[0].sid)
           .participants.list();
 
-        for (const p of participants) {
-          if (p.callSid !== callSid) {
-            remoteCallSid = p.callSid;
-            break;
-          }
+        const participantSids = new Set(participants.map((p) => p.callSid));
+
+        // Regla principal: transferir el caller original si esta en sala.
+        if (participantSids.has(effectiveCallSid)) {
+          remoteCallSid = effectiveCallSid;
         }
 
+        // Si no, elegir participante que no parezca leg de agente.
         if (!remoteCallSid) {
-          // El callSid podría no estar directamente en la conferencia
-          // (el agente usa device.connect → conference:call-{X}, con un SID diferente).
-          // Buscar por exclusión: cualquier participante cuyo SID no sea del agente.
-          // Si solo hay 1 participante, ese es el caller.
-          if (participants.length === 1) {
+          const agentSidCandidates = new Set<string>();
+          const requestSid = normalizeSid(callSid);
+          if (requestSid) agentSidCandidates.add(requestSid);
+          if (agentCallSid) agentSidCandidates.add(agentCallSid);
+
+          const callerCandidate = participants.find((p) => !agentSidCandidates.has(p.callSid));
+          if (callerCandidate) {
+            remoteCallSid = callerCandidate.callSid;
+          } else if (participants.length === 1) {
             remoteCallSid = participants[0].callSid;
           }
         }
 
+        // Derivar leg del agente si aun no esta resuelta.
+        if (!agentCallSid) {
+          const agentParticipant = participants.find((p) => p.callSid !== remoteCallSid);
+          if (agentParticipant) agentCallSid = agentParticipant.callSid;
+        }
+
         console.log(
-          `[TRANSFER] Conference mode: conf=${conferenceName} participants=${participants.length} remoteSid=${remoteCallSid}`
+          `[TRANSFER] Conference mode: conf=${conferenceName} participants=${participants.length} callerToTransfer=${remoteCallSid ?? '-'} agentLeg=${agentCallSid ?? '-'}`
         );
       }
-    } catch (err) {
-      // No hay conferencia con ese nombre — intentar búsqueda inversa
-      console.log(`[TRANSFER] No conference found for ${conferenceName}, trying DB lookup`);
+    } catch {
+      console.log(`[TRANSFER] No conference found for ${conferenceName}, trying fallback resolution`);
     }
 
-    // Si no encontramos por conferencia directa, intentar con el callSid
-    // original (ya lo tenemos en effectiveCallSid)
+    // 3) Fallback: el caller original ya es la leg a transferir.
     if (!remoteCallSid && effectiveCallSid !== callSid) {
-      // effectiveCallSid es el SID del caller original — ÉL es la remote leg
       remoteCallSid = effectiveCallSid;
-      console.log(`[TRANSFER] Using original caller SID as remote: ${remoteCallSid}`);
+      console.log(`[TRANSFER] Using effective caller SID as transfer target: ${remoteCallSid}`);
     }
 
+    // 4) Validar si effectiveCallSid existe como inbound en conference nombrada.
     if (!remoteCallSid) {
       const { data: record } = await supabase
         .from('call_records')
@@ -155,7 +191,7 @@ export async function POST(req: NextRequest) {
           });
           if (confs.length > 0) {
             remoteCallSid = effectiveCallSid;
-            console.log(`[TRANSFER] Caller SID matches record: remoteSid=${remoteCallSid}`);
+            console.log(`[TRANSFER] Caller SID confirmed in inbound record: ${remoteCallSid}`);
           }
         } catch {
           // ignore
@@ -163,36 +199,37 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Fallback: modo legacy parent/child
+    // 5) Fallback legacy parent/child.
     if (!remoteCallSid) {
-      const callInfo = await client.calls(callSid).fetch();
+      const sidToInspect = agentCallSid || callSid;
+      const callInfo = await client.calls(sidToInspect).fetch();
 
       if (callInfo.parentCallSid) {
         remoteCallSid = callInfo.parentCallSid;
+        agentCallSid = sidToInspect;
       } else {
         const children = await client.calls.list({
-          parentCallSid: callSid,
+          parentCallSid: sidToInspect,
           status: 'in-progress',
           limit: 5,
         });
 
         if (children.length > 0) {
           remoteCallSid = children[0].sid;
+          agentCallSid = sidToInspect;
         }
       }
     }
 
     if (!remoteCallSid) {
-      return apiBadRequest(
-        'No se encontró la otra parte de la llamada. Puede que ya haya colgado.'
-      );
+      return apiBadRequest('No se encontro la otra parte de la llamada. Puede que ya haya colgado.');
     }
 
     console.log(
-      `[TRANSFER] agentCallSid=${callSid} remoteSid=${remoteCallSid} → ${destination}`
+      `[TRANSFER] requestedSid=${callSid} callerToTransfer=${remoteCallSid} agentLeg=${agentCallSid ?? '-'} destination=${destination}`
     );
 
-    // ── 2. Construir TwiML inline para la transferencia ──────────────────
+    // 6) TwiML de transferencia: mover caller actual al nuevo destino.
     const twimlBuilder = new twilio.twiml.VoiceResponse();
 
     twimlBuilder.say(
@@ -200,9 +237,6 @@ export async function POST(req: NextRequest) {
       'Transfiriendo su llamada. Un momento por favor.'
     );
 
-    // <Dial> SIN action URL → al finalizar el Dial, la llamada continúa
-    // con los siguientes verbos (despedida + hangup). Así evitamos que
-    // dial-action reintente la cola.
     const dial = twimlBuilder.dial({
       callerId: callerId || undefined,
       timeout: 30,
@@ -214,7 +248,6 @@ export async function POST(req: NextRequest) {
       dial.number(destination);
     }
 
-    // Después del Dial (conteste o no), despedirse y colgar.
     twimlBuilder.say(
       { language: 'es-ES', voice: 'Polly.Conchita' },
       'La transferencia ha finalizado. Gracias por llamar.'
@@ -223,21 +256,22 @@ export async function POST(req: NextRequest) {
 
     const twimlString = twimlBuilder.toString();
 
-    // ── 3. Redirigir la leg remota con TwiML inline ──────────────────────
+    // 7) Aplicar TwiML al caller que debe transferirse.
     await client.calls(remoteCallSid).update({ twiml: twimlString });
 
-    // ── 4. Colgar la leg del agente explícitamente ───────────────────────
-    // Para entrantes: el child (agente) se desconecta automáticamente al
-    //   interrumpir el Dial del parent, pero lo completamos por seguridad.
-    // Para salientes: evitamos que el parent vaya a dial-action (que podría
-    //   reintentar colas o mostrar errores de webhook 401).
-    try {
-      await client.calls(callSid).update({ status: 'completed' });
-    } catch {
-      // Ya estaba desconectado — OK
+    // 8) Cerrar la leg del agente (nunca cerrar la leg transferida).
+    const legToComplete = (agentCallSid && agentCallSid !== remoteCallSid)
+      ? agentCallSid
+      : (callSid !== remoteCallSid ? callSid : null);
+
+    if (legToComplete) {
+      try {
+        await client.calls(legToComplete).update({ status: 'completed' });
+      } catch {
+        // Ya estaba desconectada.
+      }
     }
 
-    // Emitir evento call.transferred para RDN
     emitEvent('call.transferred', {
       call_sid: callSid,
       remote_call_sid: remoteCallSid,
@@ -250,6 +284,7 @@ export async function POST(req: NextRequest) {
       remote_call_sid: remoteCallSid,
       destination,
       caller_id: callerId ?? null,
+      agent_call_sid: agentCallSid,
       auth_method: auth.authMethod,
     });
 

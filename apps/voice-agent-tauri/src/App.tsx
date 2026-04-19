@@ -7,6 +7,7 @@ import {
   fetchAgentState,
   fetchBootstrap,
   normalizeBaseUrl,
+  updateUserAvailability,
 } from './lib/backend';
 import type {
   AgentStateSnapshot,
@@ -137,6 +138,8 @@ export default function App() {
   const remoteAcceptInFlightRef = useRef<Set<string>>(new Set());
   const lastStreamEventAtRef = useRef<number>(Date.now());
   const lastWakeTickRef = useRef<number>(Date.now());
+  const availabilitySyncInFlightRef = useRef(false);
+  const lastSyncedAvailabilityRef = useRef<boolean | null>(null);
   const reconnectVoiceRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
@@ -255,6 +258,33 @@ export default function App() {
     return result;
   }, [ensureFreshSession]);
 
+  const syncAvailability = useCallback(async (
+    nextAvailable: boolean,
+    reason: string,
+  ) => {
+    if (!backendUrl || !accessTokenRef.current) return;
+    const userId = agentState?.user_id;
+    if (!userId) return;
+    if (availabilitySyncInFlightRef.current) return;
+    if (lastSyncedAvailabilityRef.current === nextAvailable) return;
+
+    availabilitySyncInFlightRef.current = true;
+    try {
+      const result = await withJwtRetry(
+        `availability:${reason}`,
+        (jwt) => updateUserAvailability(backendUrl, jwt, userId, nextAvailable),
+      );
+
+      if (result.ok) {
+        lastSyncedAvailabilityRef.current = nextAvailable;
+      } else {
+        setMessage(`No se pudo sincronizar disponibilidad: ${result.error}`);
+      }
+    } finally {
+      availabilitySyncInFlightRef.current = false;
+    }
+  }, [agentState?.user_id, backendUrl, withJwtRetry]);
+
   const refreshAgentSnapshot = useCallback(async (reason: string) => {
     if (!backendUrl || !accessTokenRef.current) return;
 
@@ -317,6 +347,23 @@ export default function App() {
   useEffect(() => {
     reconnectVoiceRef.current = voice.reconnectNow;
   }, [voice.reconnectNow]);
+
+  useEffect(() => {
+    if (!accessToken || !agentState?.user_id) return;
+
+    const shouldBeAvailable =
+      voice.deviceStatus === 'connected'
+      || voice.deviceStatus === 'registering'
+      || voice.deviceStatus === 'reconnecting';
+
+    void syncAvailability(shouldBeAvailable, `voice:${voice.deviceStatus}`);
+  }, [accessToken, agentState?.user_id, syncAvailability, voice.deviceStatus]);
+
+  useEffect(() => {
+    if (accessToken) return;
+    lastSyncedAvailabilityRef.current = null;
+    availabilitySyncInFlightRef.current = false;
+  }, [accessToken]);
 
   const wasRemoteCommandProcessed = useCallback((commandId: string): boolean => {
     const now = Date.now();
@@ -744,12 +791,21 @@ export default function App() {
   }, [email, password]);
 
   const logout = useCallback(async () => {
+    const userId = agentState?.user_id;
+    if (backendUrl && userId && accessTokenRef.current) {
+      await withJwtRetry(
+        'availability:logout',
+        (jwt) => updateUserAvailability(backendUrl, jwt, userId, false),
+      );
+      lastSyncedAvailabilityRef.current = false;
+    }
+
     await supabaseRef.current?.auth.signOut();
     setAccessToken('');
     setAgentState(null);
     setCalls([]);
     setMessage('Sesion cerrada');
-  }, []);
+  }, [agentState?.user_id, backendUrl, withJwtRetry]);
 
   const executeCallAction = useCallback(async (
     action: 'accept' | 'hangup' | 'mute' | 'unmute',

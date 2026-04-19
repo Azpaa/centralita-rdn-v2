@@ -15,10 +15,18 @@ interface Params {
 export async function PATCH(req: NextRequest, { params }: Params) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
-  const roleCheck = requireRole(auth, 'admin');
-  if (roleCheck !== true) return roleCheck;
 
   const { id } = await params;
+  const isSelfUpdate =
+    auth.authMethod === 'session'
+    && Boolean(auth.userId)
+    && auth.userId === id;
+
+  if (!isSelfUpdate) {
+    const roleCheck = requireRole(auth, 'admin');
+    if (roleCheck !== true) return roleCheck;
+  }
+
   let body: unknown;
   try {
     body = await req.json();
