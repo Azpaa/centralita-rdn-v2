@@ -13,12 +13,16 @@ export async function POST(req: NextRequest) {
   if (validation !== true) return validation;
   const { searchParams } = new URL(req.url);
   const callerId = searchParams.get('caller_id') || '';
+  const destination = searchParams.get('destination') || '';
+  const userId = searchParams.get('user_id') || '';
+  const source = searchParams.get('source') || '';
 
-  console.log(`[OUTBOUND-CONNECT] Call answered, caller_id=${callerId}`);
+  console.log(`[OUTBOUND-CONNECT] Agent answered, caller_id=${callerId} destination=${destination} user_id=${userId} source=${source}`);
 
   const twiml = new twilio.twiml.VoiceResponse();
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
 
-  // Comprobar si este número tiene grabación activa
+  // Check if recording is enabled for this caller number
   let shouldRecord = false;
   try {
     const { createAdminClient } = await import('@/lib/supabase/admin');
@@ -31,18 +35,31 @@ export async function POST(req: NextRequest) {
 
     shouldRecord = phoneNum?.record_calls ?? false;
   } catch {
-    // Ignorar error, no grabar
+    // Ignore error, don't record
   }
 
   if (shouldRecord) {
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
     twiml.record({
       recordingStatusCallback: `${baseUrl}/api/webhooks/twilio/recording/status`,
       recordingStatusCallbackEvent: ['completed'],
     });
   }
 
-  // La llamada se mantiene abierta — el destino ya está conectado
-  // No se necesita <Dial> adicional porque Twilio ya llamó al destino directamente
+  // If there's a destination, dial it now (agent-attached outbound flow).
+  // The agent already picked up their phone; now we connect them to the target.
+  if (destination) {
+    console.log(`[OUTBOUND-CONNECT] Connecting agent to destination ${destination} via caller_id ${callerId}`);
+    const dial = twiml.dial({
+      callerId: callerId,
+      timeout: 60,
+      action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
+    });
+    dial.number(destination);
+  } else {
+    // Legacy flow: no destination, call was made directly to PSTN.
+    // Just keep the line open.
+    console.log(`[OUTBOUND-CONNECT] No destination param, legacy direct flow`);
+  }
+
   return twimlResponse(twiml);
 }
