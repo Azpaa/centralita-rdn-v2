@@ -73,7 +73,44 @@ export async function POST(req: NextRequest) {
 
     updates.status = mappedStatus;
 
-    // Para estados terminales que llegan aquí (sin dial-action previo)
+    // ── Emitir call.answered para outbound cuando el destino descuelga ────
+    // Twilio reporta 'in-progress' cuando la otra parte contesta.
+    // Para inbound esto ya se hace en agent-connect/whisper, pero para
+    // outbound NADIE lo emitía → RDN se quedaba en "Intentando".
+    if (callStatus === 'in-progress' && currentRecord?.direction === 'outbound') {
+      // Marcar answered_at si no lo tiene
+      if (!currentRecord.answered_at) {
+        updates.answeredAt = timestamp;
+      }
+
+      const agentUserId = currentRecord.answered_by_user_id ?? null;
+
+      // Resolver rdn_user_id del agente para que RDN pueda correlacionar
+      let rdnUserId: string | null = null;
+      if (agentUserId) {
+        const { data: agentData } = await supabase
+          .from('users')
+          .select('rdn_user_id')
+          .eq('id', agentUserId)
+          .single();
+        rdnUserId = (agentData as { rdn_user_id?: string } | null)?.rdn_user_id ?? null;
+      }
+
+      console.log(
+        `[STATUS] Outbound call answered — emitting call.answered call_sid=${callSid} agent=${agentUserId}`
+      );
+
+      emitEvent('call.answered', {
+        call_sid: callSid,
+        direction: 'outbound',
+        status: 'in_progress',
+        from: currentRecord.from_number ?? null,
+        to: currentRecord.to_number ?? null,
+        answered_by_user_id: agentUserId,
+        user_id: agentUserId,
+        rdn_user_id: rdnUserId,
+      });
+    }
     if (['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)) {
       if (!currentRecord?.ended_at) {
         updates.endedAt = timestamp;
