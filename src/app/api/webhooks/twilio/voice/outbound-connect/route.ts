@@ -39,21 +39,31 @@ export async function POST(req: NextRequest) {
   }
 
   if (shouldRecord) {
-    twiml.record({
-      recordingStatusCallback: `${baseUrl}/api/webhooks/twilio/recording/status`,
-      recordingStatusCallbackEvent: ['completed'],
-    });
+    // For legacy (no destination) calls, use standalone Record
+    if (!destination) {
+      twiml.record({
+        recordingStatusCallback: `${baseUrl}/api/webhooks/twilio/recording/status`,
+        recordingStatusCallbackEvent: ['completed'],
+      });
+    }
+    // For agent-attached calls, recording goes on the <Dial> verb below
   }
 
   // If there's a destination, dial it now (agent-attached outbound flow).
   // The agent already picked up their phone; now we connect them to the target.
   if (destination) {
     console.log(`[OUTBOUND-CONNECT] Connecting agent to destination ${destination} via caller_id ${callerId}`);
-    const dial = twiml.dial({
+    const dialOpts: Record<string, unknown> = {
       callerId: callerId,
       timeout: 60,
       action: `${baseUrl}/api/webhooks/twilio/voice/dial-action`,
-    });
+    };
+    if (shouldRecord) {
+      dialOpts.record = 'record-from-answer-dual';
+      dialOpts.recordingStatusCallback = `${baseUrl}/api/webhooks/twilio/recording/status`;
+      dialOpts.recordingStatusCallbackEvent = 'completed';
+    }
+    const dial = twiml.dial(dialOpts);
     dial.number(destination);
   } else {
     // Legacy flow: no destination, call was made directly to PSTN.
