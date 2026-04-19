@@ -170,7 +170,6 @@ export async function POST(req: NextRequest) {
         url: `${baseUrl}/api/webhooks/twilio/voice/outbound-connect?caller_id=${encodeURIComponent(from_number)}&destination=${encodeURIComponent(destination_number)}&user_id=${encodeURIComponent(resolvedAgent.id)}&source=${encodeURIComponent(commandSource)}`,
         statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        machineDetection: 'Enable',
         timeout: 30,
       });
 
