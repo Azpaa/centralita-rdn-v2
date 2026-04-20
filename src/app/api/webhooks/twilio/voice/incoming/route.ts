@@ -53,8 +53,8 @@ export async function POST(req: NextRequest) {
       return twimlResponse(twiml);
     }
 
-    // Registrar la llamada en DB
-    await createCallRecord({
+    // Registrar la llamada en DB — CRITICAL: sin registro, la llamada se pierde silenciosamente
+    const callRecordId = await createCallRecord({
       twilioCallSid: callSid,
       direction: 'inbound',
       fromNumber,
@@ -64,6 +64,25 @@ export async function POST(req: NextRequest) {
       phoneNumberId: route.phoneNumber.id,
       twilioData: params,
     });
+
+    if (!callRecordId) {
+      console.error(`[INCOMING] CRITICAL: createCallRecord failed for CallSid=${callSid} — cannot track call`);
+      // Emitir evento de alerta aunque no haya registro en DB
+      emitEvent('call.incoming', {
+        call_sid: callSid,
+        direction: 'inbound',
+        status: 'ringing',
+        from: fromNumber,
+        to: toNumber,
+        error: 'db_insert_failed',
+      });
+      twiml.say(
+        { language: 'es-ES', voice: 'Polly.Conchita' },
+        'Estamos experimentando problemas técnicos. Por favor, inténtelo de nuevo en unos segundos.'
+      );
+      twiml.hangup();
+      return twimlResponse(twiml);
+    }
 
     // Emitir evento call.incoming para RDN
     const candidateUserIds = (route.operators ?? []).map((op) => op.id);
@@ -301,6 +320,7 @@ export async function POST(req: NextRequest) {
     const twilioClient = getTwilioClient();
     const agentConnectBase = `${baseUrl}/api/webhooks/twilio/voice/agent-connect`;
 
+    const ringPromises: Promise<{ ok: boolean; target: string }>[] = [];
     for (const target of ringTargets) {
       const agentConnectUrl = new URL(agentConnectBase);
       agentConnectUrl.searchParams.set('conference', conferenceName);
@@ -315,30 +335,48 @@ export async function POST(req: NextRequest) {
       }
 
       // Ring agent's browser Device (Twilio Client)
-      twilioClient.calls.create({
-        to: `client:${target.id}`,
-        from: ringCallerId,
-        url: agentConnectUrl.toString(),
-        statusCallback: agentStatusCallbackUrl.toString(),
-        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        timeout: queue.ring_timeout,
-      }).catch((err) => {
-        console.warn(`[INCOMING] Failed to ring client:${target.id}: ${err.message}`);
-      });
-
-      // Also ring agent's phone if configured
-      if (target.phone) {
+      ringPromises.push(
         twilioClient.calls.create({
-          to: target.phone,
+          to: `client:${target.id}`,
           from: ringCallerId,
           url: agentConnectUrl.toString(),
           statusCallback: agentStatusCallbackUrl.toString(),
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           timeout: queue.ring_timeout,
-        }).catch((err) => {
-          console.warn(`[INCOMING] Failed to ring phone ${target.phone}: ${err.message}`);
-        });
+        }).then(() => ({ ok: true, target: `client:${target.id}` }))
+          .catch((err) => {
+            console.warn(`[INCOMING] Failed to ring client:${target.id}: ${err.message}`);
+            return { ok: false, target: `client:${target.id}` };
+          })
+      );
+
+      // Also ring agent's phone if configured
+      if (target.phone) {
+        ringPromises.push(
+          twilioClient.calls.create({
+            to: target.phone,
+            from: ringCallerId,
+            url: agentConnectUrl.toString(),
+            statusCallback: agentStatusCallbackUrl.toString(),
+            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+            timeout: queue.ring_timeout,
+          }).then(() => ({ ok: true, target: target.phone! }))
+            .catch((err) => {
+              console.warn(`[INCOMING] Failed to ring phone ${target.phone}: ${err.message}`);
+              return { ok: false, target: target.phone! };
+            })
+        );
       }
+    }
+
+    // Wait for all ring attempts and check at least one succeeded
+    const ringResults = await Promise.all(ringPromises);
+    const anyRingOk = ringResults.some(r => r.ok);
+    if (!anyRingOk && ringResults.length > 0) {
+      console.error(`[INCOMING] ALL ring attempts failed for CallSid=${callSid} — redirecting to retry`);
+      twiml.pause({ length: 3 });
+      twiml.redirect({ method: 'POST' }, `${baseUrl}/api/webhooks/twilio/voice/queue-retry`);
+      return twimlResponse(twiml);
     }
 
     // Advance round-robin index

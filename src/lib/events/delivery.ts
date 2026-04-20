@@ -303,11 +303,25 @@ async function runDeliveryAttempt(params: {
   subscription.failure_count = nextFailureCount;
 
   if (nextFailureCount >= 50) {
-    console.warn(`[DELIVERY] Disabling subscription ${subscription.id} - too many failures`);
+    console.error(`[DELIVERY] CRITICAL: Disabling subscription ${subscription.id} - ${nextFailureCount} consecutive failures. RDN will NOT receive events until re-enabled!`);
     await supabase
       .from('webhook_subscriptions')
       .update({ active: false })
       .eq('id', subscription.id);
+
+    // Emit alert so SSE-connected admins see it immediately
+    try {
+      const { emitEvent } = await import('@/lib/events/emitter');
+      emitEvent('webhook.subscription_disabled', {
+        subscription_id: subscription.id,
+        url: subscription.url,
+        failure_count: nextFailureCount,
+        reason: 'max_consecutive_failures',
+        action_required: 'Re-enable subscription manually or recreate',
+      });
+    } catch (_alertErr) {
+      // Best-effort — don't let alert emission break delivery flow
+    }
   }
 
   console.warn(

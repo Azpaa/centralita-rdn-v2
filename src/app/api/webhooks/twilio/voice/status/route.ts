@@ -9,6 +9,7 @@ import type { CallRecord, CallStatus } from '@/lib/types/database';
 
 // Terminal states: once dial-action sets one of these, do not overwrite.
 const TERMINAL_STATUSES: CallStatus[] = ['completed', 'no_answer', 'busy', 'failed', 'canceled'];
+const TERMINAL_WEBHOOK_STATUSES = ['completed', 'busy', 'no-answer', 'failed', 'canceled'];
 
 type StatusRecord = Pick<
   CallRecord,
@@ -17,6 +18,10 @@ type StatusRecord = Pick<
 
 function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
   return [...new Set(values.map((value) => (value || '').trim()).filter(Boolean))];
+}
+
+function isTerminalWebhookStatus(status: string): boolean {
+  return TERMINAL_WEBHOOK_STATUSES.includes(status);
 }
 
 async function resolveTrackedCallForStatus(params: {
@@ -171,11 +176,27 @@ export async function POST(req: NextRequest) {
             );
             return new NextResponse('OK', { status: 200 });
           } catch (advanceErr) {
-            console.warn(
+            console.error(
               `[STATUS] Round-robin advance failed parent_call_sid=${routedParentCallSid}: ${
                 advanceErr instanceof Error ? advanceErr.message : 'unknown_error'
-              }`
+              } — scheduling fallback retry`
             );
+            // Retry the redirect after a short delay
+            try {
+              const client2 = getTwilioClient();
+              await new Promise(resolve => setTimeout(resolve, 2000));
+              await client2.calls(routedParentCallSid).update({
+                url: `${baseUrl}/api/webhooks/twilio/voice/queue-retry`,
+                method: 'POST',
+              });
+              console.log(`[STATUS] Fallback round-robin retry succeeded for ${routedParentCallSid}`);
+            } catch (retryErr) {
+              console.error(
+                `[STATUS] Fallback round-robin retry also failed for ${routedParentCallSid}: ${
+                  retryErr instanceof Error ? retryErr.message : 'unknown_error'
+                }`
+              );
+            }
           }
         }
       }
@@ -195,7 +216,7 @@ export async function POST(req: NextRequest) {
     // The parent call (caller in conference) is still alive — do NOT mark it terminal.
     // Only round-robin advance (handled above) and agent-connect should touch the parent.
     const isAgentLeg = rawCallSid !== trackedCallSid;
-    const isAgentLegTerminal = isAgentLeg && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus);
+    const isAgentLegTerminal = isAgentLeg && isTerminalWebhookStatus(callStatus);
     const parentStillWaiting = currentStatus === 'ringing' || currentStatus === 'in_queue' || currentStatus === 'in_progress';
 
     if (isAgentLegTerminal && parentStillWaiting) {
@@ -203,6 +224,30 @@ export async function POST(req: NextRequest) {
         `[STATUS] Ignoring agent-leg terminal status — raw_call_sid=${rawCallSid} tracked_call_sid=${trackedCallSid} agent_status=${callStatus} parent_status=${currentStatus}`
       );
       return new NextResponse('OK', { status: 200 });
+    }
+
+    // Safety net for false terminal callbacks:
+    // if we are marked in_progress but Twilio still reports the tracked leg as live,
+    // ignore this callback to avoid cutting calls during remote hold/transfer flows.
+    if (currentStatus === 'in_progress' && isTerminalWebhookStatus(callStatus)) {
+      try {
+        const live = await getTwilioClient().calls(trackedCallSid).fetch();
+        const liveStatus = (live.status || '').toLowerCase();
+        const liveIsTerminal = isTerminalWebhookStatus(liveStatus);
+
+        if (!liveIsTerminal) {
+          console.log(
+            `[STATUS] Ignoring stale terminal callback call_sid=${trackedCallSid} callback_status=${callStatus} live_status=${liveStatus}`
+          );
+          return new NextResponse('OK', { status: 200 });
+        }
+      } catch (liveErr) {
+        console.warn(
+          `[STATUS] Could not verify live call status for ${trackedCallSid}: ${
+            liveErr instanceof Error ? liveErr.message : 'unknown_error'
+          }`
+        );
+      }
     }
 
     const statusMap: Record<string, string> = {
@@ -255,7 +300,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    if (['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)) {
+    if (isTerminalWebhookStatus(callStatus)) {
       if (!currentRecord?.ended_at) {
         updates.endedAt = timestamp;
       }
@@ -269,7 +314,7 @@ export async function POST(req: NextRequest) {
 
     await updateCallStatus(trackedCallSid, updates);
 
-    const isTerminalFromStatus = ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus);
+    const isTerminalFromStatus = isTerminalWebhookStatus(callStatus);
     if (isTerminalFromStatus && currentRecord) {
       const direction = currentRecord?.direction || 'outbound';
       const terminalStatus = mappedStatus;

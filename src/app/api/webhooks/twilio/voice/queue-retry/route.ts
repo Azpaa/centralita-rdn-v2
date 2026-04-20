@@ -244,6 +244,7 @@ export async function POST(req: NextRequest) {
     const twilioClient = getTwilioClient();
     const agentConnectBase = `${baseUrl}/api/webhooks/twilio/voice/agent-connect`;
 
+    const ringPromises: Promise<{ ok: boolean; target: string }>[] = [];
     for (const target of ringTargets) {
       const agentConnectUrl = new URL(agentConnectBase);
       agentConnectUrl.searchParams.set('conference', conferenceName);
@@ -258,30 +259,48 @@ export async function POST(req: NextRequest) {
       }
 
       // Ring agent's browser Device
-      twilioClient.calls.create({
-        to: `client:${target.id}`,
-        from: ringCallerId,
-        url: agentConnectUrl.toString(),
-        statusCallback: agentStatusCallbackUrl.toString(),
-        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        timeout: activeQueue.ring_timeout,
-      }).catch((err) => {
-        console.warn(`[QUEUE-RETRY] Failed to ring client:${target.id}: ${err.message}`);
-      });
-
-      // Also ring agent's phone if configured
-      if (target.phone) {
+      ringPromises.push(
         twilioClient.calls.create({
-          to: target.phone,
+          to: `client:${target.id}`,
           from: ringCallerId,
           url: agentConnectUrl.toString(),
           statusCallback: agentStatusCallbackUrl.toString(),
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           timeout: activeQueue.ring_timeout,
-        }).catch((err) => {
-          console.warn(`[QUEUE-RETRY] Failed to ring phone ${target.phone}: ${err.message}`);
-        });
+        }).then(() => ({ ok: true, target: `client:${target.id}` }))
+          .catch((err) => {
+            console.warn(`[QUEUE-RETRY] Failed to ring client:${target.id}: ${err.message}`);
+            return { ok: false, target: `client:${target.id}` };
+          })
+      );
+
+      // Also ring agent's phone if configured
+      if (target.phone) {
+        ringPromises.push(
+          twilioClient.calls.create({
+            to: target.phone,
+            from: ringCallerId,
+            url: agentConnectUrl.toString(),
+            statusCallback: agentStatusCallbackUrl.toString(),
+            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+            timeout: activeQueue.ring_timeout,
+          }).then(() => ({ ok: true, target: target.phone! }))
+            .catch((err) => {
+              console.warn(`[QUEUE-RETRY] Failed to ring phone ${target.phone}: ${err.message}`);
+              return { ok: false, target: target.phone! };
+            })
+        );
       }
+    }
+
+    // Check at least one ring succeeded — if all failed, retry immediately
+    const ringResults = await Promise.all(ringPromises);
+    const anyRingOk = ringResults.some(r => r.ok);
+    if (!anyRingOk && ringResults.length > 0) {
+      console.error(`[QUEUE-RETRY] ALL ring attempts failed for CallSid=${callSid} — retrying in 5s`);
+      twiml.pause({ length: 5 });
+      twiml.redirect({ method: 'POST' }, `${baseUrl}/api/webhooks/twilio/voice/queue-retry`);
+      return twimlResponse(twiml);
     }
 
     if (activeQueue.strategy !== 'ring_all') {
@@ -320,11 +339,24 @@ export async function POST(req: NextRequest) {
     return twimlResponse(twiml);
   } catch (err) {
     console.error('[QUEUE-RETRY] Error:', err);
-    twiml.say(
-      { language: 'es-ES', voice: 'Polly.Conchita' },
-      'Estamos experimentando problemas técnicos. Por favor, inténtelo más tarde.'
-    );
-    twiml.hangup();
+    // En vez de colgar, reintentar — el llamante sigue en conferencia esperando.
+    // Solo colgar si llevamos demasiados errores consecutivos (safety net).
+    const retryErrorCount = parseInt(new URL(req.url).searchParams.get('_ec') || '0', 10) + 1;
+    if (retryErrorCount >= 3) {
+      console.error(`[QUEUE-RETRY] Too many consecutive errors (${retryErrorCount}) — hanging up ${callSid}`);
+      twiml.say(
+        { language: 'es-ES', voice: 'Polly.Conchita' },
+        'Estamos experimentando problemas técnicos. Por favor, inténtelo más tarde.'
+      );
+      twiml.hangup();
+    } else {
+      console.warn(`[QUEUE-RETRY] Transient error (attempt ${retryErrorCount}/3) — retrying for ${callSid}`);
+      twiml.pause({ length: 3 });
+      twiml.redirect(
+        { method: 'POST' },
+        `${baseUrl}/api/webhooks/twilio/voice/queue-retry?_ec=${retryErrorCount}`
+      );
+    }
     return twimlResponse(twiml);
   }
 }
