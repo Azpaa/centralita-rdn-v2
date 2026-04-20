@@ -75,7 +75,7 @@ X-Centralita-Timestamp: 2026-04-03T10:05:30.000Z
 
 Recomendacion RDN:
 - deduplicar por `delivery_id` (tecnico)
-- proteger negocio por `event_id` + `event` + entidad (`call_sid`)
+- proteger negocio por `event_id` + `event` + entidad (`call_sid`) y, cuando aplique, usuario destino (`user_id` o `rdn_user_id`)
 
 ### 3.3 Retries (persistentes)
 
@@ -433,7 +433,8 @@ Envia evento `test.ping` firmado.
 
 | Evento | Estado | Cuando se emite | Campos principales |
 |---|---|---|---|
-| `call.incoming` | Operativo | Entrada de llamada | `call_sid`, `from`, `to`, `queue_id`, `phone_number_id`, `route_type` |
+| `call.incoming` | Operativo | Entrada de llamada | `call_sid`, `from`, `to`, `queue_id`, `phone_number_id`, `route_type`, `ring_strategy`, `candidate_user_ids`, `candidate_rdn_user_ids` |
+| `call.ringing` | Operativo | Intento de timbrado hacia agente destino | `call_sid`, `user_id`, `rdn_user_id`, `ring_strategy`, `queue_id`, `phone_number_id` |
 | `call.completed` | Operativo | Dial finaliza con conversacion | `call_sid`, `direction`, `status`, `duration`, `wait_time`, `answered_at`, `ended_at` |
 | `call.missed` | Operativo | Llamada inbound no contestada/fallida | `call_sid`, `direction`, `final_status`, `queue_id` |
 | `call.transferred` | Operativo | Transferencia ejecutada | `call_sid`, `remote_call_sid`, `destination`, `transferred_by` |
@@ -447,11 +448,20 @@ Envia evento `test.ping` firmado.
 
 Estos patrones pueden existir en validacion de suscripcion, pero **no deben asumirse activos**:
 
-- `call.ringing`
 - `call.answered`
 - `agent.online`
 - `agent.offline`
 - `agent.busy`
+
+## 6.3 Semantica multiusuario (ring_all) para RDN
+
+Esta seccion es contractual para consumo de webhooks de entrada:
+
+- `call.incoming` se emite una vez por entrada de llamada e incluye candidatos (`candidate_user_ids`, `candidate_rdn_user_ids`) y estrategia (`ring_strategy`).
+- Con `ring_strategy=ring_all`, `call.ringing` se emite una vez por cada usuario destino en el intento actual.
+- En reintentos de cola puede volver a emitirse otro lote de `call.ringing` para la misma `call_sid`.
+- No colapsar `call.ringing` solo por `call_sid`; distinguir por `user_id`/`rdn_user_id` y por `event_id`.
+- Mantener idempotencia tecnica por `delivery_id` como regla primaria de transporte.
 
 ## 7. Formato webhook
 
@@ -482,6 +492,26 @@ Body:
     "wait_time": 15,
     "answered_at": "2026-04-03T10:00:15.000Z",
     "ended_at": "2026-04-03T10:05:30.000Z"
+  }
+}
+```
+
+Ejemplo de `call.ringing` en `ring_all`:
+
+```json
+{
+  "event_id": "d3c9f9f2-1f31-4f5b-a991-5dd1f1f5cd9e",
+  "event": "call.ringing",
+  "timestamp": "2026-04-20T12:22:05.195Z",
+  "data": {
+    "call_sid": "CAxxxxxxxx",
+    "direction": "inbound",
+    "status": "ringing",
+    "ring_strategy": "ring_all",
+    "queue_id": "uuid-cola",
+    "phone_number_id": "uuid-numero",
+    "user_id": "uuid-agente",
+    "rdn_user_id": "uuid-rdn-agente"
   }
 }
 ```

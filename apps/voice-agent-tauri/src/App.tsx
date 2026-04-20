@@ -35,6 +35,9 @@ const REMOTE_ACCEPT_RETRY_DELAY_MS = 350;
 const REMOTE_ACCEPT_MAX_ATTEMPTS = 5;
 const REMOTE_COMMAND_TTL_MS = 10 * 60_000;
 const REMOTE_COMMAND_MAX_TRACKED = 200;
+const INCOMING_RING_BEEP_INTERVAL_MS = 1500;
+const INCOMING_RING_BEEP_DURATION_MS = 240;
+const INCOMING_RING_BEEP_FREQUENCY_HZ = 900;
 
 type StreamStatus = 'connecting' | 'connected' | 'disconnected';
 
@@ -141,6 +144,15 @@ export default function App() {
   const availabilitySyncInFlightRef = useRef(false);
   const lastSyncedAvailabilityRef = useRef<boolean | null>(null);
   const reconnectVoiceRef = useRef<() => Promise<void>>(async () => {});
+  const ringtoneRef = useRef<{
+    context: AudioContext | null;
+    interval: ReturnType<typeof setInterval> | null;
+    active: boolean;
+  }>({
+    context: null,
+    interval: null,
+    active: false,
+  });
 
   useEffect(() => {
     accessTokenRef.current = accessToken;
@@ -334,6 +346,61 @@ export default function App() {
 
   const handleVoiceInfo = useCallback((info: string) => {
     setMessage(info);
+  }, []);
+
+  const stopIncomingRingtone = useCallback(() => {
+    const state = ringtoneRef.current;
+    state.active = false;
+    if (state.interval) {
+      clearInterval(state.interval);
+      state.interval = null;
+    }
+  }, []);
+
+  const startIncomingRingtone = useCallback(async () => {
+    const state = ringtoneRef.current;
+    if (state.active) return;
+    if (typeof window === 'undefined' || typeof window.AudioContext === 'undefined') return;
+
+    if (!state.context) {
+      state.context = new window.AudioContext();
+    }
+
+    const context = state.context;
+    if (context.state === 'suspended') {
+      try {
+        await context.resume();
+      } catch {
+        return;
+      }
+    }
+
+    const playBeep = () => {
+      if (!state.active) return;
+      if (context.state === 'closed') return;
+
+      const osc = context.createOscillator();
+      const gain = context.createGain();
+      const now = context.currentTime;
+      const durationSec = INCOMING_RING_BEEP_DURATION_MS / 1000;
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(INCOMING_RING_BEEP_FREQUENCY_HZ, now);
+
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.12, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + durationSec);
+
+      osc.connect(gain);
+      gain.connect(context.destination);
+
+      osc.start(now);
+      osc.stop(now + durationSec + 0.02);
+    };
+
+    state.active = true;
+    playBeep();
+    state.interval = setInterval(playBeep, INCOMING_RING_BEEP_INTERVAL_MS);
   }, []);
 
   const voice = useVoiceEngine({
@@ -915,7 +982,28 @@ export default function App() {
     if (supabase) {
       (supabase.auth as typeof supabase.auth & { stopAutoRefresh?: () => void }).stopAutoRefresh?.();
     }
-  }, []);
+    stopIncomingRingtone();
+    const context = ringtoneRef.current.context;
+    if (context && context.state !== 'closed') {
+      void context.close().catch(() => {});
+    }
+    ringtoneRef.current.context = null;
+  }, [stopIncomingRingtone]);
+
+  const hasIncomingRingingCalls = useMemo(() => (
+    calls.some((call) => (
+      call.direction === 'inbound'
+      && (call.status === 'ringing' || call.status === 'in_queue')
+    ))
+  ), [calls]);
+
+  useEffect(() => {
+    if (hasIncomingRingingCalls) {
+      void startIncomingRingtone();
+      return;
+    }
+    stopIncomingRingtone();
+  }, [hasIncomingRingingCalls, startIncomingRingtone, stopIncomingRingtone]);
 
   const streamBadge = useMemo(() => {
     if (streamStatus === 'connected') return 'Stream conectado';
