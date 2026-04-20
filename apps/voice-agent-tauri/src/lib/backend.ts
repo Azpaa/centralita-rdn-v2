@@ -140,7 +140,7 @@ export async function consumeSseStream(params: {
   const { baseUrl, jwt, onEvent, onStatus, signal } = params;
   onStatus('connecting');
 
-  const response = await fetch(`${baseUrl}/api/v1/stream/events?scope=mine`, {
+  const response = await fetch(`${baseUrl}/api/v1/stream/events?scope=mine&client=voice_agent_desktop`, {
     method: 'GET',
     headers: {
       Authorization: `Bearer ${jwt}`,

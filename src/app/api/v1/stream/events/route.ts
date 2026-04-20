@@ -58,6 +58,13 @@ export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const scopeParam = searchParams.get('scope');
   const requestedUserId = searchParams.get('user_id');
+  const clientParam = searchParams.get('client');
+  const normalizedClientKind = (
+    clientParam
+    && /^[a-z0-9._-]{1,64}$/i.test(clientParam)
+  )
+    ? clientParam.toLowerCase()
+    : null;
 
   let receiveAll = false;
   let targetUserId: string | null = null;
@@ -162,6 +169,7 @@ export async function GET(req: NextRequest) {
       unsubscribe = subscribeCanonicalClientEvents({
         receiveAll,
         targetUserId,
+        clientKind: normalizedClientKind,
         onEvent: (event) => send(event),
       });
 

@@ -32,6 +32,7 @@ export type BootstrapPayload = {
 
 export type AgentStateSnapshot = {
   user_id: string;
+  available?: boolean;
   operational_status: BackendOperationalStatus;
   active_calls_count: number;
   active_calls: Array<{

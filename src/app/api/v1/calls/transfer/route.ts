@@ -11,6 +11,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 type TransferCallRecordRow = {
   twilio_call_sid: string | null;
   twilio_data: Record<string, unknown> | null;
+  answered_by_user_id?: string | null;
 };
 
 function normalizeSid(value: unknown): string | null {
@@ -269,6 +270,46 @@ export async function POST(req: NextRequest) {
         await client.calls(legToComplete).update({ status: 'completed' });
       } catch {
         // Ya estaba desconectada.
+      }
+    }
+
+    // 9) Liberar ownership del agente para que pueda recibir nuevas llamadas
+    // sin esperar a que finalice la llamada transferida.
+    const transferRecordSid = originalCallSid || effectiveCallSid;
+    if (transferRecordSid) {
+      const { data: transferRecord } = await supabase
+        .from('call_records')
+        .select('answered_by_user_id, twilio_data')
+        .eq('twilio_call_sid', transferRecordSid)
+        .maybeSingle();
+
+      if (transferRecord) {
+        const transferAt = new Date().toISOString();
+        const transferRecordRow = transferRecord as TransferCallRecordRow;
+        const currentTwilioData = (transferRecordRow.twilio_data && typeof transferRecordRow.twilio_data === 'object')
+          ? transferRecordRow.twilio_data
+          : {};
+        const transferredByUser = auth.userId ?? null;
+
+        await supabase
+          .from('call_records')
+          .update({
+            status: 'forwarded',
+            answered_by_user_id: null,
+            twilio_data: {
+              ...currentTwilioData,
+              transfer_destination: destination,
+              transferred_at: transferAt,
+              transferred_by_user_id: transferredByUser,
+              transfer_previous_answered_by_user_id: transferRecordRow.answered_by_user_id ?? null,
+              transfer_agent_call_sid: legToComplete ?? agentCallSid ?? null,
+              transfer_agent_released: true,
+              transfer_agent_released_at: transferAt,
+            },
+          })
+          .eq('twilio_call_sid', transferRecordSid);
+
+        console.log(`[TRANSFER] Agent released for new queue calls: ${transferRecordSid}`);
       }
     }
 

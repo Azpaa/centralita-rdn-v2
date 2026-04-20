@@ -7,6 +7,20 @@ import { emitEvent } from '@/lib/events/emitter';
 import { getTwilioClient } from '@/lib/twilio/client';
 import type { CallRecord, PhoneNumber, Queue } from '@/lib/types/database';
 
+function resolveQueueWaitUrl(baseUrl: string, waitMusicUrl?: string | null): string {
+  const normalized = (waitMusicUrl || '').trim();
+  if (!normalized) {
+    return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
+  }
+
+  const lowered = normalized.toLowerCase();
+  if (lowered === 'none' || lowered === 'silent' || lowered === 'off') {
+    return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
+  }
+
+  return normalized;
+}
+
 /**
  * POST /api/webhooks/twilio/voice/queue-retry
  * Endpoint de reintento de cola. Se llama cuando dial-action detecta que
@@ -31,7 +45,7 @@ export async function POST(req: NextRequest) {
     // 1. Buscar el call record
     const { data: callRecord } = await supabase
       .from('call_records')
-      .select('queue_id, from_number, to_number, phone_number_id, started_at')
+      .select('queue_id, from_number, to_number, phone_number_id, started_at, twilio_data')
       .eq('twilio_call_sid', callSid)
       .single();
 
@@ -46,6 +60,29 @@ export async function POST(req: NextRequest) {
       twiml.hangup();
       return twimlResponse(twiml);
     }
+
+    const mergeRoutingMetadata = async (payload: Record<string, unknown>) => {
+      const existingData = (
+        record.twilio_data
+        && typeof record.twilio_data === 'object'
+        && !Array.isArray(record.twilio_data)
+      )
+        ? (record.twilio_data as Record<string, unknown>)
+        : {};
+
+      const mergedData = {
+        ...existingData,
+        ...payload,
+        last_routing_at: new Date().toISOString(),
+      };
+
+      await supabase
+        .from('call_records')
+        .update({ twilio_data: mergedData })
+        .eq('twilio_call_sid', callSid);
+
+      (record as CallRecord).twilio_data = mergedData;
+    };
 
     // 2. Obtener cola y operadores disponibles
     const queueData = await getQueueWithOperators(record.queue_id);
@@ -122,6 +159,12 @@ export async function POST(req: NextRequest) {
     }
 
     if (!queueData || !queueData.queue || queueData.operators.length === 0) {
+      await mergeRoutingMetadata({
+        candidate_user_ids: [],
+        current_ring_target_user_ids: [],
+        incoming_conference_request: true,
+        routing_source: 'queue_retry_waiting_no_targets',
+      });
       // No hay operadores disponibles → mensaje de espera y reintentar en unos segundos
       console.log(`[QUEUE-RETRY] No operators available, waiting and retrying...`);
       twiml.say(
@@ -192,6 +235,14 @@ export async function POST(req: NextRequest) {
 
     // 5. Conference-based approach: ring agents via REST API, put caller back in conference
     const conferenceName = `call-${callSid}`;
+    const conferenceWaitUrl = resolveQueueWaitUrl(baseUrl, activeQueue.wait_music_url);
+    await mergeRoutingMetadata({
+      candidate_user_ids: operators.map((operator) => operator.id),
+      current_ring_target_user_ids: ringTargets.map((target) => target.id),
+      conference_name: conferenceName,
+      incoming_conference_request: true,
+      routing_source: 'queue_retry',
+    });
     // IMPORTANT: use our Twilio DID as callerId/from for re-ring attempts.
     // Using the external caller number can make Twilio reject these outbound legs.
     const ringCallerId = record.to_number || record.from_number;
@@ -256,7 +307,7 @@ export async function POST(req: NextRequest) {
         startConferenceOnEnter: true,
         endConferenceOnExit: true,
         beep: 'false' as const,
-        waitUrl: 'http://twimlets.com/holdmusic?Bucket=com.twilio.music.ambient',
+        waitUrl: conferenceWaitUrl,
         maxParticipants: 10,
         statusCallbackEvent: ['join', 'leave', 'end'],
         statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,

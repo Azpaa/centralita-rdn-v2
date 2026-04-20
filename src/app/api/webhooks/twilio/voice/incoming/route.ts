@@ -5,6 +5,20 @@ import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-a
 import { emitEvent } from '@/lib/events/emitter';
 import { getTwilioClient } from '@/lib/twilio/client';
 
+function resolveQueueWaitUrl(baseUrl: string, waitMusicUrl?: string | null): string {
+  const normalized = (waitMusicUrl || '').trim();
+  if (!normalized) {
+    return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
+  }
+
+  const lowered = normalized.toLowerCase();
+  if (lowered === 'none' || lowered === 'silent' || lowered === 'off') {
+    return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
+  }
+
+  return normalized;
+}
+
 /**
  * POST /api/webhooks/twilio/voice/incoming
  * Punto de entrada principal para llamadas entrantes.
@@ -184,8 +198,45 @@ export async function POST(req: NextRequest) {
       .update({ status: 'in_queue' })
       .eq('twilio_call_sid', callSid);
 
+    const mergeRoutingMetadata = async (payload: Record<string, unknown>) => {
+      const { data: existingRow } = await supabase
+        .from('call_records')
+        .select('twilio_data')
+        .eq('twilio_call_sid', callSid)
+        .maybeSingle();
+
+      const existingData = (
+        existingRow
+        && typeof existingRow === 'object'
+        && 'twilio_data' in existingRow
+        && existingRow.twilio_data
+        && typeof existingRow.twilio_data === 'object'
+        && !Array.isArray(existingRow.twilio_data)
+      )
+        ? (existingRow.twilio_data as Record<string, unknown>)
+        : {};
+
+      await supabase
+        .from('call_records')
+        .update({
+          twilio_data: {
+            ...existingData,
+            ...payload,
+            last_routing_at: new Date().toISOString(),
+          },
+        })
+        .eq('twilio_call_sid', callSid);
+    };
+
     // Si no hay operadores libres en este momento, enviar al bucle de espera
     if (operators.length === 0) {
+      await mergeRoutingMetadata({
+        candidate_user_ids: [],
+        current_ring_target_user_ids: [],
+        incoming_conference_request: true,
+        routing_source: 'incoming_waiting_no_targets',
+      });
+
       console.log(`[INCOMING] No free operators for queue ${queue.id}, sending to retry loop`);
       twiml.say(
         { language: 'es-ES', voice: 'Polly.Conchita' },
@@ -207,6 +258,14 @@ export async function POST(req: NextRequest) {
 
     // Conference name for this call — used by SSE events, REST rings, and caller dial
     const conferenceName = `call-${callSid}`;
+    const conferenceWaitUrl = resolveQueueWaitUrl(baseUrl, queue.wait_music_url);
+    await mergeRoutingMetadata({
+      candidate_user_ids: operators.map((operator) => operator.id),
+      current_ring_target_user_ids: ringTargets.map((target) => target.id),
+      conference_name: conferenceName,
+      incoming_conference_request: true,
+      routing_source: 'incoming_initial',
+    });
 
     if (ringTargets.length > 0) {
       console.log(
@@ -304,7 +363,7 @@ export async function POST(req: NextRequest) {
         startConferenceOnEnter: true,
         endConferenceOnExit: true,
         beep: 'false' as const,
-        waitUrl: 'http://twimlets.com/holdmusic?Bucket=com.twilio.music.ambient',
+        waitUrl: conferenceWaitUrl,
         maxParticipants: 10,
         statusCallbackEvent: ['join', 'leave', 'end'],
         statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,

@@ -20,6 +20,11 @@ async function ensureDir(dirPath) {
   await fs.mkdir(dirPath, { recursive: true });
 }
 
+async function resetDir(dirPath) {
+  await fs.rm(dirPath, { recursive: true, force: true });
+  await ensureDir(dirPath);
+}
+
 async function listFilesRecursive(rootDir) {
   const entries = await fs.readdir(rootDir, { withFileTypes: true });
   const files = [];
@@ -47,7 +52,7 @@ function toPosixPath(inputPath) {
   return inputPath.replace(/\\/g, '/');
 }
 
-function pickPrimaryWindowsInstaller(files) {
+function pickPrimaryWindowsInstaller(files, version) {
   const exeFiles = files.filter((file) => file.toLowerCase().endsWith('.exe'));
   if (exeFiles.length === 0) return null;
 
@@ -57,8 +62,13 @@ function pickPrimaryWindowsInstaller(files) {
   });
 
   const candidates = setupPreferred.length > 0 ? setupPreferred : exeFiles;
-  candidates.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
-  return candidates[0];
+  const normalizedVersion = String(version ?? '').trim().toLowerCase();
+  const versionMatched = normalizedVersion
+    ? candidates.filter((file) => path.basename(file).toLowerCase().includes(normalizedVersion))
+    : [];
+  const finalCandidates = versionMatched.length > 0 ? versionMatched : candidates;
+  finalCandidates.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+  return finalCandidates[0];
 }
 
 function findSignatureForInstaller(installerPath, files) {
@@ -86,7 +96,7 @@ async function main() {
     process.exit(1);
   }
 
-  const installerPath = pickPrimaryWindowsInstaller(files);
+  const installerPath = pickPrimaryWindowsInstaller(files, version);
   if (!installerPath) {
     console.error('[voice-agent] No se encontro instalador .exe en bundle.');
     console.error(`[voice-agent] Revisa que exista build en: ${BUNDLE_DIR}`);
@@ -97,7 +107,7 @@ async function main() {
   const installerFileName = path.basename(installerPath);
   const arch = inferArch(installerFileName);
   const versionDir = path.resolve(PUBLIC_DOWNLOADS_BASE, `v${version}`);
-  await ensureDir(versionDir);
+  await resetDir(versionDir);
 
   const installerTarget = path.resolve(versionDir, installerFileName);
   await fs.copyFile(installerPath, installerTarget);
@@ -148,4 +158,3 @@ main().catch((err) => {
   console.error('[voice-agent] Error publicando release:', err);
   process.exit(1);
 });
-

@@ -264,9 +264,11 @@ export default function App() {
   ) => {
     if (!backendUrl || !accessTokenRef.current) return;
     const userId = agentState?.user_id;
+    const backendAvailability = agentState?.available;
     if (!userId) return;
     if (availabilitySyncInFlightRef.current) return;
-    if (lastSyncedAvailabilityRef.current === nextAvailable) return;
+    const backendAlreadySynced = backendAvailability === nextAvailable;
+    if (lastSyncedAvailabilityRef.current === nextAvailable && backendAlreadySynced) return;
 
     availabilitySyncInFlightRef.current = true;
     try {
@@ -283,7 +285,7 @@ export default function App() {
     } finally {
       availabilitySyncInFlightRef.current = false;
     }
-  }, [agentState?.user_id, backendUrl, withJwtRetry]);
+  }, [agentState?.available, agentState?.user_id, backendUrl, withJwtRetry]);
 
   const refreshAgentSnapshot = useCallback(async (reason: string) => {
     if (!backendUrl || !accessTokenRef.current) return;
@@ -357,6 +359,23 @@ export default function App() {
       || voice.deviceStatus === 'reconnecting';
 
     void syncAvailability(shouldBeAvailable, `voice:${voice.deviceStatus}`);
+  }, [accessToken, agentState?.user_id, syncAvailability, voice.deviceStatus]);
+
+  useEffect(() => {
+    if (!accessToken || !agentState?.user_id) return;
+    const shouldBeAvailable =
+      voice.deviceStatus === 'connected'
+      || voice.deviceStatus === 'registering'
+      || voice.deviceStatus === 'reconnecting';
+    if (!shouldBeAvailable) return;
+
+    const interval = setInterval(() => {
+      void syncAvailability(true, 'desktop_presence_keepalive');
+    }, 20_000);
+
+    return () => {
+      clearInterval(interval);
+    };
   }, [accessToken, agentState?.user_id, syncAvailability, voice.deviceStatus]);
 
   useEffect(() => {

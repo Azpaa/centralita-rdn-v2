@@ -33,6 +33,7 @@ type StreamSubscriber = {
   id: string;
   receiveAll: boolean;
   targetUserId: string | null;
+  clientKind: string | null;
   onEvent: (event: CanonicalClientEvent) => void;
 };
 
@@ -200,6 +201,7 @@ export function publishCanonicalClientEventFromDomain(
 export function subscribeCanonicalClientEvents(params: {
   receiveAll: boolean;
   targetUserId: string | null;
+  clientKind?: string | null;
   onEvent: (event: CanonicalClientEvent) => void;
 }): () => void {
   const bus = getBusState();
@@ -207,6 +209,7 @@ export function subscribeCanonicalClientEvents(params: {
     id: crypto.randomUUID(),
     receiveAll: params.receiveAll,
     targetUserId: params.targetUserId,
+    clientKind: params.clientKind ?? null,
     onEvent: params.onEvent,
   };
 
@@ -215,4 +218,25 @@ export function subscribeCanonicalClientEvents(params: {
   return () => {
     bus.subscribers.delete(subscriber.id);
   };
+}
+
+const DESKTOP_CLIENT_KINDS = new Set([
+  'voice_agent_desktop',
+  'tauri_voice_agent',
+  'tauri_desktop',
+]);
+
+function isDesktopClientKind(clientKind: string | null): boolean {
+  if (!clientKind) return false;
+  return DESKTOP_CLIENT_KINDS.has(clientKind.toLowerCase());
+}
+
+export function hasActiveDesktopStreamForUser(userId: string): boolean {
+  const bus = getBusState();
+  for (const subscriber of bus.subscribers.values()) {
+    if (subscriber.targetUserId !== userId) continue;
+    if (!isDesktopClientKind(subscriber.clientKind)) continue;
+    return true;
+  }
+  return false;
 }

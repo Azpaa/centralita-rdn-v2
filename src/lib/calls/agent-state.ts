@@ -111,10 +111,20 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
     .order('started_at', { ascending: false })
     .limit(25);
 
+  // Ringing/in_queue calls currently targeted to this user (conference pre-answer routing).
+  const targetedPendingCallsQuery = await supabase
+    .from('call_records')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data')
+    .in('status', ['ringing', 'in_queue'] as CallRecord['status'][])
+    .contains('twilio_data', { current_ring_target_user_ids: [userId] })
+    .order('started_at', { ascending: false })
+    .limit(25);
+
   const rows = [
     ...(answeredCallsQuery.data || []),
     ...(resolvedAgentCallsQuery.data || []),
     ...(initiatedCallsQuery.data || []),
+    ...(targetedPendingCallsQuery.data || []),
   ] as MinimalCallRecordRow[];
 
   const byId = new Map<string, MinimalCallRecordRow>();
@@ -157,4 +167,3 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
     source_of_truth: 'backend_call_records',
   };
 }
-

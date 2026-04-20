@@ -4,6 +4,7 @@
  */
 
 import { createAdminClient } from '@/lib/supabase/admin';
+import { hasActiveDesktopStreamForUser } from '@/lib/events/client-stream';
 import type { PhoneNumber, Schedule, ScheduleSlot, Queue, User, QueueUser, CallStatus, CallDirection } from '@/lib/types/database';
 
 // --- Tipos de resultado ---
@@ -127,6 +128,18 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
   if (!activeCalls) return busyIds;
 
   for (const call of activeCalls as Array<{ answered_by_user_id: string | null; twilio_data: Record<string, unknown> | null }>) {
+    const transferReleased = Boolean(
+      call.twilio_data
+      && typeof call.twilio_data === 'object'
+      && (
+        call.twilio_data.transfer_agent_released === true
+        || typeof call.twilio_data.transfer_agent_released_at === 'string'
+      )
+    );
+    if (transferReleased) {
+      continue;
+    }
+
     if (call.answered_by_user_id) {
       busyIds.add(call.answered_by_user_id);
     }
@@ -176,7 +189,6 @@ export async function getQueueWithOperators(queueId: string): Promise<{
     .select('*')
     .in('id', userIds)
     .eq('active', true)
-    .eq('available', true)
     .is('deleted_at', null);
 
   if (!users) {
@@ -189,7 +201,11 @@ export async function getQueueWithOperators(queueId: string): Promise<{
   const busyAgentIds = await getBusyAgentIds();
   const priorityMap = new Map((queueUsers as QueueUser[]).map(qu => [qu.user_id, qu.priority]));
   const operators = (users as User[])
-    .filter(u => !busyAgentIds.has(u.id))
+    .filter((u) => {
+      if (busyAgentIds.has(u.id)) return false;
+      if (u.available) return true;
+      return hasActiveDesktopStreamForUser(u.id);
+    })
     .map(u => ({
       ...u,
       priority: priorityMap.get(u.id) ?? 0,
