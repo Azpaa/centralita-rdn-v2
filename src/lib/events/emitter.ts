@@ -25,7 +25,8 @@ export type EventType =
   | 'agent.available'
   | 'agent.unavailable'
   | 'agent.busy'
-  | 'recording.ready';
+  | 'recording.ready'
+  | 'webhook.subscription_disabled';
 
 export interface EventPayload {
   event_id: string;
