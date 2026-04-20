@@ -5,6 +5,7 @@ import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-a
 import { createAdminClient } from '@/lib/supabase/admin';
 import { emitEvent } from '@/lib/events/emitter';
 import type { User } from '@/lib/types/database';
+import { getTwilioClient } from '@/lib/twilio/client';
 
 /**
  * POST /api/webhooks/twilio/voice/agent-connect
@@ -76,6 +77,60 @@ export async function POST(req: NextRequest) {
         user_id: operatorId,
         rdn_user_id: user?.rdn_user_id ?? null,
       });
+
+      // --- ring_all cleanup: cancel other ringing agent legs ---
+      try {
+        const { data: callForCleanup } = await supabase
+          .from('call_records')
+          .select('twilio_data')
+          .eq('twilio_call_sid', parentCallSid)
+          .maybeSingle();
+
+        const td = (
+          callForCleanup?.twilio_data
+          && typeof callForCleanup.twilio_data === 'object'
+          && !Array.isArray(callForCleanup.twilio_data)
+        ) ? (callForCleanup.twilio_data as Record<string, unknown>) : {};
+
+        const ringTargetIds = Array.isArray(td.current_ring_target_user_ids)
+          ? (td.current_ring_target_user_ids as string[])
+          : [];
+        const otherTargets = ringTargetIds.filter(id => id !== operatorId);
+
+        if (otherTargets.length > 0) {
+          const twilioClient = getTwilioClient();
+          const recentCutoff = new Date(Date.now() - 5 * 60 * 1000);
+
+          for (const otherId of otherTargets) {
+            // Cancel browser Device legs
+            twilioClient.calls.list({
+              to: `client:${otherId}`,
+              status: 'ringing',
+              startTimeAfter: recentCutoff,
+            }).then(calls => {
+              for (const c of calls) {
+                twilioClient.calls(c.sid).update({ status: 'canceled' })
+                  .then(() => console.log(`[AGENT-CONNECT] Canceled ring leg ${c.sid} → client:${otherId}`))
+                  .catch(() => {});
+              }
+            }).catch(() => {});
+
+            // Cancel phone legs too
+            twilioClient.calls.list({
+              to: `client:${otherId}`,
+              status: 'queued',
+              startTimeAfter: recentCutoff,
+            }).then(calls => {
+              for (const c of calls) {
+                twilioClient.calls(c.sid).update({ status: 'canceled' }).catch(() => {});
+              }
+            }).catch(() => {});
+          }
+          console.log(`[AGENT-CONNECT] ring_all cleanup: canceling legs for ${otherTargets.length} other target(s)`);
+        }
+      } catch (cleanupErr) {
+        console.warn('[AGENT-CONNECT] ring_all cleanup error (non-fatal):', cleanupErr);
+      }
     } catch (err) {
       console.error('[AGENT-CONNECT] Error updating call record:', err);
     }

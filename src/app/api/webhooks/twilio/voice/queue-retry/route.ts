@@ -1,4 +1,5 @@
 import type { NextRequest } from 'next/server';
+import { randomUUID } from 'crypto';
 import twilio from 'twilio';
 import { getQueueWithOperators } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
@@ -7,18 +8,8 @@ import { emitEvent } from '@/lib/events/emitter';
 import { getTwilioClient } from '@/lib/twilio/client';
 import type { CallRecord, PhoneNumber, Queue } from '@/lib/types/database';
 
-function resolveQueueWaitUrl(baseUrl: string, waitMusicUrl?: string | null): string {
-  const normalized = (waitMusicUrl || '').trim();
-  if (!normalized) {
-    return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
-  }
-
-  const lowered = normalized.toLowerCase();
-  if (lowered === 'none' || lowered === 'silent' || lowered === 'off') {
-    return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
-  }
-
-  return normalized;
+function resolveQueueWaitUrl(baseUrl: string): string {
+  return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
 }
 
 /**
@@ -76,10 +67,11 @@ export async function POST(req: NextRequest) {
         last_routing_at: new Date().toISOString(),
       };
 
-      await supabase
+      const { error: mergeErr } = await supabase
         .from('call_records')
         .update({ twilio_data: mergedData })
         .eq('twilio_call_sid', callSid);
+      if (mergeErr) console.error(`[QUEUE-RETRY] Failed to merge routing metadata for ${callSid}:`, mergeErr);
 
       (record as CallRecord).twilio_data = mergedData;
     };
@@ -188,6 +180,7 @@ export async function POST(req: NextRequest) {
       : (operators[activeQueue.current_index % operators.length]
         ? [operators[activeQueue.current_index % operators.length]]
         : []);
+    const roundRobinAttemptId = activeQueue.strategy === 'ring_all' ? null : randomUUID();
 
     if (ringTargets.length > 0) {
       console.log(
@@ -235,13 +228,15 @@ export async function POST(req: NextRequest) {
 
     // 5. Conference-based approach: ring agents via REST API, put caller back in conference
     const conferenceName = `call-${callSid}`;
-    const conferenceWaitUrl = resolveQueueWaitUrl(baseUrl, activeQueue.wait_music_url);
+    const conferenceWaitUrl = resolveQueueWaitUrl(baseUrl);
     await mergeRoutingMetadata({
       candidate_user_ids: operators.map((operator) => operator.id),
       current_ring_target_user_ids: ringTargets.map((target) => target.id),
       conference_name: conferenceName,
       incoming_conference_request: true,
       routing_source: 'queue_retry',
+      current_round_robin_attempt_id: roundRobinAttemptId,
+      current_round_robin_attempt_started_at: roundRobinAttemptId ? new Date().toISOString() : null,
     });
     // IMPORTANT: use our Twilio DID as callerId/from for re-ring attempts.
     // Using the external caller number can make Twilio reject these outbound legs.
@@ -254,13 +249,20 @@ export async function POST(req: NextRequest) {
       agentConnectUrl.searchParams.set('conference', conferenceName);
       agentConnectUrl.searchParams.set('call_sid', callSid);
       agentConnectUrl.searchParams.set('operator_id', target.id);
+      const agentStatusCallbackUrl = new URL(`${baseUrl}/api/webhooks/twilio/voice/status`);
+      agentStatusCallbackUrl.searchParams.set('parent_call_sid', callSid);
+      agentStatusCallbackUrl.searchParams.set('queue_strategy', activeQueue.strategy);
+      agentStatusCallbackUrl.searchParams.set('target_user_id', target.id);
+      if (roundRobinAttemptId) {
+        agentStatusCallbackUrl.searchParams.set('attempt_id', roundRobinAttemptId);
+      }
 
       // Ring agent's browser Device
       twilioClient.calls.create({
         to: `client:${target.id}`,
         from: ringCallerId,
         url: agentConnectUrl.toString(),
-        statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+        statusCallback: agentStatusCallbackUrl.toString(),
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
         timeout: activeQueue.ring_timeout,
       }).catch((err) => {
@@ -273,7 +275,7 @@ export async function POST(req: NextRequest) {
           to: target.phone,
           from: ringCallerId,
           url: agentConnectUrl.toString(),
-          statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+          statusCallback: agentStatusCallbackUrl.toString(),
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           timeout: activeQueue.ring_timeout,
         }).catch((err) => {

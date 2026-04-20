@@ -19,6 +19,7 @@ export type AgentActiveCall = {
   answered_by_user_id: string | null;
   source: string | null;
   resolved_agent_id: string | null;
+  conference_name: string | null;
 };
 
 export type AgentRuntimeSnapshot = {
@@ -68,6 +69,7 @@ function mapCallRecord(row: MinimalCallRecordRow): AgentActiveCall {
     answered_by_user_id: row.answered_by_user_id,
     source: getTextFromTwilioData(row.twilio_data, 'source'),
     resolved_agent_id: getTextFromTwilioData(row.twilio_data, 'resolved_agent_id'),
+    conference_name: getTextFromTwilioData(row.twilio_data, 'conference_name'),
   };
 }
 

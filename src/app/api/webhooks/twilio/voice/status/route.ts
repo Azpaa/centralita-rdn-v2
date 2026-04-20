@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook } from '@/lib/api/twilio-auth';
 import { createAdminClient } from '@/lib/supabase/admin';
+import { getTwilioClient } from '@/lib/twilio/client';
 import { emitEvent } from '@/lib/events/emitter';
 import type { CallRecord, CallStatus } from '@/lib/types/database';
 
@@ -68,19 +69,26 @@ export async function POST(req: NextRequest) {
   const webhook = await validateAndParseTwilioWebhook(req);
   if (!webhook.ok) return webhook.response;
   const params = webhook.params;
+  const { searchParams } = new URL(req.url);
 
   const rawCallSid = params.CallSid || '';
   const rawParentCallSid = params.ParentCallSid || '';
+  const routedParentCallSid = (searchParams.get('parent_call_sid') || '').trim();
+  const queueStrategyHint = (searchParams.get('queue_strategy') || '').trim();
+  const attemptIdHint = (searchParams.get('attempt_id') || '').trim();
+  const targetUserIdHint = (searchParams.get('target_user_id') || '').trim();
   const callStatus = params.CallStatus || '';
+  const callDuration = params.CallDuration ? parseInt(params.CallDuration, 10) : 0;
+  const normalizedDuration = Number.isFinite(callDuration) ? callDuration : 0;
   const timestamp = params.Timestamp || new Date().toISOString();
 
   const { trackedCallSid, currentRecord } = await resolveTrackedCallForStatus({
     callSid: rawCallSid,
-    parentCallSid: rawParentCallSid,
+    parentCallSid: routedParentCallSid || rawParentCallSid,
   });
 
   console.log(
-    `[STATUS] raw_call_sid=${rawCallSid || '-'} raw_parent_call_sid=${rawParentCallSid || '-'} tracked_call_sid=${trackedCallSid || '-'} status=${callStatus}`
+    `[STATUS] raw_call_sid=${rawCallSid || '-'} raw_parent_call_sid=${rawParentCallSid || '-'} routed_parent_call_sid=${routedParentCallSid || '-'} tracked_call_sid=${trackedCallSid || '-'} status=${callStatus}`
   );
 
   if (!trackedCallSid) {
@@ -90,6 +98,88 @@ export async function POST(req: NextRequest) {
   try {
     const supabase = createAdminClient();
     const currentStatus = currentRecord?.status;
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+
+    // Round-robin advance: if an agent leg attempt ends without answer, immediately
+    // force the parent caller leg to fetch /queue-retry so the next operator is rung.
+    const shouldTryRoundRobinAdvance = (
+      queueStrategyHint === 'round_robin'
+      && !!routedParentCallSid
+      && !!attemptIdHint
+      && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)
+      && (callStatus !== 'completed' || normalizedDuration === 0)
+    );
+
+    if (shouldTryRoundRobinAdvance) {
+      const { data: parentRecord } = await supabase
+        .from('call_records')
+        .select('status, answered_by_user_id, twilio_data')
+        .eq('twilio_call_sid', routedParentCallSid)
+        .maybeSingle();
+
+      const parentStatus = (parentRecord as { status?: CallStatus } | null)?.status;
+      const parentAnsweredByUserId = (parentRecord as { answered_by_user_id?: string | null } | null)?.answered_by_user_id ?? null;
+      const parentTwilioDataRaw = (parentRecord as { twilio_data?: unknown } | null)?.twilio_data;
+      const parentTwilioData = (
+        parentTwilioDataRaw
+        && typeof parentTwilioDataRaw === 'object'
+        && !Array.isArray(parentTwilioDataRaw)
+      )
+        ? (parentTwilioDataRaw as Record<string, unknown>)
+        : {};
+      const currentAttemptId = typeof parentTwilioData.current_round_robin_attempt_id === 'string'
+        ? parentTwilioData.current_round_robin_attempt_id
+        : null;
+
+      if (
+        currentAttemptId === attemptIdHint
+        && !parentAnsweredByUserId
+        && parentStatus !== 'in_progress'
+        && parentStatus !== 'completed'
+      ) {
+        const consumedTwilioData = {
+          ...parentTwilioData,
+          current_round_robin_attempt_id: null,
+          last_round_robin_attempt_id: attemptIdHint,
+          last_round_robin_attempt_result: callStatus,
+          last_round_robin_attempt_finished_at: new Date().toISOString(),
+          last_round_robin_attempt_target_user_id: targetUserIdHint || null,
+          last_round_robin_attempt_agent_call_sid: rawCallSid || null,
+        };
+
+        const { data: consumeResult } = await supabase
+          .from('call_records')
+          .update({
+            status: 'in_queue',
+            twilio_data: consumedTwilioData,
+          })
+          .eq('twilio_call_sid', routedParentCallSid)
+          .is('answered_by_user_id', null)
+          .filter('twilio_data->>current_round_robin_attempt_id', 'eq', attemptIdHint)
+          .select('twilio_call_sid')
+          .maybeSingle();
+
+        if (consumeResult?.twilio_call_sid) {
+          try {
+            const client = getTwilioClient();
+            await client.calls(routedParentCallSid).update({
+              url: `${baseUrl}/api/webhooks/twilio/voice/queue-retry`,
+              method: 'POST',
+            });
+            console.log(
+              `[STATUS] Round-robin advance triggered parent_call_sid=${routedParentCallSid} attempt_id=${attemptIdHint} call_status=${callStatus}`
+            );
+            return new NextResponse('OK', { status: 200 });
+          } catch (advanceErr) {
+            console.warn(
+              `[STATUS] Round-robin advance failed parent_call_sid=${routedParentCallSid}: ${
+                advanceErr instanceof Error ? advanceErr.message : 'unknown_error'
+              }`
+            );
+          }
+        }
+      }
+    }
 
     if (currentStatus && TERMINAL_STATUSES.includes(currentStatus)) {
       if (!currentRecord?.ended_at && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)) {
@@ -164,7 +254,7 @@ export async function POST(req: NextRequest) {
     await updateCallStatus(trackedCallSid, updates);
 
     const isTerminalFromStatus = ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus);
-    if (isTerminalFromStatus) {
+    if (isTerminalFromStatus && currentRecord) {
       const direction = currentRecord?.direction || 'outbound';
       const terminalStatus = mappedStatus;
       const endedAt = updates.endedAt || currentRecord?.ended_at || timestamp;

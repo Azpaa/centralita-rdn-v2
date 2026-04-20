@@ -38,6 +38,7 @@ export async function POST(
 
   try {
     const client = getTwilioClient();
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
 
     const callInfo = await client.calls(callSid).fetch();
     let remoteSid: string;
@@ -61,9 +62,10 @@ export async function POST(
       { language: 'es-ES', voice: 'Polly.Conchita' },
       'Un momento por favor, le ponemos en espera.'
     );
-    holdTwiml.play({
-      loop: 0,
-    }, body.music_url || 'http://com.twilio.music.classical.s3.amazonaws.com/ith_chopin-702702.mp3');
+    holdTwiml.redirect(
+      { method: 'POST' },
+      `${baseUrl}/api/webhooks/twilio/voice/wait-silence`
+    );
 
     await client.calls(remoteSid).update({ twiml: holdTwiml.toString() });
 

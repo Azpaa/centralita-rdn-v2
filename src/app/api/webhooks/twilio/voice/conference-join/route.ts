@@ -25,7 +25,7 @@ export async function POST(req: NextRequest) {
     {
       startConferenceOnEnter: true,
       endConferenceOnExit: role === 'moderator', // Si el moderador sale, termina la conferencia
-      waitUrl: 'http://com.twilio.music.classical.s3.amazonaws.com/ith_chopin-702702.mp3',
+      waitUrl: `${baseUrl}/api/webhooks/twilio/voice/wait-silence`,
       statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
       statusCallbackEvent: ['start', 'end', 'join', 'leave'],
     },

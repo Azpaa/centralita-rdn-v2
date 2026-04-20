@@ -159,6 +159,49 @@ export async function GET(req: NextRequest) {
                 agent_state: snapshot,
               },
             });
+
+            // Re-ring agent if there are pending ringing calls (reconnect recovery)
+            if (snapshot) {
+              const ringingCalls = snapshot.active_calls.filter(
+                (c) => (c.status === 'ringing' || c.status === 'in_queue')
+                  && c.conference_name
+                  && !c.answered_by_user_id
+              );
+
+              if (ringingCalls.length > 0) {
+                const { getTwilioClient } = await import('@/lib/twilio/client');
+                const twilioClient = getTwilioClient();
+                const appBaseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+
+                for (const call of ringingCalls) {
+                  const agentConnectUrl = new URL(`${appBaseUrl}/api/webhooks/twilio/voice/agent-connect`);
+                  agentConnectUrl.searchParams.set('conference', call.conference_name!);
+                  agentConnectUrl.searchParams.set('call_sid', call.call_sid || '');
+                  agentConnectUrl.searchParams.set('operator_id', targetUserId as string);
+
+                  const statusUrl = new URL(`${appBaseUrl}/api/webhooks/twilio/voice/status`);
+                  statusUrl.searchParams.set('parent_call_sid', call.call_sid || '');
+                  statusUrl.searchParams.set('target_user_id', targetUserId as string);
+
+                  // Use our DID as callerId (for inbound, 'to' is our number)
+                  const callerId = call.direction === 'inbound' ? call.to : call.from;
+
+                  twilioClient.calls.create({
+                    to: `client:${targetUserId}`,
+                    from: callerId,
+                    url: agentConnectUrl.toString(),
+                    statusCallback: statusUrl.toString(),
+                    statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+                    timeout: 30,
+                  }).then((c) => {
+                    console.log(`[SSE] Re-ring on reconnect: user=${targetUserId} call_sid=${call.call_sid} new_leg=${c.sid}`);
+                  }).catch((err) => {
+                    console.warn(`[SSE] Re-ring failed: user=${targetUserId} call_sid=${call.call_sid}: ${(err as Error).message}`);
+                  });
+                }
+                console.log(`[SSE] Triggered re-ring for ${ringingCalls.length} pending call(s) on reconnect`);
+              }
+            }
           } catch (err) {
             console.error('[SSE] Failed building initial snapshot:', err);
           }

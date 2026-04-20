@@ -1,22 +1,13 @@
 import { NextRequest } from 'next/server';
+import { randomUUID } from 'crypto';
 import twilio from 'twilio';
 import { routeIncomingCall, createCallRecord } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { emitEvent } from '@/lib/events/emitter';
 import { getTwilioClient } from '@/lib/twilio/client';
 
-function resolveQueueWaitUrl(baseUrl: string, waitMusicUrl?: string | null): string {
-  const normalized = (waitMusicUrl || '').trim();
-  if (!normalized) {
-    return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
-  }
-
-  const lowered = normalized.toLowerCase();
-  if (lowered === 'none' || lowered === 'silent' || lowered === 'off') {
-    return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
-  }
-
-  return normalized;
+function resolveQueueWaitUrl(baseUrl: string): string {
+  return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
 }
 
 /**
@@ -193,10 +184,11 @@ export async function POST(req: NextRequest) {
     // Actualizar estado a "en cola"
     const { createAdminClient } = await import('@/lib/supabase/admin');
     const supabase = createAdminClient();
-    await supabase
+    const { error: queueStatusErr } = await supabase
       .from('call_records')
       .update({ status: 'in_queue' })
       .eq('twilio_call_sid', callSid);
+    if (queueStatusErr) console.error(`[INCOMING] Failed to update status to in_queue for ${callSid}:`, queueStatusErr);
 
     const mergeRoutingMetadata = async (payload: Record<string, unknown>) => {
       const { data: existingRow } = await supabase
@@ -216,7 +208,7 @@ export async function POST(req: NextRequest) {
         ? (existingRow.twilio_data as Record<string, unknown>)
         : {};
 
-      await supabase
+      const { error: mergeErr } = await supabase
         .from('call_records')
         .update({
           twilio_data: {
@@ -226,6 +218,7 @@ export async function POST(req: NextRequest) {
           },
         })
         .eq('twilio_call_sid', callSid);
+      if (mergeErr) console.error(`[INCOMING] Failed to merge routing metadata for ${callSid}:`, mergeErr);
     };
 
     // Si no hay operadores libres en este momento, enviar al bucle de espera
@@ -255,16 +248,19 @@ export async function POST(req: NextRequest) {
       : (operators[queue.current_index % operators.length]
         ? [operators[queue.current_index % operators.length]]
         : []);
+    const roundRobinAttemptId = queue.strategy === 'ring_all' ? null : randomUUID();
 
     // Conference name for this call — used by SSE events, REST rings, and caller dial
     const conferenceName = `call-${callSid}`;
-    const conferenceWaitUrl = resolveQueueWaitUrl(baseUrl, queue.wait_music_url);
+    const conferenceWaitUrl = resolveQueueWaitUrl(baseUrl);
     await mergeRoutingMetadata({
       candidate_user_ids: operators.map((operator) => operator.id),
       current_ring_target_user_ids: ringTargets.map((target) => target.id),
       conference_name: conferenceName,
       incoming_conference_request: true,
       routing_source: 'incoming_initial',
+      current_round_robin_attempt_id: roundRobinAttemptId,
+      current_round_robin_attempt_started_at: roundRobinAttemptId ? new Date().toISOString() : null,
     });
 
     if (ringTargets.length > 0) {
@@ -310,13 +306,20 @@ export async function POST(req: NextRequest) {
       agentConnectUrl.searchParams.set('conference', conferenceName);
       agentConnectUrl.searchParams.set('call_sid', callSid);
       agentConnectUrl.searchParams.set('operator_id', target.id);
+      const agentStatusCallbackUrl = new URL(`${baseUrl}/api/webhooks/twilio/voice/status`);
+      agentStatusCallbackUrl.searchParams.set('parent_call_sid', callSid);
+      agentStatusCallbackUrl.searchParams.set('queue_strategy', queue.strategy);
+      agentStatusCallbackUrl.searchParams.set('target_user_id', target.id);
+      if (roundRobinAttemptId) {
+        agentStatusCallbackUrl.searchParams.set('attempt_id', roundRobinAttemptId);
+      }
 
       // Ring agent's browser Device (Twilio Client)
       twilioClient.calls.create({
         to: `client:${target.id}`,
         from: ringCallerId,
         url: agentConnectUrl.toString(),
-        statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+        statusCallback: agentStatusCallbackUrl.toString(),
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
         timeout: queue.ring_timeout,
       }).catch((err) => {
@@ -329,7 +332,7 @@ export async function POST(req: NextRequest) {
           to: target.phone,
           from: ringCallerId,
           url: agentConnectUrl.toString(),
-          statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
+          statusCallback: agentStatusCallbackUrl.toString(),
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           timeout: queue.ring_timeout,
         }).catch((err) => {
