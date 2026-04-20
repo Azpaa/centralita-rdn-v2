@@ -1,11 +1,17 @@
 import twilio from 'twilio';
 import { twimlResponse } from '@/lib/api/twilio-auth';
 
+function resolveWaitAudioUrl(baseUrl: string): string {
+  const fromEnv = process.env.TWILIO_QUEUE_WAIT_AUDIO_URL?.trim();
+  if (fromEnv) return fromEnv;
+  return `${baseUrl}/audio/hold-ringback-es.wav`;
+}
+
 function buildSilenceResponse(baseUrl: string) {
   const twiml = new twilio.twiml.VoiceResponse();
-  // Keep caller on hold with a basic and familiar hold audio.
-  // Avoid digit tones/beeps that feel abrupt for callers.
-  twiml.play('https://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3');
+  // Keep caller on hold with a classic ringback-style tone.
+  // Can be overridden per environment with TWILIO_QUEUE_WAIT_AUDIO_URL.
+  twiml.play(resolveWaitAudioUrl(baseUrl));
   twiml.redirect({ method: 'POST' }, `${baseUrl}/api/webhooks/twilio/voice/wait-silence`);
   return twimlResponse(twiml);
 }

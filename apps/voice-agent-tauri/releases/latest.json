@@ -1,14 +1,14 @@
 {
   "app_id": "com.rdn.voiceagent",
-  "version": "0.1.3",
-  "released_at": "2026-04-20T07:01:31.515Z",
-  "notes": "Release 0.1.3",
+  "version": "0.1.4",
+  "released_at": "2026-04-20T18:37:56.917Z",
+  "notes": "Release 0.1.4",
   "assets": [
     {
       "platform": "windows",
       "arch": "x64",
-      "file_name": "RDN Voice Agent_0.1.3_x64-setup.exe",
-      "url": "/downloads/voice-agent/v0.1.3/RDN Voice Agent_0.1.3_x64-setup.exe"
+      "file_name": "RDN Voice Agent_0.1.4_x64-setup.exe",
+      "url": "/downloads/voice-agent/v0.1.4/RDN Voice Agent_0.1.4_x64-setup.exe"
     }
   ]
 }

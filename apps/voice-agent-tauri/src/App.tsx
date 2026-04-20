@@ -17,6 +17,7 @@ import type {
   VoiceDeviceStatus,
 } from './lib/types';
 import { useVoiceEngine } from './lib/voice-engine';
+import incomingRingUrl from './assets/incoming-ring.wav';
 
 const DEFAULT_BACKEND_URL = 'https://centralita.reparacionesdelnorte.es';
 const BOOTSTRAP_BACKEND_URL = normalizeBaseUrl(
@@ -35,9 +36,10 @@ const REMOTE_ACCEPT_RETRY_DELAY_MS = 350;
 const REMOTE_ACCEPT_MAX_ATTEMPTS = 5;
 const REMOTE_COMMAND_TTL_MS = 10 * 60_000;
 const REMOTE_COMMAND_MAX_TRACKED = 200;
-const INCOMING_RING_BEEP_INTERVAL_MS = 1500;
-const INCOMING_RING_BEEP_DURATION_MS = 240;
-const INCOMING_RING_BEEP_FREQUENCY_HZ = 900;
+const FALLBACK_RING_BEEP_INTERVAL_MS = 3000;
+const FALLBACK_RING_BEEP_DURATION_MS = 1200;
+const FALLBACK_RING_BEEP_FREQ_A_HZ = 440;
+const FALLBACK_RING_BEEP_FREQ_B_HZ = 480;
 
 type StreamStatus = 'connecting' | 'connected' | 'disconnected';
 
@@ -144,6 +146,7 @@ export default function App() {
   const availabilitySyncInFlightRef = useRef(false);
   const lastSyncedAvailabilityRef = useRef<boolean | null>(null);
   const reconnectVoiceRef = useRef<() => Promise<void>>(async () => {});
+  const ringtoneAudioRef = useRef<HTMLAudioElement | null>(null);
   const ringtoneRef = useRef<{
     context: AudioContext | null;
     interval: ReturnType<typeof setInterval> | null;
@@ -348,6 +351,20 @@ export default function App() {
     setMessage(info);
   }, []);
 
+  useEffect(() => {
+    const audio = new Audio(incomingRingUrl);
+    audio.loop = true;
+    audio.preload = 'auto';
+    audio.volume = 0.8;
+    ringtoneAudioRef.current = audio;
+
+    return () => {
+      audio.pause();
+      audio.src = '';
+      ringtoneAudioRef.current = null;
+    };
+  }, []);
+
   const stopIncomingRingtone = useCallback(() => {
     const state = ringtoneRef.current;
     state.active = false;
@@ -355,12 +372,58 @@ export default function App() {
       clearInterval(state.interval);
       state.interval = null;
     }
+    const audio = ringtoneAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+    }
+  }, []);
+
+  const primeIncomingRingtone = useCallback(async () => {
+    const audio = ringtoneAudioRef.current;
+    if (audio) {
+      try {
+        audio.muted = true;
+        await audio.play();
+        audio.pause();
+        audio.currentTime = 0;
+      } catch {
+        // Ignore autoplay warmup errors.
+      } finally {
+        audio.muted = false;
+      }
+    }
+
+    const context = ringtoneRef.current.context;
+    if (context && context.state === 'suspended') {
+      try {
+        await context.resume();
+      } catch {
+        // Best-effort warmup.
+      }
+    }
   }, []);
 
   const startIncomingRingtone = useCallback(async () => {
     const state = ringtoneRef.current;
     if (state.active) return;
-    if (typeof window === 'undefined' || typeof window.AudioContext === 'undefined') return;
+    state.active = true;
+
+    const audio = ringtoneAudioRef.current;
+    if (audio) {
+      try {
+        audio.currentTime = 0;
+        await audio.play();
+        return;
+      } catch {
+        // Fallback to generated tone.
+      }
+    }
+
+    if (typeof window === 'undefined' || typeof window.AudioContext === 'undefined') {
+      state.active = false;
+      return;
+    }
 
     if (!state.context) {
       state.context = new window.AudioContext();
@@ -371,6 +434,7 @@ export default function App() {
       try {
         await context.resume();
       } catch {
+        state.active = false;
         return;
       }
     }
@@ -379,28 +443,33 @@ export default function App() {
       if (!state.active) return;
       if (context.state === 'closed') return;
 
-      const osc = context.createOscillator();
+      const oscA = context.createOscillator();
+      const oscB = context.createOscillator();
       const gain = context.createGain();
       const now = context.currentTime;
-      const durationSec = INCOMING_RING_BEEP_DURATION_MS / 1000;
+      const durationSec = FALLBACK_RING_BEEP_DURATION_MS / 1000;
 
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(INCOMING_RING_BEEP_FREQUENCY_HZ, now);
+      oscA.type = 'sine';
+      oscA.frequency.setValueAtTime(FALLBACK_RING_BEEP_FREQ_A_HZ, now);
+      oscB.type = 'sine';
+      oscB.frequency.setValueAtTime(FALLBACK_RING_BEEP_FREQ_B_HZ, now);
 
       gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.12, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.09, now + 0.03);
       gain.gain.exponentialRampToValueAtTime(0.0001, now + durationSec);
 
-      osc.connect(gain);
+      oscA.connect(gain);
+      oscB.connect(gain);
       gain.connect(context.destination);
 
-      osc.start(now);
-      osc.stop(now + durationSec + 0.02);
+      oscA.start(now);
+      oscB.start(now);
+      oscA.stop(now + durationSec + 0.02);
+      oscB.stop(now + durationSec + 0.02);
     };
 
-    state.active = true;
     playBeep();
-    state.interval = setInterval(playBeep, INCOMING_RING_BEEP_INTERVAL_MS);
+    state.interval = setInterval(playBeep, FALLBACK_RING_BEEP_INTERVAL_MS);
   }, []);
 
   const voice = useVoiceEngine({
@@ -416,6 +485,19 @@ export default function App() {
   useEffect(() => {
     reconnectVoiceRef.current = voice.reconnectNow;
   }, [voice.reconnectNow]);
+
+  useEffect(() => {
+    const unlockAudio = () => {
+      void primeIncomingRingtone();
+    };
+
+    window.addEventListener('pointerdown', unlockAudio);
+    window.addEventListener('keydown', unlockAudio);
+    return () => {
+      window.removeEventListener('pointerdown', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
+  }, [primeIncomingRingtone]);
 
   useEffect(() => {
     if (!accessToken || !agentState?.user_id) return;
@@ -873,8 +955,9 @@ export default function App() {
     }
 
     setAccessToken(getSessionToken(data.session));
+    void primeIncomingRingtone();
     setMessage('Login correcto');
-  }, [email, password]);
+  }, [email, password, primeIncomingRingtone]);
 
   const logout = useCallback(async () => {
     const userId = agentState?.user_id;
