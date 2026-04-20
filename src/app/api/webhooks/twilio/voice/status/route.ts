@@ -189,6 +189,22 @@ export async function POST(req: NextRequest) {
       return new NextResponse('OK', { status: 200 });
     }
 
+    // --- GUARD: agent-leg status must NOT overwrite the parent call record ---
+    // When the rawCallSid (the leg that finished) is different from the trackedCallSid
+    // (the parent call record), this is an agent ring leg ending (timeout, cancel, etc.).
+    // The parent call (caller in conference) is still alive — do NOT mark it terminal.
+    // Only round-robin advance (handled above) and agent-connect should touch the parent.
+    const isAgentLeg = rawCallSid !== trackedCallSid;
+    const isAgentLegTerminal = isAgentLeg && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus);
+    const parentStillWaiting = currentStatus === 'ringing' || currentStatus === 'in_queue' || currentStatus === 'in_progress';
+
+    if (isAgentLegTerminal && parentStillWaiting) {
+      console.log(
+        `[STATUS] Ignoring agent-leg terminal status — raw_call_sid=${rawCallSid} tracked_call_sid=${trackedCallSid} agent_status=${callStatus} parent_status=${currentStatus}`
+      );
+      return new NextResponse('OK', { status: 200 });
+    }
+
     const statusMap: Record<string, string> = {
       queued: 'ringing',
       ringing: 'ringing',
