@@ -1,14 +1,16 @@
 import twilio from 'twilio';
 import { twimlResponse } from '@/lib/api/twilio-auth';
 
-function resolveWaitAudioUrl(): string {
-  return 'https://twimlets.com/holdmusic?Bucket=com.twilio.music.guitars';
+function resolveWaitAudioUrl(baseUrl: string): string {
+  const fromEnv = process.env.TWILIO_QUEUE_WAIT_AUDIO_URL?.trim();
+  if (fromEnv) return fromEnv;
+  return `${baseUrl}/audio/hold-ringback-es.wav`;
 }
 
 function buildSilenceResponse(baseUrl: string) {
   const twiml = new twilio.twiml.VoiceResponse();
-  // Keep callers on hold with Twilio guitars hold-music bucket.
-  twiml.play(resolveWaitAudioUrl());
+  // Fallback hold loop for routes that still point to this endpoint.
+  twiml.play(resolveWaitAudioUrl(baseUrl));
   twiml.redirect({ method: 'POST' }, `${baseUrl}/api/webhooks/twilio/voice/wait-silence`);
   return twimlResponse(twiml);
 }

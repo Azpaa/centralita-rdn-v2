@@ -6,8 +6,10 @@ import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-a
 import { emitEvent } from '@/lib/events/emitter';
 import { getTwilioClient } from '@/lib/twilio/client';
 
-function resolveQueueWaitUrl(baseUrl: string): string {
-  return `${baseUrl}/api/webhooks/twilio/voice/wait-silence`;
+function resolveQueueWaitUrl(): string {
+  const fromEnv = process.env.TWILIO_QUEUE_WAIT_URL?.trim();
+  if (fromEnv) return fromEnv;
+  return 'https://twimlets.com/holdmusic?Bucket=com.twilio.music.guitars';
 }
 
 /**
@@ -271,7 +273,7 @@ export async function POST(req: NextRequest) {
 
     // Conference name for this call — used by SSE events, REST rings, and caller dial
     const conferenceName = `call-${callSid}`;
-    const conferenceWaitUrl = resolveQueueWaitUrl(baseUrl);
+    const conferenceWaitUrl = resolveQueueWaitUrl();
     await mergeRoutingMetadata({
       candidate_user_ids: operators.map((operator) => operator.id),
       current_ring_target_user_ids: ringTargets.map((target) => target.id),
