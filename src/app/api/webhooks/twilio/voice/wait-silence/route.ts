@@ -1,17 +1,14 @@
 import twilio from 'twilio';
 import { twimlResponse } from '@/lib/api/twilio-auth';
 
-function resolveWaitAudioUrl(baseUrl: string): string {
-  const fromEnv = process.env.TWILIO_QUEUE_WAIT_AUDIO_URL?.trim();
-  if (fromEnv) return fromEnv;
-  return `${baseUrl}/audio/hold-ringback-es.wav`;
+function resolveWaitAudioUrl(): string {
+  return 'https://twimlets.com/holdmusic?Bucket=com.twilio.music.guitars';
 }
 
 function buildSilenceResponse(baseUrl: string) {
   const twiml = new twilio.twiml.VoiceResponse();
-  // Keep caller on hold with a classic ringback-style tone.
-  // Can be overridden per environment with TWILIO_QUEUE_WAIT_AUDIO_URL.
-  twiml.play(resolveWaitAudioUrl(baseUrl));
+  // Keep callers on hold with Twilio guitars hold-music bucket.
+  twiml.play(resolveWaitAudioUrl());
   twiml.redirect({ method: 'POST' }, `${baseUrl}/api/webhooks/twilio/voice/wait-silence`);
   return twimlResponse(twiml);
 }
