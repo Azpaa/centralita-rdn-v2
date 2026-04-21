@@ -5,6 +5,7 @@
 
 import { createAdminClient } from '@/lib/supabase/admin';
 import { hasActiveDesktopStreamForUser } from '@/lib/events/client-stream';
+import { getTwilioClient } from '@/lib/twilio/client';
 import type { PhoneNumber, Schedule, ScheduleSlot, Queue, User, QueueUser, CallStatus, CallDirection } from '@/lib/types/database';
 
 // --- Tipos de resultado ---
@@ -104,6 +105,14 @@ export async function getScheduleWithSlots(scheduleId: string): Promise<(Schedul
 
 async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
   const supabase = createAdminClient();
+  const twilioClient = getTwilioClient();
+  const nowMs = Date.now();
+  const staleVerificationAgeMs = 90 * 1000;
+  const terminalTwilioStatuses = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
+  const mapTerminalStatus = (status: string): CallStatus => {
+    if (status === 'no-answer') return 'no_answer';
+    return (status as CallStatus);
+  };
 
   // Solo considerar llamadas en progreso real (ya contestadas)
   // Las llamadas ringing/in_queue sin answered_by_user_id son llamadas esperando,
@@ -113,9 +122,10 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
 
   let query = supabase
     .from('call_records')
-    .select('answered_by_user_id, twilio_data, twilio_call_sid')
+    .select('answered_by_user_id, twilio_data, twilio_call_sid, started_at')
     .in('status', ['in_progress'] as CallStatus[])
     .not('answered_by_user_id', 'is', null)
+    .is('ended_at', null)
     .gte('started_at', fourHoursAgo);
 
   if (excludeCallSid) {
@@ -127,7 +137,12 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
   const busyIds = new Set<string>();
   if (!activeCalls) return busyIds;
 
-  for (const call of activeCalls as Array<{ answered_by_user_id: string | null; twilio_data: Record<string, unknown> | null }>) {
+  for (const call of activeCalls as Array<{
+    answered_by_user_id: string | null;
+    twilio_data: Record<string, unknown> | null;
+    twilio_call_sid: string | null;
+    started_at: string;
+  }>) {
     const transferReleased = Boolean(
       call.twilio_data
       && typeof call.twilio_data === 'object'
@@ -138,6 +153,54 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
     );
     if (transferReleased) {
       continue;
+    }
+
+    const callSid = call.twilio_call_sid;
+    const startedAtMs = Date.parse(call.started_at);
+    const shouldVerifyWithTwilio = Boolean(
+      callSid
+      && !callSid.startsWith('pending-')
+      && Number.isFinite(startedAtMs)
+      && (nowMs - startedAtMs) >= staleVerificationAgeMs
+    );
+
+    if (shouldVerifyWithTwilio && callSid) {
+      try {
+        const liveCall = await twilioClient.calls(callSid).fetch();
+        const liveStatus = (liveCall.status || '').toLowerCase();
+
+        if (terminalTwilioStatuses.has(liveStatus)) {
+          const endedAt = liveCall.endTime
+            ? new Date(liveCall.endTime).toISOString()
+            : new Date().toISOString();
+          const parsedDuration = parseInt(String(liveCall.duration ?? '0'), 10);
+          const safeDuration = Number.isFinite(parsedDuration) ? parsedDuration : 0;
+
+          const { error: reconcileErr } = await supabase
+            .from('call_records')
+            .update({
+              status: mapTerminalStatus(liveStatus),
+              ended_at: endedAt,
+              duration: safeDuration,
+            })
+            .eq('twilio_call_sid', callSid)
+            .eq('status', 'in_progress')
+            .is('ended_at', null);
+
+          if (reconcileErr) {
+            console.warn(`[CALL-ENGINE] Failed reconciling stale busy call ${callSid}:`, reconcileErr.message);
+          } else {
+            console.log(`[CALL-ENGINE] Reconciled stale busy call ${callSid} -> ${liveStatus}`);
+          }
+          continue;
+        }
+      } catch (verifyErr) {
+        console.warn(
+          `[CALL-ENGINE] Unable to verify busy call ${callSid} in Twilio: ${
+            verifyErr instanceof Error ? verifyErr.message : 'unknown_error'
+          }`
+        );
+      }
     }
 
     if (call.answered_by_user_id) {

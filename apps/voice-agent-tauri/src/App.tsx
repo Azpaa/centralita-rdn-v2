@@ -32,6 +32,7 @@ const STREAM_STALE_TIMEOUT_MS = 85_000;
 const STREAM_WATCHDOG_INTERVAL_MS = 12_000;
 const WAKE_GAP_DETECT_MS = 15_000;
 const WAKE_GAP_THRESHOLD_MS = 55_000;
+const RECOVERY_RECONNECT_THROTTLE_MS = 3_000;
 const REMOTE_ACCEPT_RETRY_DELAY_MS = 350;
 const REMOTE_ACCEPT_MAX_ATTEMPTS = 5;
 const REMOTE_COMMAND_TTL_MS = 10 * 60_000;
@@ -115,6 +116,17 @@ function isJwtOrAuthError(message: string): boolean {
   );
 }
 
+function isTransientNetworkError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('network')
+    || normalized.includes('fetch')
+    || normalized.includes('offline')
+    || normalized.includes('timeout')
+    || normalized.includes('aborted')
+  );
+}
+
 function getSessionToken(session: Session | null): string {
   return session?.access_token || '';
 }
@@ -146,6 +158,7 @@ export default function App() {
   const availabilitySyncInFlightRef = useRef(false);
   const lastSyncedAvailabilityRef = useRef<boolean | null>(null);
   const reconnectVoiceRef = useRef<() => Promise<void>>(async () => {});
+  const lastRecoveryTriggerAtRef = useRef<number>(0);
   const ringtoneAudioRef = useRef<HTMLAudioElement | null>(null);
   const ringtoneRef = useRef<{
     context: AudioContext | null;
@@ -233,13 +246,20 @@ export default function App() {
     if (forceRefresh || !token || isNearExpiry) {
       const refreshResult = await supabase.auth.refreshSession();
       if (refreshResult.error || !refreshResult.data.session) {
+        const refreshError = refreshResult.error?.message || 'sin session';
+        const authFailure = isJwtOrAuthError(refreshError) && !isTransientNetworkError(refreshError);
         if (!silent) {
           setMessage(
-            `Sesion no valida (${reason}): ${refreshResult.error?.message || 'sin session'}`
+            authFailure
+              ? `Sesion no valida (${reason}): ${refreshError}`
+              : `No se pudo refrescar sesion (${reason}): ${refreshError}. Reintentando en segundo plano.`
           );
         }
-        setAccessToken('');
-        return '';
+        if (authFailure) {
+          setAccessToken('');
+          return '';
+        }
+        return token || accessTokenRef.current;
       }
       session = refreshResult.data.session;
     }
@@ -740,14 +760,17 @@ export default function App() {
 
     const { data } = await supabase.auth.getSession();
     const token = getSessionToken(data.session);
-    if (token) setAccessToken(token);
+    if (token) {
+      setAccessToken(token);
+      void primeIncomingRingtone();
+    }
 
     authSubscriptionRef.current?.unsubscribe();
     const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
       setAccessToken(getSessionToken(session));
     });
     authSubscriptionRef.current = authListener.subscription;
-  }, [backendUrl]);
+  }, [backendUrl, primeIncomingRingtone]);
 
   useEffect(() => {
     const bootstrapTimer = window.setTimeout(() => {
@@ -831,6 +854,16 @@ export default function App() {
       });
     };
 
+    const recoverRealtime = (reason: string) => {
+      const now = Date.now();
+      if (now - lastRecoveryTriggerAtRef.current < RECOVERY_RECONNECT_THROTTLE_MS) return;
+      lastRecoveryTriggerAtRef.current = now;
+      sseControllerRef.current?.abort();
+      void refreshAgentSnapshot(`recover:${reason}`);
+      void reconnectVoiceRef.current();
+      void primeIncomingRingtone();
+    };
+
     void keepAlive('startup', false);
 
     const interval = setInterval(() => {
@@ -839,15 +872,18 @@ export default function App() {
 
     const onFocus = () => {
       void keepAlive('focus', true);
+      recoverRealtime('focus');
     };
 
     const onOnline = () => {
       void keepAlive('online', true);
+      recoverRealtime('online');
     };
 
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         void keepAlive('visibility_visible', true);
+        recoverRealtime('visibility_visible');
       }
     };
 
@@ -862,7 +898,7 @@ export default function App() {
       window.removeEventListener('online', onOnline);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [backendUrl, ensureFreshSession]);
+  }, [backendUrl, ensureFreshSession, primeIncomingRingtone, refreshAgentSnapshot]);
 
   useEffect(() => {
     if (!accessToken || !backendUrl) return;

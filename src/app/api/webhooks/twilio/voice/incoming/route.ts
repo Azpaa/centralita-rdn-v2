@@ -402,7 +402,9 @@ export async function POST(req: NextRequest) {
     dial.conference(
       {
         startConferenceOnEnter: true,
-        endConferenceOnExit: true,
+        // Do not tear down the whole conference if caller leg leaves transiently
+        // (some external PBXs "hold" by temporarily re-signaling/parking the leg).
+        endConferenceOnExit: false,
         beep: 'false' as const,
         waitUrl: conferenceWaitUrl,
         maxParticipants: 10,

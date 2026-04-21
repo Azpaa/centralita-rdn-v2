@@ -100,6 +100,15 @@ export async function POST(req: NextRequest) {
     return new NextResponse('OK', { status: 200 });
   }
 
+  // Conference status callbacks (join/leave/end) may hit this endpoint without CallStatus.
+  // They are informative for observability, but must not overwrite call_records status.
+  if (!callStatus) {
+    console.log(
+      `[STATUS] Ignoring callback without CallStatus raw_call_sid=${rawCallSid || '-'} tracked_call_sid=${trackedCallSid || '-'}`
+    );
+    return new NextResponse('OK', { status: 200 });
+  }
+
   try {
     const supabase = createAdminClient();
     const currentStatus = currentRecord?.status;

@@ -18,7 +18,9 @@ import type { VoiceDeviceStatus } from './types';
  * device.connect() does NOT require device.register() — it just needs a valid token.
  */
 
-const TOKEN_REFRESH_INTERVAL_MS = 25 * 60_000; // 25 minutes
+const TOKEN_REFRESH_INTERVAL_MS = 5 * 60_000; // 5 minutes
+const HEALTH_CHECK_INTERVAL_MS = 20_000;
+const DEVICE_ERROR_RETRY_DELAY_MS = 1_500;
 
 type VoiceActionResult = ApiResult<{
   call_sid: string;
@@ -121,11 +123,13 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
   const initInFlightRef = useRef(false);
   const enabledRef = useRef(false);
   const tokenRefreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const healthCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const onCallStartedRef = useRef(onCallStarted);
   const onCallAcceptedRef = useRef(onCallAccepted);
   const onCallEndedRef = useRef(onCallEnded);
   const onCallMutedChangedRef = useRef(onCallMutedChanged);
   const onInfoRef = useRef(onInfo);
+  const deviceStatusRef = useRef<VoiceDeviceStatus>('disconnected');
 
   useEffect(() => {
     baseUrlRef.current = baseUrl;
@@ -139,6 +143,10 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     onCallMutedChangedRef.current = onCallMutedChanged;
     onInfoRef.current = onInfo;
   }, [onCallStarted, onCallAccepted, onCallEnded, onCallMutedChanged, onInfo]);
+
+  useEffect(() => {
+    deviceStatusRef.current = deviceStatus;
+  }, [deviceStatus]);
 
   const syncAttachedCallSids = useCallback(() => {
     setAttachedCallSids(Array.from(callsRef.current.keys()));
@@ -256,7 +264,12 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         const code = err.code ?? 0;
         const message = err.message || `Error de device (${code})`;
         setLastError(message);
+        setProblem('degraded', `Error de softphone ${code}: ${message}`);
         onInfoRef.current?.(`Error de softphone ${code}: ${message}`);
+        setTimeout(() => {
+          if (!enabledRef.current || initInFlightRef.current) return;
+          void ensureDevice('device_error_retry');
+        }, DEVICE_ERROR_RETRY_DELAY_MS);
       });
 
       device.on('tokenWillExpire', async () => {
@@ -267,6 +280,10 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         if (!refresh.ok) {
           setLastError(refresh.error);
           setProblem('degraded', `No se pudo refrescar token: ${refresh.error}`);
+          setTimeout(() => {
+            if (!enabledRef.current || initInFlightRef.current) return;
+            void ensureDevice('token_refresh_retry');
+          }, DEVICE_ERROR_RETRY_DELAY_MS);
           return;
         }
 
@@ -302,6 +319,10 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         clearInterval(tokenRefreshTimerRef.current);
         tokenRefreshTimerRef.current = null;
       }
+      if (healthCheckTimerRef.current) {
+        clearInterval(healthCheckTimerRef.current);
+        healthCheckTimerRef.current = null;
+      }
       if (deviceRef.current) {
         try { deviceRef.current.destroy(); } catch { /* ignore */ }
         deviceRef.current = null;
@@ -325,11 +346,22 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       void ensureDevice('token_refresh_interval');
     }, TOKEN_REFRESH_INTERVAL_MS);
 
+    healthCheckTimerRef.current = setInterval(() => {
+      if (!enabledRef.current) return;
+      if (initInFlightRef.current) return;
+      if (deviceStatusRef.current === 'connected') return;
+      void ensureDevice('health_check');
+    }, HEALTH_CHECK_INTERVAL_MS);
+
     return () => {
       enabledRef.current = false;
       if (tokenRefreshTimerRef.current) {
         clearInterval(tokenRefreshTimerRef.current);
         tokenRefreshTimerRef.current = null;
+      }
+      if (healthCheckTimerRef.current) {
+        clearInterval(healthCheckTimerRef.current);
+        healthCheckTimerRef.current = null;
       }
       if (deviceRef.current) {
         try { deviceRef.current.destroy(); } catch { /* ignore */ }

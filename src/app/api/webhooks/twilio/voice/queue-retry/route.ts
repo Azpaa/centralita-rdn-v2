@@ -326,7 +326,8 @@ export async function POST(req: NextRequest) {
     dial.conference(
       {
         startConferenceOnEnter: true,
-        endConferenceOnExit: true,
+        // Keep conference alive on transient caller-leg drops/holds from external PBXs.
+        endConferenceOnExit: false,
         beep: 'false' as const,
         waitUrl: conferenceWaitUrl,
         maxParticipants: 10,
