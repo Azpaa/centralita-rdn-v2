@@ -92,6 +92,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
     .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data')
     .eq('answered_by_user_id', userId)
     .in('status', ACTIVE_STATUSES)
+    .is('ended_at', null)
     .order('started_at', { ascending: false })
     .limit(25);
 
@@ -101,6 +102,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
     .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data')
     .eq('twilio_data->>resolved_agent_id', userId)
     .in('status', ACTIVE_STATUSES)
+    .is('ended_at', null)
     .order('started_at', { ascending: false })
     .limit(25);
 
@@ -110,6 +112,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
     .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data')
     .eq('twilio_data->>initiated_by', userId)
     .in('status', ACTIVE_STATUSES)
+    .is('ended_at', null)
     .order('started_at', { ascending: false })
     .limit(25);
 
@@ -118,6 +121,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
     .from('call_records')
     .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data')
     .in('status', ['ringing', 'in_queue'] as CallRecord['status'][])
+    .is('ended_at', null)
     .contains('twilio_data', { current_ring_target_user_ids: [userId] })
     .order('started_at', { ascending: false })
     .limit(25);

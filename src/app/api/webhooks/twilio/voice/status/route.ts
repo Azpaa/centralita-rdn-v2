@@ -10,6 +10,18 @@ import type { CallRecord, CallStatus } from '@/lib/types/database';
 // Terminal states: once dial-action sets one of these, do not overwrite.
 const TERMINAL_STATUSES: CallStatus[] = ['completed', 'no_answer', 'busy', 'failed', 'canceled'];
 const TERMINAL_WEBHOOK_STATUSES = ['completed', 'busy', 'no-answer', 'failed', 'canceled'];
+const CALLBACK_STATUS_MAP: Record<string, CallStatus> = {
+  initiated: 'ringing',
+  queued: 'ringing',
+  ringing: 'ringing',
+  answered: 'in_progress',
+  'in-progress': 'in_progress',
+  completed: 'completed',
+  busy: 'busy',
+  'no-answer': 'no_answer',
+  failed: 'failed',
+  canceled: 'canceled',
+};
 
 type StatusRecord = Pick<
   CallRecord,
@@ -22,6 +34,15 @@ function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
 
 function isTerminalWebhookStatus(status: string): boolean {
   return TERMINAL_WEBHOOK_STATUSES.includes(status);
+}
+
+function mapTwilioStatusToCallStatus(status: string): CallStatus {
+  if (status === 'no-answer') return 'no_answer';
+  return status as CallStatus;
+}
+
+function mapWebhookStatusToCallStatus(status: string): CallStatus | null {
+  return CALLBACK_STATUS_MAP[status] ?? null;
 }
 
 async function resolveTrackedCallForStatus(params: {
@@ -229,6 +250,68 @@ export async function POST(req: NextRequest) {
     const parentStillWaiting = currentStatus === 'ringing' || currentStatus === 'in_queue' || currentStatus === 'in_progress';
 
     if (isAgentLegTerminal && parentStillWaiting) {
+      // If parent is actually terminal in Twilio, reconcile immediately.
+      // This avoids "busy ghost" states when parent terminal callbacks are delayed/missing.
+      if (currentStatus === 'in_progress') {
+        try {
+          const liveParentCall = await getTwilioClient().calls(trackedCallSid).fetch();
+          const liveParentStatus = (liveParentCall.status || '').toLowerCase();
+
+          if (isTerminalWebhookStatus(liveParentStatus)) {
+            const endedAt = liveParentCall.endTime
+              ? new Date(liveParentCall.endTime).toISOString()
+              : timestamp;
+            const parsedDuration = parseInt(String(liveParentCall.duration ?? '0'), 10);
+            const safeDuration = Number.isFinite(parsedDuration) ? parsedDuration : 0;
+            const terminalStatus = mapTwilioStatusToCallStatus(liveParentStatus);
+
+            await updateCallStatus(trackedCallSid, {
+              status: terminalStatus,
+              endedAt,
+              duration: safeDuration,
+            });
+
+            if (currentRecord?.direction === 'inbound' && terminalStatus !== 'completed') {
+              emitEvent('call.missed', {
+                call_sid: trackedCallSid,
+                direction: currentRecord.direction,
+                from: currentRecord.from_number ?? null,
+                to: currentRecord.to_number ?? null,
+                final_status: terminalStatus,
+                queue_id: currentRecord.queue_id ?? null,
+                terminal_source: 'agent_leg_reconcile',
+              });
+            } else if (currentRecord) {
+              emitEvent('call.completed', {
+                call_sid: trackedCallSid,
+                direction: currentRecord.direction,
+                status: terminalStatus,
+                from: currentRecord.from_number ?? null,
+                to: currentRecord.to_number ?? null,
+                queue_id: currentRecord.queue_id ?? null,
+                answered_by_user_id: currentRecord.answered_by_user_id ?? null,
+                duration: safeDuration,
+                wait_time: null,
+                answered_at: currentRecord.answered_at ?? null,
+                ended_at: endedAt,
+                terminal_source: 'agent_leg_reconcile',
+              });
+            }
+
+            console.log(
+              `[STATUS] Reconciled parent terminal from agent-leg callback tracked_call_sid=${trackedCallSid} live_parent_status=${liveParentStatus}`
+            );
+            return new NextResponse('OK', { status: 200 });
+          }
+        } catch (reconcileErr) {
+          console.warn(
+            `[STATUS] Failed reconciling parent status from agent-leg callback tracked_call_sid=${trackedCallSid}: ${
+              reconcileErr instanceof Error ? reconcileErr.message : 'unknown_error'
+            }`
+          );
+        }
+      }
+
       console.log(
         `[STATUS] Ignoring agent-leg terminal status — raw_call_sid=${rawCallSid} tracked_call_sid=${trackedCallSid} agent_status=${callStatus} parent_status=${currentStatus}`
       );
@@ -259,18 +342,14 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const statusMap: Record<string, string> = {
-      queued: 'ringing',
-      ringing: 'ringing',
-      'in-progress': 'in_progress',
-      completed: 'completed',
-      busy: 'busy',
-      'no-answer': 'no_answer',
-      failed: 'failed',
-      canceled: 'canceled',
-    };
+    const mappedStatus = mapWebhookStatusToCallStatus(callStatus);
+    if (!mappedStatus) {
+      console.warn(
+        `[STATUS] Ignoring unsupported CallStatus raw=${callStatus} raw_call_sid=${rawCallSid || '-'} tracked_call_sid=${trackedCallSid || '-'}`
+      );
+      return new NextResponse('OK', { status: 200 });
+    }
 
-    const mappedStatus = statusMap[callStatus] || callStatus;
     const updates: Parameters<typeof updateCallStatus>[1] = {
       status: mappedStatus,
     };
@@ -326,7 +405,7 @@ export async function POST(req: NextRequest) {
     const isTerminalFromStatus = isTerminalWebhookStatus(callStatus);
     if (isTerminalFromStatus && currentRecord) {
       const direction = currentRecord?.direction || 'outbound';
-      const terminalStatus = mappedStatus;
+      const terminalStatus = mappedStatus as CallStatus;
       const endedAt = updates.endedAt || currentRecord?.ended_at || timestamp;
       const answeredAt = currentRecord?.answered_at || null;
       const duration = updates.duration ?? currentRecord?.duration ?? 0;
