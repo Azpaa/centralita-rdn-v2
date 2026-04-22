@@ -47,18 +47,63 @@ export async function POST(req: NextRequest) {
       // Guardar el SID de la leg del agente en twilio_data para lookups inversos
       // (transfer, hangup, etc. reciben el agentCallSid y necesitan encontrar el original)
       const supabase = createAdminClient();
+      let ringTargetIds: string[] = [];
+      let parentTwilioData: Record<string, unknown> = {};
       if (agentCallSid) {
         const { data: existing } = await supabase
           .from('call_records')
           .select('twilio_data')
           .eq('twilio_call_sid', parentCallSid)
           .single();
-        const merged = { ...((existing?.twilio_data as Record<string, unknown>) || {}), agent_call_sid: agentCallSid };
+        parentTwilioData = (
+          existing?.twilio_data
+          && typeof existing.twilio_data === 'object'
+          && !Array.isArray(existing.twilio_data)
+        ) ? (existing.twilio_data as Record<string, unknown>) : {};
+
+        ringTargetIds = Array.isArray(parentTwilioData.current_ring_target_user_ids)
+          ? (parentTwilioData.current_ring_target_user_ids as string[]).filter((id): id is string => typeof id === 'string')
+          : [];
+
+        const merged = {
+          ...parentTwilioData,
+          agent_call_sid: agentCallSid,
+          current_ring_target_user_ids: [],
+          ring_answered_by_user_id: operatorId,
+          ring_answered_at: new Date().toISOString(),
+        };
         await supabase
           .from('call_records')
           .update({ twilio_data: merged })
           .eq('twilio_call_sid', parentCallSid);
         console.log(`[AGENT-CONNECT] Stored agent_call_sid=${agentCallSid} in call_record ${parentCallSid}`);
+      } else {
+        const { data: existing } = await supabase
+          .from('call_records')
+          .select('twilio_data')
+          .eq('twilio_call_sid', parentCallSid)
+          .maybeSingle();
+        parentTwilioData = (
+          existing?.twilio_data
+          && typeof existing.twilio_data === 'object'
+          && !Array.isArray(existing.twilio_data)
+        ) ? (existing.twilio_data as Record<string, unknown>) : {};
+        ringTargetIds = Array.isArray(parentTwilioData.current_ring_target_user_ids)
+          ? (parentTwilioData.current_ring_target_user_ids as string[]).filter((id): id is string => typeof id === 'string')
+          : [];
+
+        if (ringTargetIds.length > 0) {
+          const merged = {
+            ...parentTwilioData,
+            current_ring_target_user_ids: [],
+            ring_answered_by_user_id: operatorId,
+            ring_answered_at: new Date().toISOString(),
+          };
+          await supabase
+            .from('call_records')
+            .update({ twilio_data: merged })
+            .eq('twilio_call_sid', parentCallSid);
+        }
       }
 
       const { data: userData } = await supabase
@@ -76,25 +121,11 @@ export async function POST(req: NextRequest) {
         answered_by_user_id: operatorId,
         user_id: operatorId,
         rdn_user_id: user?.rdn_user_id ?? null,
+        candidate_user_ids: ringTargetIds,
       });
 
       // --- ring_all cleanup: cancel other ringing agent legs ---
       try {
-        const { data: callForCleanup } = await supabase
-          .from('call_records')
-          .select('twilio_data')
-          .eq('twilio_call_sid', parentCallSid)
-          .maybeSingle();
-
-        const td = (
-          callForCleanup?.twilio_data
-          && typeof callForCleanup.twilio_data === 'object'
-          && !Array.isArray(callForCleanup.twilio_data)
-        ) ? (callForCleanup.twilio_data as Record<string, unknown>) : {};
-
-        const ringTargetIds = Array.isArray(td.current_ring_target_user_ids)
-          ? (td.current_ring_target_user_ids as string[])
-          : [];
         const otherTargets = ringTargetIds.filter(id => id !== operatorId);
 
         if (otherTargets.length > 0) {

@@ -131,6 +131,36 @@ export async function POST(req: NextRequest) {
             answeredByUserId: operatorId,
           });
 
+          const { data: parentRecord } = await supabase
+            .from('call_records')
+            .select('twilio_data')
+            .eq('twilio_call_sid', parentCallSid)
+            .maybeSingle();
+
+          const parentTwilioData = (
+            parentRecord?.twilio_data
+            && typeof parentRecord.twilio_data === 'object'
+            && !Array.isArray(parentRecord.twilio_data)
+          ) ? (parentRecord.twilio_data as Record<string, unknown>) : {};
+
+          const ringTargetIds = Array.isArray(parentTwilioData.current_ring_target_user_ids)
+            ? (parentTwilioData.current_ring_target_user_ids as string[]).filter((id): id is string => typeof id === 'string')
+            : [];
+
+          if (ringTargetIds.length > 0) {
+            await supabase
+              .from('call_records')
+              .update({
+                twilio_data: {
+                  ...parentTwilioData,
+                  current_ring_target_user_ids: [],
+                  ring_answered_by_user_id: operatorId,
+                  ring_answered_at: new Date().toISOString(),
+                },
+              })
+              .eq('twilio_call_sid', parentCallSid);
+          }
+
           const { data: userData } = await supabase
             .from('users')
             .select('id, rdn_user_id')
@@ -146,6 +176,7 @@ export async function POST(req: NextRequest) {
             answered_by_user_id: operatorId,
             user_id: operatorId,
             rdn_user_id: user?.rdn_user_id ?? null,
+            candidate_user_ids: ringTargetIds,
           });
         } catch (err) {
           console.error('[CLIENT-VOICE] Error updating call record for conference join:', err);

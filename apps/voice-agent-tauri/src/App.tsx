@@ -632,6 +632,7 @@ export default function App() {
     const payloadCommandId = typeof event.payload?.command_id === 'string'
       ? event.payload.command_id
       : null;
+    const localAgentUserId = agentState?.user_id ?? null;
 
     // Handle outbound connect requests from backend (RDN dial)
     const isOutboundConnectRequest = Boolean(event.payload?.outbound_connect_request);
@@ -689,22 +690,46 @@ export default function App() {
         muted: false,
       }));
     } else if (event.type === 'call_answered' && callSid) {
-      setCalls((prev) => prev.map((call) => (
-        call.callSid === callSid
-          ? { ...call, status: 'in_progress' }
-          : call
-      )));
+      stopIncomingRingtone();
+      if (event.agent_user_id && localAgentUserId && event.agent_user_id !== localAgentUserId) {
+        setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
+        setIncomingConferences((prev) => {
+          if (!prev.has(callSid)) return prev;
+          const next = new Map(prev);
+          next.delete(callSid);
+          return next;
+        });
+      } else {
+        setCalls((prev) => prev.map((call) => (
+          call.callSid === callSid
+            ? { ...call, status: 'in_progress' }
+            : call
+        )));
+      }
     } else if (event.type === 'call_updated' && callSid) {
-      setCalls((prev) => prev.map((call) => (
-        call.callSid === callSid
-          ? {
-              ...call,
-              status: payloadStatus || call.status,
-              from: payloadFrom ?? call.from,
-              to: payloadTo ?? call.to,
-            }
-          : call
-      )));
+      if (payloadStatus === 'in_progress') {
+        stopIncomingRingtone();
+      }
+      if (payloadStatus === 'in_progress' && event.agent_user_id && localAgentUserId && event.agent_user_id !== localAgentUserId) {
+        setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
+        setIncomingConferences((prev) => {
+          if (!prev.has(callSid)) return prev;
+          const next = new Map(prev);
+          next.delete(callSid);
+          return next;
+        });
+      } else {
+        setCalls((prev) => prev.map((call) => (
+          call.callSid === callSid
+            ? {
+                ...call,
+                status: payloadStatus || call.status,
+                from: payloadFrom ?? call.from,
+                to: payloadTo ?? call.to,
+              }
+            : call
+        )));
+      }
 
       if (payloadCommand === 'accept') {
         void executeRemoteAccept(callSid, payloadCommandId);
@@ -732,7 +757,7 @@ export default function App() {
     if (refreshEvents.has(event.type)) {
       void refreshAgentSnapshot(`stream:${event.type}`);
     }
-  }, [applySnapshot, executeRemoteAccept, refreshAgentSnapshot, voice]);
+  }, [agentState?.user_id, applySnapshot, executeRemoteAccept, refreshAgentSnapshot, stopIncomingRingtone, voice]);
 
   const hydrateBootstrapAndSession = useCallback(async () => {
     if (!backendUrl) return;
@@ -1030,6 +1055,7 @@ export default function App() {
         setMessage(`No se pudo unir a conferencia para ${callSid}: ${result.error}`);
         return;
       }
+      stopIncomingRingtone();
       // Clean up the incoming conference mapping
       setIncomingConferences((prev) => {
         const next = new Map(prev);
@@ -1109,12 +1135,22 @@ export default function App() {
     ringtoneRef.current.context = null;
   }, [stopIncomingRingtone]);
 
+  const hasInProgressCalls = useMemo(() => (
+    calls.some((call) => call.status === 'in_progress')
+  ), [calls]);
+
   const hasIncomingRingingCalls = useMemo(() => (
-    calls.some((call) => (
+    !hasInProgressCalls
+    && calls.some((call) => (
       call.direction === 'inbound'
       && (call.status === 'ringing' || call.status === 'in_queue')
     ))
-  ), [calls]);
+  ), [calls, hasInProgressCalls]);
+
+  useEffect(() => {
+    if (!hasInProgressCalls) return;
+    stopIncomingRingtone();
+  }, [hasInProgressCalls, stopIncomingRingtone]);
 
   useEffect(() => {
     if (hasIncomingRingingCalls) {
