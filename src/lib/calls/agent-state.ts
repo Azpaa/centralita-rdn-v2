@@ -55,6 +55,8 @@ type MinimalCallRecordRow = Pick<
   | 'answered_by_user_id'
   | 'twilio_data'
   | 'queue_id'
+  | 'last_webhook_at'
+  | 'last_verified_at'
 >;
 
 function getTextFromTwilioData(data: Record<string, unknown> | null, key: string): string | null {
@@ -96,8 +98,21 @@ async function reconcileStaleActiveCalls(
     .filter((row) => {
       if (row.status !== 'in_progress') return false;
       if (!row.twilio_call_sid || row.twilio_call_sid.startsWith('pending-')) return false;
+
+      // Consider the freshest signal we have. Phase 4 pattern:
+      // max(last_webhook_at, last_verified_at, started_at). If any of these
+      // is recent we know the call is alive without hitting Twilio; only
+      // ping the API when every signal is older than the min age.
+      const lastWebhookMs = row.last_webhook_at ? Date.parse(row.last_webhook_at) : 0;
+      const lastVerifiedMs = row.last_verified_at ? Date.parse(row.last_verified_at) : 0;
       const startedAtMs = Date.parse(row.started_at);
-      return Number.isFinite(startedAtMs) && (nowMs - startedAtMs) >= SELF_HEAL_MIN_AGE_MS;
+      const latestSignalMs = Math.max(
+        Number.isFinite(lastWebhookMs) ? lastWebhookMs : 0,
+        Number.isFinite(lastVerifiedMs) ? lastVerifiedMs : 0,
+        Number.isFinite(startedAtMs) ? startedAtMs : 0,
+      );
+      if (latestSignalMs === 0) return false;
+      return (nowMs - latestSignalMs) >= SELF_HEAL_MIN_AGE_MS;
     })
     .slice(0, SELF_HEAL_MAX_CHECKS);
 
@@ -246,7 +261,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
   // Main assignment source: answered_by_user_id
   const answeredCallsQuery = await supabase
     .from('call_records')
-    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id, last_webhook_at, last_verified_at')
     .eq('answered_by_user_id', userId)
     .in('status', ACTIVE_STATUSES)
     .is('ended_at', null)
@@ -256,7 +271,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
   // Secondary assignment source: resolved agent in twilio_data (RDN initiated/adopted)
   const resolvedAgentCallsQuery = await supabase
     .from('call_records')
-    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id, last_webhook_at, last_verified_at')
     .eq('twilio_data->>resolved_agent_id', userId)
     .in('status', ACTIVE_STATUSES)
     .is('ended_at', null)
@@ -266,7 +281,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
   // Fallback source for legacy browser-originated calls
   const initiatedCallsQuery = await supabase
     .from('call_records')
-    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id, last_webhook_at, last_verified_at')
     .eq('twilio_data->>initiated_by', userId)
     .in('status', ACTIVE_STATUSES)
     .is('ended_at', null)
@@ -276,7 +291,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
   // Ringing/in_queue calls currently targeted to this user (conference pre-answer routing).
   const targetedPendingCallsQuery = await supabase
     .from('call_records')
-    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id, last_webhook_at, last_verified_at')
     .in('status', ['ringing', 'in_queue'] as CallRecord['status'][])
     .is('ended_at', null)
     .contains('twilio_data', { current_ring_target_user_ids: [userId] })
