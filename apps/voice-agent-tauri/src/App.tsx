@@ -159,6 +159,7 @@ export default function App() {
   const lastSyncedAvailabilityRef = useRef<boolean | null>(null);
   const reconnectVoiceRef = useRef<() => Promise<void>>(async () => {});
   const lastRecoveryTriggerAtRef = useRef<number>(0);
+  const localCallSidByParentSidRef = useRef<Map<string, string>>(new Map());
   const ringtoneAudioRef = useRef<HTMLAudioElement | null>(null);
   const ringtoneRef = useRef<{
     context: AudioContext | null;
@@ -215,6 +216,10 @@ export default function App() {
       return changed ? next : prev;
     });
   }, []);
+
+  const resolveLocalCallSid = useCallback((parentCallSid: string) => (
+    localCallSidByParentSidRef.current.get(parentCallSid) ?? parentCallSid
+  ), []);
 
   const ensureFreshSession = useCallback(async (
     reason: string,
@@ -356,6 +361,11 @@ export default function App() {
   }, []);
 
   const handleVoiceEnded = useCallback((callSid: string) => {
+    // Cleanup reverse mapping when a local media leg ends.
+    for (const [parentSid, localSid] of localCallSidByParentSidRef.current.entries()) {
+      if (localSid !== callSid) continue;
+      localCallSidByParentSidRef.current.delete(parentSid);
+    }
     setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
   }, []);
 
@@ -502,6 +512,24 @@ export default function App() {
     onInfo: handleVoiceInfo,
   });
 
+  const cleanupStaleLocalCalls = useCallback(async () => {
+    // Preserve local media legs that map to calls still marked in progress by backend.
+    const inProgressParentSids = calls
+      .filter((call) => call.status === 'in_progress')
+      .map((call) => call.callSid);
+
+    const preserve = new Set<string>();
+    for (const parentSid of inProgressParentSids) {
+      const localSid = localCallSidByParentSidRef.current.get(parentSid);
+      if (localSid) preserve.add(localSid);
+    }
+
+    const staleLocalSids = voice.attachedCallSids.filter((sid) => !preserve.has(sid));
+    for (const sid of staleLocalSids) {
+      await voice.disconnectCall(sid);
+    }
+  }, [calls, voice]);
+
   useEffect(() => {
     reconnectVoiceRef.current = voice.reconnectNow;
   }, [voice.reconnectNow]);
@@ -586,6 +614,7 @@ export default function App() {
     remoteAcceptInFlightRef.current.add(callSid);
     try {
       stopIncomingRingtone();
+      await cleanupStaleLocalCalls();
       // For incoming calls, join the conference room
       const confName = incomingConferences.get(callSid) || `call-${callSid}`;
       const result = await voice.joinConference({
@@ -594,6 +623,12 @@ export default function App() {
       });
 
       if (result.ok) {
+        const localCallSid = result.data?.call_sid;
+        if (typeof localCallSid === 'string' && localCallSid.length > 0) {
+          localCallSidByParentSidRef.current.set(callSid, localCallSid);
+          // Ensure microphone starts unmuted on the new leg.
+          await voice.setMuted(localCallSid, false);
+        }
         setCalls((prev) => prev.map((call) => (
           call.callSid === callSid
             ? { ...call, status: 'in_progress' }
@@ -607,7 +642,7 @@ export default function App() {
     } finally {
       remoteAcceptInFlightRef.current.delete(callSid);
     }
-  }, [incomingConferences, markRemoteCommandProcessed, stopIncomingRingtone, voice, wasRemoteCommandProcessed]);
+  }, [cleanupStaleLocalCalls, incomingConferences, markRemoteCommandProcessed, stopIncomingRingtone, voice, wasRemoteCommandProcessed]);
 
   // Track outbound connect requests we've already processed
   const processedOutboundRequestsRef = useRef<Set<string>>(new Set());
@@ -741,6 +776,11 @@ export default function App() {
         void executeRemoteAccept(callSid, payloadCommandId);
       }
     } else if (event.type === 'call_ended' && callSid) {
+      const mappedLocalSid = localCallSidByParentSidRef.current.get(callSid);
+      if (mappedLocalSid) {
+        void voice.disconnectCall(mappedLocalSid);
+        localCallSidByParentSidRef.current.delete(callSid);
+      }
       setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
       setIncomingConferences((prev) => {
         if (!prev.has(callSid)) return prev;
@@ -1051,6 +1091,7 @@ export default function App() {
 
     if (action === 'accept') {
       stopIncomingRingtone();
+      await cleanupStaleLocalCalls();
       // Accept incoming call by joining the conference room
       // Use the conference name from SSE event if available, otherwise derive from callSid
       const confName = incomingConferences.get(callSid) || `call-${callSid}`;
@@ -1061,6 +1102,11 @@ export default function App() {
       if (!result.ok) {
         setMessage(`No se pudo unir a conferencia para ${callSid}: ${result.error}`);
         return;
+      }
+      const localCallSid = result.data?.call_sid;
+      if (typeof localCallSid === 'string' && localCallSid.length > 0) {
+        localCallSidByParentSidRef.current.set(callSid, localCallSid);
+        await voice.setMuted(localCallSid, false);
       }
       stopIncomingRingtone();
       setCalls((prev) => prev.map((call) => (
@@ -1079,7 +1125,8 @@ export default function App() {
     }
 
     if (action === 'hangup') {
-      const local = await voice.disconnectCall(callSid);
+      const local = await voice.disconnectCall(resolveLocalCallSid(callSid));
+      localCallSidByParentSidRef.current.delete(callSid);
       const backend = await withJwtRetry(
         `call_hangup:${callSid}`,
         (jwt) => callCommand(
@@ -1102,7 +1149,7 @@ export default function App() {
     }
 
     const wantsMute = action === 'mute';
-    const muteResult = await voice.setMuted(callSid, wantsMute);
+    const muteResult = await voice.setMuted(resolveLocalCallSid(callSid), wantsMute);
     if (!muteResult.ok) {
       setMessage(muteResult.error);
       return;
@@ -1130,7 +1177,7 @@ export default function App() {
 
     setMessage(`${wantsMute ? 'Mute' : 'Unmute'} aplicado en ${callSid}`);
     void refreshAgentSnapshot(`action:${action}`);
-  }, [backendUrl, conferenceName, incomingConferences, refreshAgentSnapshot, stopIncomingRingtone, voice, withJwtRetry]);
+  }, [backendUrl, cleanupStaleLocalCalls, conferenceName, incomingConferences, refreshAgentSnapshot, resolveLocalCallSid, stopIncomingRingtone, voice, withJwtRetry]);
 
   useEffect(() => () => {
     authSubscriptionRef.current?.unsubscribe();
@@ -1309,7 +1356,8 @@ export default function App() {
               )}
 
               {calls.map((call) => {
-                const attached = voice.isCallAttached(call.callSid);
+                const localControlSid = resolveLocalCallSid(call.callSid);
+                const attached = voice.isCallAttached(localControlSid);
                 const hasKnownConference = incomingConferences.has(call.callSid);
                 const canAccept = (attached || hasKnownConference) && call.status !== 'in_progress';
                 const canToggleMute = attached && call.status === 'in_progress';
