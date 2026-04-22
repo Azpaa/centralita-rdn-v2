@@ -27,6 +27,7 @@ export type AuditAction =
   | 'call.transfer'
   | 'call.accept_requested'
   | 'call.accept_confirmed'
+  | 'call.rejected'
   | 'call.mute'
   | 'call.unmute'
   | 'call.conference'

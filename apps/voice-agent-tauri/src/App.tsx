@@ -34,9 +34,10 @@ const STREAM_WATCHDOG_INTERVAL_MS = 12_000;
 const WAKE_GAP_DETECT_MS = 15_000;
 const WAKE_GAP_THRESHOLD_MS = 55_000;
 const RECOVERY_RECONNECT_THROTTLE_MS = 3_000;
-const REMOTE_ACCEPT_RETRY_DELAY_MS = 350;
-const REMOTE_ACCEPT_MAX_ATTEMPTS = 5;
-const REMOTE_COMMAND_TTL_MS = 10 * 60_000;
+// If a remote-accept command lands but media never bridges (voice engine
+// fails silently, wrong conference, etc.), force the ringtone off and clear
+// in-flight flags after this timeout so the operator isn't trapped.
+const REMOTE_ACCEPT_WATCHDOG_MS = 4_000;
 const REMOTE_COMMAND_MAX_TRACKED = 200;
 // Unified dedup for canonical SSE events keyed by event.id. Catches
 // duplicates from both Twilio webhook retries (now collapsed server-side
@@ -729,19 +730,10 @@ export default function App() {
     availabilitySyncInFlightRef.current = false;
   }, [accessToken]);
 
-  const wasRemoteCommandProcessed = useCallback((commandId: string): boolean => {
-    const now = Date.now();
-    const tracked = processedRemoteCommandIdsRef.current;
-
-    for (const [knownId, timestamp] of tracked.entries()) {
-      if (now - timestamp > REMOTE_COMMAND_TTL_MS) {
-        tracked.delete(knownId);
-      }
-    }
-
-    return tracked.has(commandId);
-  }, []);
-
+  // `wasRemoteCommandProcessed` used to short-circuit duplicate commandIds
+  // but we removed that check — SSE replays of the same commandId are a
+  // valid retry signal when the first attempt never bridged media. Dedup
+  // now lives strictly on in-flight callSid inside executeRemoteAccept.
   const markRemoteCommandProcessed = useCallback((commandId: string) => {
     const tracked = processedRemoteCommandIdsRef.current;
     tracked.set(commandId, Date.now());
@@ -760,14 +752,35 @@ export default function App() {
   // naming only as a last resort — if both snapshot and SSE events failed
   // to deliver a conference_name, the backend probably didn't wire one and
   // joinConference would fail anyway.
-  const resolveConferenceNameForParent = useCallback((parentSid: string): string => {
+  const resolveConferenceNameForParent = useCallback((
+    parentSid: string,
+    preferred: string | null = null,
+  ): string => {
+    if (preferred && preferred.length > 0) return preferred;
     const existing = calls.find((call) => call.callSid === parentSid);
     if (existing && existing.conferenceName) return existing.conferenceName;
     return `call-${parentSid}`;
   }, [calls]);
 
-  const executeRemoteAccept = useCallback(async (callSid: string, commandId: string | null) => {
-    if (commandId && wasRemoteCommandProcessed(commandId)) return;
+  // Orders from the RDN web UI land here via SSE. This path is the SAME
+  // primitive the local Accept button uses (voice.joinConference), but it
+  // runs under tighter uncertainty: the event may be a replay, the softphone
+  // may not be fully primed, the conference name may be stale.
+  //
+  // Design rules:
+  //  - Dedup ONLY by callSid in-flight. We used to also skip if commandId
+  //    had been seen before, but that trapped legitimate retries after
+  //    SSE replay and left the operator "pending" forever.
+  //  - Prefer the conference_name from the event payload over local state
+  //    so we land in the room the backend actually created.
+  //  - Arm a watchdog: if media doesn't bridge within REMOTE_ACCEPT_WATCHDOG_MS
+  //    and no call is attached locally, force the ringtone off and clear the
+  //    in-flight flag. Better to surface a failure than to ring forever.
+  const executeRemoteAccept = useCallback(async (
+    callSid: string,
+    commandId: string | null,
+    conferenceNameFromEvent: string | null,
+  ) => {
     if (remoteAcceptInFlightRef.current.has(callSid)) return;
 
     remoteAcceptInFlightRef.current.add(callSid);
@@ -776,34 +789,45 @@ export default function App() {
       pendingAcceptCommandIdRef.current.set(callSid, commandId);
     }
     bumpInFlightVersion();
+
+    const watchdog = window.setTimeout(() => {
+      if (voiceRef.current?.isCallAttached(callSid)) return;
+      stopIncomingRingtone();
+      if (acceptInFlightRef.current.delete(callSid)) bumpInFlightVersion();
+      pendingAcceptCommandIdRef.current.delete(callSid);
+      setMessage(
+        `Timeout aceptando ${callSid}: el softphone no unió media. Intenta aceptar desde la app.`
+      );
+    }, REMOTE_ACCEPT_WATCHDOG_MS);
+
     try {
       await cleanupStaleLocalCalls();
-      const confName = resolveConferenceNameForParent(callSid);
+      const confName = resolveConferenceNameForParent(callSid, conferenceNameFromEvent);
       const result = await voice.joinConference({
         conferenceName: confName,
         parentCallSid: callSid,
       });
 
       if (result.ok) {
-        // Only stop the ringtone once the media path is actually joined.
-        // Stopping earlier masks accept failures and leaves the user thinking
-        // they answered when no audio path exists.
+        // joinConference returned ok → Call object is wired up. Stop the
+        // ringtone now (the watchdog is redundant past this point but harmless).
         stopIncomingRingtone();
-        // Ensure the microphone starts unmuted. Keyed by parent SID thanks to
-        // the engine's internal parent→local translation.
         await voice.setMuted(callSid, false);
         if (commandId) markRemoteCommandProcessed(commandId);
         setMessage(`Orden remota ejecutada: unido a conferencia para llamada ${callSid}.`);
       } else {
-        // Accept failed — clear the in-flight flag so the UI reverts from
-        // 'accepting' back to 'ringing'. The ringtone keeps playing because
-        // we never stopped it in the failure path (intended).
+        // Accept failed — revert UI and stop the ringtone so the operator
+        // isn't left with audio they can't mute. Previously we kept the
+        // ringtone on to "reveal" the failure; in production this just
+        // traps the user. The message still surfaces the error.
+        stopIncomingRingtone();
         acceptInFlightRef.current.delete(callSid);
         pendingAcceptCommandIdRef.current.delete(callSid);
         bumpInFlightVersion();
         setMessage(`No se pudo unir a conferencia para ${callSid}: ${result.error}`);
       }
     } finally {
+      window.clearTimeout(watchdog);
       remoteAcceptInFlightRef.current.delete(callSid);
     }
   }, [
@@ -813,7 +837,6 @@ export default function App() {
     resolveConferenceNameForParent,
     stopIncomingRingtone,
     voice,
-    wasRemoteCommandProcessed,
   ]);
 
   // Track outbound connect requests we've already processed
@@ -969,7 +992,10 @@ export default function App() {
       }
 
       if (payloadCommand === 'accept') {
-        void executeRemoteAccept(callSid, payloadCommandId);
+        const conferenceNameFromEvent = typeof event.payload?.conference_name === 'string'
+          ? event.payload.conference_name
+          : null;
+        void executeRemoteAccept(callSid, payloadCommandId, conferenceNameFromEvent);
       }
     } else if (event.type === 'call_ended' && callSid) {
       // Engine is keyed by parent SID — one disconnect covers the local leg.

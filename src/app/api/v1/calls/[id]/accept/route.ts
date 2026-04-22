@@ -126,6 +126,26 @@ export async function POST(
     );
   }
 
+  // Pull the conference name written by the incoming webhook so the
+  // softphone doesn't have to rely on its `call-<sid>` fallback. If the
+  // fallback ever drifts from what the webhook wrote, joinConference
+  // silently lands in an empty room and media never bridges.
+  const supabase = createAdminClient();
+  const { data: callRow } = await supabase
+    .from('call_records')
+    .select('twilio_data')
+    .eq('twilio_call_sid', callSid)
+    .maybeSingle();
+
+  const conferenceName = (() => {
+    const data = callRow?.twilio_data;
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      const value = (data as Record<string, unknown>).conference_name;
+      if (typeof value === 'string' && value.length > 0) return value;
+    }
+    return `call-${callSid}`;
+  })();
+
   const commandId = crypto.randomUUID();
   const requestedAt = new Date().toISOString();
 
@@ -140,6 +160,7 @@ export async function POST(
       command: 'accept',
       command_id: commandId,
       call_sid: callSid,
+      conference_name: conferenceName,
       target_user_ids: targetUserIds,
       requested_at: requestedAt,
       requested_by_user_id: auth.userId ?? null,

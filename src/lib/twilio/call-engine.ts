@@ -389,11 +389,16 @@ export async function createCallRecord(params: {
   if (error) {
     // 23505 = unique_violation. Two constraints can fire here:
     //   1. `twilio_call_sid` UNIQUE → Twilio webhook retry or duplicate SID.
+    //      (Real SID winners are always returned — they own the media path.)
     //   2. `idx_call_records_pending_agent_unique` (partial, migration 007)
     //      → concurrent dial racing for the same agent.
-    // In both cases the existing row is the "winner" and callers should
-    // stay idempotent by receiving its id rather than treating it as a
-    // hard failure.
+    //
+    // For the pending_agent case: returning the existing id silently is only
+    // correct if it's a genuine double-submit of the SAME attempt. If the
+    // existing row is stale (>30s old) or still carries a `pending-` SID
+    // placeholder (device.connect never resolved), we force-close it so the
+    // new dial can proceed. Otherwise the operator gets trapped — the UI
+    // shows "accepting" tied to a dead row forever.
     if ((error as { code?: string }).code === '23505') {
       const { data: existingBySid } = await supabase
         .from('call_records')
@@ -407,13 +412,79 @@ export async function createCallRecord(params: {
       if (params.status === 'pending_agent' && params.answeredByUserId) {
         const { data: existingByAgent } = await supabase
           .from('call_records')
-          .select('id')
+          .select('id, started_at, twilio_call_sid')
           .eq('answered_by_user_id', params.answeredByUserId)
           .eq('status', 'pending_agent')
           .is('ended_at', null)
           .maybeSingle();
+
         if (existingByAgent) {
-          return (existingByAgent as { id: string }).id;
+          const existing = existingByAgent as {
+            id: string;
+            started_at: string | null;
+            twilio_call_sid: string | null;
+          };
+          const startedAtMs = existing.started_at
+            ? Date.parse(existing.started_at)
+            : 0;
+          const ageMs = Number.isFinite(startedAtMs)
+            ? Date.now() - startedAtMs
+            : Number.POSITIVE_INFINITY;
+          const hasRealSid = Boolean(
+            existing.twilio_call_sid
+            && !existing.twilio_call_sid.startsWith('pending-')
+          );
+
+          // Genuine fresh double-submit: same attempt, return its id.
+          if (ageMs < 30_000 && hasRealSid) {
+            return existing.id;
+          }
+
+          // Stale or unresolved placeholder: force-close and retry insert.
+          console.warn(
+            `[CREATE_CALL_RECORD] Force-closing stale pending_agent ${existing.id}`
+            + ` age_ms=${ageMs} sid=${existing.twilio_call_sid ?? 'null'}`
+          );
+          await supabase
+            .from('call_records')
+            .update({
+              status: 'canceled' as CallStatus,
+              ended_at: new Date().toISOString(),
+              twilio_data: {
+                ...(params.twilioData ?? {}),
+                force_closed_reason: 'stale_pending_agent_before_new_dial',
+                force_closed_at: new Date().toISOString(),
+                force_closed_age_ms: Number.isFinite(ageMs) ? ageMs : null,
+              },
+            })
+            .eq('id', existing.id)
+            .is('ended_at', null);
+
+          const retry = await supabase
+            .from('call_records')
+            .insert({
+              twilio_call_sid: params.twilioCallSid,
+              direction: params.direction as CallDirection,
+              from_number: params.fromNumber,
+              to_number: params.toNumber,
+              status: params.status as CallStatus,
+              started_at: new Date().toISOString(),
+              queue_id: params.queueId ?? null,
+              phone_number_id: params.phoneNumberId ?? null,
+              answered_by_user_id: params.answeredByUserId ?? null,
+              twilio_data: params.twilioData ?? null,
+            })
+            .select('id')
+            .single();
+
+          if (retry.error) {
+            console.error(
+              '[CREATE_CALL_RECORD] Retry after force-close failed:',
+              retry.error
+            );
+            return null;
+          }
+          return (retry.data as { id: string })?.id ?? null;
         }
       }
     }
