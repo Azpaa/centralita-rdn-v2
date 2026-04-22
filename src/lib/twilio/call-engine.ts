@@ -195,6 +195,30 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
           continue;
         }
       } catch (verifyErr) {
+        const errorCode = (verifyErr as { code?: number; status?: number })?.code;
+        const errorStatus = (verifyErr as { code?: number; status?: number })?.status;
+        const isNotFound = errorCode === 20404 || errorStatus === 404;
+
+        if (isNotFound) {
+          const endedAt = new Date().toISOString();
+          const { error: reconcileErr } = await supabase
+            .from('call_records')
+            .update({
+              status: 'canceled',
+              ended_at: endedAt,
+            })
+            .eq('twilio_call_sid', callSid)
+            .eq('status', 'in_progress')
+            .is('ended_at', null);
+
+          if (reconcileErr) {
+            console.warn(`[CALL-ENGINE] Failed reconciling missing busy call ${callSid}:`, reconcileErr.message);
+          } else {
+            console.log(`[CALL-ENGINE] Reconciled missing busy call ${callSid} -> canceled`);
+          }
+          continue;
+        }
+
         console.warn(
           `[CALL-ENGINE] Unable to verify busy call ${callSid} in Twilio: ${
             verifyErr instanceof Error ? verifyErr.message : 'unknown_error'

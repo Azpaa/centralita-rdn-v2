@@ -11,6 +11,7 @@ export type TimeoutAction = 'hangup' | 'forward' | 'voicemail' | 'keep_waiting';
 export type OohAction = 'hangup' | 'forward' | 'voicemail';
 export type CallDirection = 'inbound' | 'outbound';
 export type CallStatus =
+  | 'pending_agent'
   | 'ringing'
   | 'in_queue'
   | 'in_progress'

@@ -8,7 +8,85 @@ import { createCallRecord } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { auditLog } from '@/lib/api/audit';
 import { emitEvent } from '@/lib/events/emitter';
-import type { PhoneNumber, User } from '@/lib/types/database';
+import type { CallStatus, PhoneNumber, User } from '@/lib/types/database';
+
+const PRE_DIAL_RELEASE_STATUSES: CallStatus[] = ['in_progress', 'ringing', 'in_queue', 'pending_agent'];
+
+type AgentDialCleanupRow = {
+  id: string;
+  twilio_call_sid: string | null;
+  status: string;
+  started_at: string;
+  twilio_data: Record<string, unknown> | null;
+};
+
+async function releaseAgentCallsBeforeNewDial(params: {
+  supabase: ReturnType<typeof createAdminClient>;
+  twilioClient: ReturnType<typeof getTwilioClient>;
+  agentId: string;
+  destination: string;
+}): Promise<number> {
+  const { data } = await params.supabase
+    .from('call_records')
+    .select('id, twilio_call_sid, status, started_at, twilio_data')
+    .eq('answered_by_user_id', params.agentId)
+    .in('status', PRE_DIAL_RELEASE_STATUSES)
+    .is('ended_at', null)
+    .order('started_at', { ascending: true })
+    .limit(10);
+
+  const rows = (data || []) as AgentDialCleanupRow[];
+  if (rows.length === 0) return 0;
+
+  let released = 0;
+  for (const row of rows) {
+    const sid = (row.twilio_call_sid || '').trim();
+    let canCloseRecord = !sid || sid.startsWith('pending-');
+
+    if (sid && !sid.startsWith('pending-')) {
+      try {
+        await params.twilioClient.calls(sid).update({ status: 'completed' });
+        canCloseRecord = true;
+      } catch (err) {
+        const code = (err as { code?: number; status?: number })?.code;
+        const status = (err as { code?: number; status?: number })?.status;
+        const isNotFound = code === 20404 || status === 404;
+        if (isNotFound) {
+          canCloseRecord = true;
+        } else {
+          console.warn(
+            `[DIAL] Could not release active call before new dial agent=${params.agentId} call_sid=${sid} error=${
+              err instanceof Error ? err.message : 'unknown_error'
+            }`
+          );
+        }
+      }
+    }
+
+    if (!canCloseRecord) continue;
+
+    const mergedTwilioData = {
+      ...(row.twilio_data || {}),
+      superseded_by_new_dial: true,
+      superseded_by_new_dial_at: new Date().toISOString(),
+      superseded_by_new_dial_destination: params.destination,
+    };
+
+    await params.supabase
+      .from('call_records')
+      .update({
+        status: 'canceled',
+        ended_at: new Date().toISOString(),
+        twilio_data: mergedTwilioData,
+      })
+      .eq('id', row.id)
+      .is('ended_at', null);
+
+    released += 1;
+  }
+
+  return released;
+}
 
 /**
  * POST /api/v1/calls/dial
@@ -128,6 +206,19 @@ export async function POST(req: NextRequest) {
     // The agent's device.connect() triggers the TwiML App voice URL (/client)
     // which generates <Dial><Number>destination</Number></Dial>.
     if (resolvedAgent) {
+      const releasedCalls = await releaseAgentCallsBeforeNewDial({
+        supabase,
+        twilioClient,
+        agentId: resolvedAgent.id,
+        destination: destination_number,
+      });
+
+      if (releasedCalls > 0) {
+        console.log(
+          `[DIAL] Released ${releasedCalls} previous call(s) before new dial for agent=${resolvedAgent.id}`
+        );
+      }
+
       let metadataJson = '';
       if (metadata) {
         try {

@@ -1,5 +1,6 @@
 import { createAdminClient } from '@/lib/supabase/admin';
-import type { CallRecord, User } from '@/lib/types/database';
+import { getTwilioClient } from '@/lib/twilio/client';
+import type { CallRecord, CallStatus, User } from '@/lib/types/database';
 
 export type AgentOperationalStatus =
   | 'inactive'
@@ -37,6 +38,9 @@ export type AgentRuntimeSnapshot = {
 };
 
 const ACTIVE_STATUSES: Array<CallRecord['status']> = ['ringing', 'in_queue', 'in_progress'];
+const TERMINAL_TWILIO_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
+const SELF_HEAL_MIN_AGE_MS = 30 * 1000;
+const SELF_HEAL_MAX_CHECKS = 5;
 
 type MinimalCallRecordRow = Pick<
   CallRecord,
@@ -71,6 +75,78 @@ function mapCallRecord(row: MinimalCallRecordRow): AgentActiveCall {
     resolved_agent_id: getTextFromTwilioData(row.twilio_data, 'resolved_agent_id'),
     conference_name: getTextFromTwilioData(row.twilio_data, 'conference_name'),
   };
+}
+
+function mapTerminalTwilioStatus(status: string): CallStatus {
+  if (status === 'no-answer') return 'no_answer';
+  return status as CallStatus;
+}
+
+async function reconcileStaleActiveCalls(
+  rows: MinimalCallRecordRow[],
+): Promise<MinimalCallRecordRow[]> {
+  const nowMs = Date.now();
+  const supabase = createAdminClient();
+  const twilioClient = getTwilioClient();
+  const staleIds = new Set<string>();
+
+  const candidates = rows
+    .filter((row) => {
+      if (row.status !== 'in_progress') return false;
+      if (!row.twilio_call_sid || row.twilio_call_sid.startsWith('pending-')) return false;
+      const startedAtMs = Date.parse(row.started_at);
+      return Number.isFinite(startedAtMs) && (nowMs - startedAtMs) >= SELF_HEAL_MIN_AGE_MS;
+    })
+    .slice(0, SELF_HEAL_MAX_CHECKS);
+
+  for (const row of candidates) {
+    const callSid = row.twilio_call_sid as string;
+
+    try {
+      const liveCall = await twilioClient.calls(callSid).fetch();
+      const liveStatus = (liveCall.status || '').toLowerCase();
+      if (!TERMINAL_TWILIO_STATUSES.has(liveStatus)) continue;
+
+      const endedAt = liveCall.endTime
+        ? new Date(liveCall.endTime).toISOString()
+        : new Date().toISOString();
+      const parsedDuration = parseInt(String(liveCall.duration ?? '0'), 10);
+      const safeDuration = Number.isFinite(parsedDuration) ? parsedDuration : 0;
+
+      await supabase
+        .from('call_records')
+        .update({
+          status: mapTerminalTwilioStatus(liveStatus),
+          ended_at: endedAt,
+          duration: safeDuration,
+        })
+        .eq('id', row.id)
+        .eq('status', 'in_progress')
+        .is('ended_at', null);
+
+      staleIds.add(row.id);
+    } catch (err) {
+      const errorCode = (err as { code?: number; status?: number })?.code;
+      const errorStatus = (err as { code?: number; status?: number })?.status;
+      const isNotFound = errorCode === 20404 || errorStatus === 404;
+      if (!isNotFound) continue;
+
+      await supabase
+        .from('call_records')
+        .update({
+          status: 'canceled',
+          ended_at: new Date().toISOString(),
+        })
+        .eq('id', row.id)
+        .eq('status', 'in_progress')
+        .is('ended_at', null);
+
+      staleIds.add(row.id);
+    }
+  }
+
+  if (staleIds.size === 0) return rows;
+  return rows.filter((row) => !staleIds.has(row.id));
 }
 
 export async function resolveAgentRuntimeSnapshot(userId: string): Promise<AgentRuntimeSnapshot | null> {
@@ -138,7 +214,9 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
     byId.set(row.id, row);
   }
 
-  const activeCalls = [...byId.values()]
+  const reconciledRows = await reconcileStaleActiveCalls([...byId.values()]);
+
+  const activeCalls = reconciledRows
     .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime())
     .slice(0, 25)
     .map(mapCallRecord);
