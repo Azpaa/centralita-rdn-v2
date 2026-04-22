@@ -18,8 +18,6 @@ const STUCK_IN_PROGRESS_THRESHOLD_MINUTES = 2;
 const STUCK_RINGING_THRESHOLD_MINUTES = 3;
 
 /**
- * POST /api/v1/calls/reconcile
- *
  * Reconciles stuck calls:
  * - Finds call_records with status='in_progress' older than STUCK_IN_PROGRESS_THRESHOLD_MINUTES
  * - Checks real status via Twilio API
@@ -28,15 +26,28 @@ const STUCK_RINGING_THRESHOLD_MINUTES = 3;
  *
  * Also reconciles stuck 'ringing'/'in_queue' calls older than STUCK_RINGING_THRESHOLD_MINUTES.
  *
- * Intended cadence: cron every 60 seconds (previously recommended 5 min — too slow
- * for the "ghost busy" problem caused by lost webhooks). Requires admin session or M2M API key.
+ * Runs every 60 s via Vercel Cron (GET, authorized by CRON_SECRET). Also callable
+ * manually via POST (admin session or M2M API key) for on-demand reconciliation.
  */
-export async function POST(req: NextRequest) {
-  const auth = await authenticate(req);
-  if (!isAuthenticated(auth)) return auth;
 
-  if (auth.authMethod === 'session' && auth.role !== 'admin') {
-    return apiForbidden('Solo admin puede ejecutar reconciliación');
+// Vercel Cron calls via GET with `Authorization: Bearer <CRON_SECRET>`.
+// We short-circuit authenticate() for that path instead of registering
+// a fake "cron user" in the normal auth pipeline.
+function isAuthorizedCronRequest(req: NextRequest): boolean {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) return false;
+  const header = req.headers.get('authorization');
+  return header === `Bearer ${secret}`;
+}
+
+async function handleReconcile(req: NextRequest) {
+  if (!isAuthorizedCronRequest(req)) {
+    const auth = await authenticate(req);
+    if (!isAuthenticated(auth)) return auth;
+
+    if (auth.authMethod === 'session' && auth.role !== 'admin') {
+      return apiForbidden('Solo admin puede ejecutar reconciliación');
+    }
   }
 
   const supabase = createAdminClient();
@@ -145,4 +156,12 @@ export async function POST(req: NextRequest) {
 
   console.log(`[RECONCILE] Done: checked=${checked} reconciled=${reconciled}`);
   return apiSuccess({ reconciled, checked, total_stuck: allStuck.length, details });
+}
+
+export async function GET(req: NextRequest) {
+  return handleReconcile(req);
+}
+
+export async function POST(req: NextRequest) {
+  return handleReconcile(req);
 }

@@ -387,6 +387,36 @@ export async function createCallRecord(params: {
     .single();
 
   if (error) {
+    // 23505 = unique_violation. Two constraints can fire here:
+    //   1. `twilio_call_sid` UNIQUE → Twilio webhook retry or duplicate SID.
+    //   2. `idx_call_records_pending_agent_unique` (partial, migration 007)
+    //      → concurrent dial racing for the same agent.
+    // In both cases the existing row is the "winner" and callers should
+    // stay idempotent by receiving its id rather than treating it as a
+    // hard failure.
+    if ((error as { code?: string }).code === '23505') {
+      const { data: existingBySid } = await supabase
+        .from('call_records')
+        .select('id')
+        .eq('twilio_call_sid', params.twilioCallSid)
+        .maybeSingle();
+      if (existingBySid) {
+        return (existingBySid as { id: string }).id;
+      }
+
+      if (params.status === 'pending_agent' && params.answeredByUserId) {
+        const { data: existingByAgent } = await supabase
+          .from('call_records')
+          .select('id')
+          .eq('answered_by_user_id', params.answeredByUserId)
+          .eq('status', 'pending_agent')
+          .is('ended_at', null)
+          .maybeSingle();
+        if (existingByAgent) {
+          return (existingByAgent as { id: string }).id;
+        }
+      }
+    }
     console.error('Error creating call record:', error);
     return null;
   }

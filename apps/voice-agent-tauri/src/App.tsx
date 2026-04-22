@@ -468,9 +468,11 @@ export default function App() {
         : call
     )));
 
-    // Phase 4: tell the backend our softphone confirmed media. Fire-and-forget:
-    // a missed confirm only removes an observability signal, it does not stall
-    // the call. The backend stamps last_verified_at on receipt.
+    // Phase 4: tell the backend our softphone confirmed media. Fire-and-forget
+    // for the call UX, but retry with backoff because losing this signal
+    // leaves the backend without the last_verified_at freshness timestamp it
+    // uses to tell live calls apart from ghosts. /accept/confirm is
+    // idempotent server-side, so repeats are safe.
     const engineAcceptedAt = new Date().toISOString();
     const commandId = pendingAcceptCommandIdRef.current.get(parentSid) ?? null;
     pendingAcceptCommandIdRef.current.delete(parentSid);
@@ -479,12 +481,22 @@ export default function App() {
       void (async () => {
         const body: Record<string, unknown> = { engine_accepted_at: engineAcceptedAt };
         if (commandId) body.command_id = commandId;
-        const result = await withJwtRetry(
-          `accept_confirm:${parentSid}`,
-          (jwt) => callCommand(backendUrl, jwt, `/api/v1/calls/${parentSid}/accept/confirm`, body),
-        );
-        if (!result.ok) {
-          console.warn(`[ACCEPT-CONFIRM] Failed for ${parentSid}: ${result.error}`);
+
+        const delaysMs = [0, 1_000, 3_000];
+        for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
+          if (delaysMs[attempt] > 0) {
+            await new Promise((resolve) => setTimeout(resolve, delaysMs[attempt]));
+          }
+          const result = await withJwtRetry(
+            `accept_confirm:${parentSid}:attempt=${attempt + 1}`,
+            (jwt) => callCommand(backendUrl, jwt, `/api/v1/calls/${parentSid}/accept/confirm`, body),
+          );
+          if (result.ok) return;
+          if (attempt === delaysMs.length - 1) {
+            console.warn(
+              `[ACCEPT-CONFIRM] Gave up after ${attempt + 1} attempts for ${parentSid}: ${result.error}`,
+            );
+          }
         }
       })();
     }

@@ -12,6 +12,12 @@ import type { CallStatus, PhoneNumber, User } from '@/lib/types/database';
 
 const PRE_DIAL_RELEASE_STATUSES: CallStatus[] = ['in_progress', 'ringing', 'in_queue', 'pending_agent'];
 const DIAL_FRESHNESS_WINDOW_MS = 30 * 1000;
+// Absolute age after which we force-close a row whose Twilio API verification
+// keeps failing (non-404). Without this, a sustained Twilio outage would leave
+// the agent's existing row alive forever and block every subsequent dial. The
+// threshold is intentionally comfortable (>>typical call duration) so we only
+// kick in when the row is genuinely cold.
+const DIAL_PRE_RECONCILE_ABSOLUTE_BACKSTOP_MS = 10 * 60 * 1000;
 const DIAL_TERMINAL_TWILIO_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
 
 type AgentDialCleanupRow = {
@@ -197,6 +203,30 @@ async function reconcileAgentCallsBeforeNewDial(params: {
       const status = (err as { code?: number; status?: number })?.status;
       const isNotFound = code === 20404 || status === 404;
       if (!isNotFound) {
+        // Twilio API reachable-but-erroring. Normally we preserve (err on
+        // the side of keeping a possibly live call). The absolute-age
+        // backstop flips that decision for rows that have been cold for
+        // minutes already: at that point they're almost certainly dead
+        // and leaving them blocks the agent from dialing anything else.
+        const startedAtMs = Date.parse(row.started_at);
+        const coldestSignalMs = Math.max(
+          Number.isFinite(startedAtMs) ? startedAtMs : 0,
+          lastWebhookMs,
+          lastVerifiedMs,
+        );
+        const absoluteAgeMs = coldestSignalMs ? nowMs - coldestSignalMs : Infinity;
+        if (absoluteAgeMs >= DIAL_PRE_RECONCILE_ABSOLUTE_BACKSTOP_MS) {
+          console.warn(
+            `[DIAL] Pre-dial reconcile: Twilio unreachable for sid=${sid} but row age=${absoluteAgeMs}ms >= backstop; force-closing to unblock agent=${params.agentId}.`,
+          );
+          const closed = await closePreDialRow(params.supabase, row, params.destination, {
+            reason: 'stale_before_new_dial_absolute_backstop',
+            status: 'canceled',
+          });
+          if (closed) released += 1;
+          continue;
+        }
+
         console.warn(
           `[DIAL] Pre-dial reconcile could not verify agent=${params.agentId} sid=${sid}: ${
             err instanceof Error ? err.message : 'unknown_error'
