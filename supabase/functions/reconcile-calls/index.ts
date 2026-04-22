@@ -16,8 +16,11 @@ type CandidateCall = {
 
 const TERMINAL_TWILIO = new Set(["completed", "busy", "no-answer", "failed", "canceled"]);
 const WAITING_STATUSES = ["ringing", "in_queue"];
-const IN_PROGRESS_MINUTES = 30;
-const WAITING_MINUTES = 10;
+// Lowered from 30 → 2. A call stuck in_progress with no progress in 2 min is almost
+// always a lost webhook; 30 min left the operator ghost-busy for far too long.
+const IN_PROGRESS_MINUTES = 2;
+// Lowered from 10 → 3. Ringing/in_queue beyond 3 min is effectively dead.
+const WAITING_MINUTES = 3;
 const BATCH_LIMIT = 200;
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");

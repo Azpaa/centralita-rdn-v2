@@ -32,21 +32,22 @@ create index if not exists idx_reconcile_outbox_pending
 on public.reconcile_event_outbox (created_at)
 where delivered_at is null;
 
--- Remove previous job (if exists)
+-- Remove previous jobs (if exist) — covers both legacy 3m name and current 1m name
 do $$
 declare
   j record;
 begin
-  for j in select jobid from cron.job where jobname = 'reconcile-calls-every-3m'
+  for j in select jobid from cron.job where jobname in ('reconcile-calls-every-3m', 'reconcile-calls-every-1m')
   loop
     perform cron.unschedule(j.jobid);
   end loop;
 end $$;
 
--- Schedule every 3 minutes
+-- Schedule every minute. The edge function itself short-circuits if another run
+-- is already in flight (uq_reconcile_single_running), so overlap is safe.
 select cron.schedule(
-  'reconcile-calls-every-3m',
-  '*/3 * * * *',
+  'reconcile-calls-every-1m',
+  '* * * * *',
   $$
   select net.http_post(
     url := 'https://paugdcqmjpygrjucdjwi.supabase.co/functions/v1/reconcile-calls',
