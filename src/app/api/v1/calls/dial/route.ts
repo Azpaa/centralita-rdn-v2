@@ -11,24 +11,116 @@ import { emitEvent } from '@/lib/events/emitter';
 import type { CallStatus, PhoneNumber, User } from '@/lib/types/database';
 
 const PRE_DIAL_RELEASE_STATUSES: CallStatus[] = ['in_progress', 'ringing', 'in_queue', 'pending_agent'];
+const DIAL_FRESHNESS_WINDOW_MS = 30 * 1000;
+const DIAL_TERMINAL_TWILIO_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
 
 type AgentDialCleanupRow = {
   id: string;
   twilio_call_sid: string | null;
   status: string;
+  direction: 'inbound' | 'outbound';
+  from_number: string;
+  to_number: string;
   started_at: string;
+  queue_id: string | null;
+  answered_by_user_id: string | null;
+  last_webhook_at: string | null;
+  last_verified_at: string | null;
   twilio_data: Record<string, unknown> | null;
 };
 
-async function releaseAgentCallsBeforeNewDial(params: {
+function mapDialTerminalStatus(status: string): CallStatus {
+  if (status === 'no-answer') return 'no_answer';
+  return status as CallStatus;
+}
+
+async function closePreDialRow(
+  supabase: ReturnType<typeof createAdminClient>,
+  row: AgentDialCleanupRow,
+  destination: string,
+  options: {
+    reason: string;
+    status: CallStatus;
+    endedAt?: string;
+    duration?: number;
+    lastVerifiedAt?: string;
+  },
+): Promise<boolean> {
+  const endedAt = options.endedAt ?? new Date().toISOString();
+  const mergedTwilioData = {
+    ...(row.twilio_data || {}),
+    superseded_by_new_dial: true,
+    superseded_by_new_dial_at: endedAt,
+    superseded_by_new_dial_destination: destination,
+    pre_dial_reconcile_reason: options.reason,
+  };
+
+  type UpdatePayload = {
+    status: CallStatus;
+    ended_at: string;
+    twilio_data: Record<string, unknown>;
+    duration?: number;
+    last_verified_at?: string;
+  };
+
+  const update: UpdatePayload = {
+    status: options.status,
+    ended_at: endedAt,
+    twilio_data: mergedTwilioData,
+  };
+  if (options.duration !== undefined) update.duration = options.duration;
+  if (options.lastVerifiedAt) update.last_verified_at = options.lastVerifiedAt;
+
+  const { data } = await supabase
+    .from('call_records')
+    .update(update)
+    .eq('id', row.id)
+    .is('ended_at', null)
+    .select('id')
+    .maybeSingle();
+
+  if (!data) return false;
+
+  const callSid = row.twilio_call_sid || '';
+  if (row.direction === 'inbound' && options.status !== 'completed') {
+    await emitEvent('call.missed', {
+      call_sid: callSid,
+      direction: row.direction,
+      from: row.from_number ?? null,
+      to: row.to_number ?? null,
+      final_status: options.status,
+      queue_id: row.queue_id ?? null,
+      terminal_source: options.reason,
+    });
+  } else {
+    await emitEvent('call.completed', {
+      call_sid: callSid,
+      direction: row.direction,
+      status: options.status,
+      from: row.from_number ?? null,
+      to: row.to_number ?? null,
+      queue_id: row.queue_id ?? null,
+      answered_by_user_id: row.answered_by_user_id ?? null,
+      duration: options.duration ?? 0,
+      wait_time: null,
+      answered_at: null,
+      ended_at: endedAt,
+      terminal_source: options.reason,
+    });
+  }
+
+  return true;
+}
+
+async function reconcileAgentCallsBeforeNewDial(params: {
   supabase: ReturnType<typeof createAdminClient>;
   twilioClient: ReturnType<typeof getTwilioClient>;
   agentId: string;
   destination: string;
-}): Promise<number> {
+}): Promise<{ released: number; preserved: number }> {
   const { data } = await params.supabase
     .from('call_records')
-    .select('id, twilio_call_sid, status, started_at, twilio_data')
+    .select('id, twilio_call_sid, status, direction, from_number, to_number, started_at, queue_id, answered_by_user_id, last_webhook_at, last_verified_at, twilio_data')
     .eq('answered_by_user_id', params.agentId)
     .in('status', PRE_DIAL_RELEASE_STATUSES)
     .is('ended_at', null)
@@ -36,56 +128,94 @@ async function releaseAgentCallsBeforeNewDial(params: {
     .limit(10);
 
   const rows = (data || []) as AgentDialCleanupRow[];
-  if (rows.length === 0) return 0;
+  if (rows.length === 0) return { released: 0, preserved: 0 };
 
+  const nowMs = Date.now();
   let released = 0;
+  let preserved = 0;
+
   for (const row of rows) {
     const sid = (row.twilio_call_sid || '').trim();
-    let canCloseRecord = !sid || sid.startsWith('pending-');
+    const isPending = !sid || sid.startsWith('pending-');
 
-    if (sid && !sid.startsWith('pending-')) {
-      try {
-        await params.twilioClient.calls(sid).update({ status: 'completed' });
-        canCloseRecord = true;
-      } catch (err) {
-        const code = (err as { code?: number; status?: number })?.code;
-        const status = (err as { code?: number; status?: number })?.status;
-        const isNotFound = code === 20404 || status === 404;
-        if (isNotFound) {
-          canCloseRecord = true;
-        } else {
-          console.warn(
-            `[DIAL] Could not release active call before new dial agent=${params.agentId} call_sid=${sid} error=${
-              err instanceof Error ? err.message : 'unknown_error'
-            }`
-          );
-        }
-      }
+    // Placeholders without a real Twilio SID have no live carrier counterpart.
+    // They are leftover pending_agent records from earlier failed dials.
+    if (isPending) {
+      const closed = await closePreDialRow(params.supabase, row, params.destination, {
+        reason: 'stale_pending_before_new_dial',
+        status: 'canceled',
+      });
+      if (closed) released += 1;
+      continue;
     }
 
-    if (!canCloseRecord) continue;
+    // Freshness gate: if we've seen signal (webhook or live verification)
+    // recently, treat the call as alive and leave it alone. That's the
+    // core of Phase 4 — no more heuristic nuking of real live calls.
+    const lastWebhookMs = row.last_webhook_at ? Date.parse(row.last_webhook_at) : 0;
+    const lastVerifiedMs = row.last_verified_at ? Date.parse(row.last_verified_at) : 0;
+    const latestSignalMs = Math.max(lastWebhookMs, lastVerifiedMs);
+    const ageMs = latestSignalMs ? nowMs - latestSignalMs : Infinity;
+    if (ageMs < DIAL_FRESHNESS_WINDOW_MS) {
+      preserved += 1;
+      continue;
+    }
 
-    const mergedTwilioData = {
-      ...(row.twilio_data || {}),
-      superseded_by_new_dial: true,
-      superseded_by_new_dial_at: new Date().toISOString(),
-      superseded_by_new_dial_destination: params.destination,
-    };
+    const verifiedAt = new Date().toISOString();
 
-    await params.supabase
-      .from('call_records')
-      .update({
+    try {
+      const liveCall = await params.twilioClient.calls(sid).fetch();
+      const liveStatus = (liveCall.status || '').toLowerCase();
+
+      if (!DIAL_TERMINAL_TWILIO_STATUSES.has(liveStatus)) {
+        // Genuinely alive per Twilio API. Stamp verification, skip close.
+        await params.supabase
+          .from('call_records')
+          .update({ last_verified_at: verifiedAt })
+          .eq('id', row.id);
+        preserved += 1;
+        continue;
+      }
+
+      const endedAt = liveCall.endTime
+        ? new Date(liveCall.endTime).toISOString()
+        : new Date().toISOString();
+      const parsedDuration = parseInt(String(liveCall.duration ?? '0'), 10);
+      const safeDuration = Number.isFinite(parsedDuration) ? parsedDuration : 0;
+      const terminalStatus = mapDialTerminalStatus(liveStatus);
+
+      const closed = await closePreDialRow(params.supabase, row, params.destination, {
+        reason: 'stale_before_new_dial_twilio_terminal',
+        status: terminalStatus,
+        endedAt,
+        duration: safeDuration,
+        lastVerifiedAt: verifiedAt,
+      });
+      if (closed) released += 1;
+    } catch (err) {
+      const code = (err as { code?: number; status?: number })?.code;
+      const status = (err as { code?: number; status?: number })?.status;
+      const isNotFound = code === 20404 || status === 404;
+      if (!isNotFound) {
+        console.warn(
+          `[DIAL] Pre-dial reconcile could not verify agent=${params.agentId} sid=${sid}: ${
+            err instanceof Error ? err.message : 'unknown_error'
+          }`,
+        );
+        preserved += 1;
+        continue;
+      }
+
+      const closed = await closePreDialRow(params.supabase, row, params.destination, {
+        reason: 'stale_before_new_dial_twilio_404',
         status: 'canceled',
-        ended_at: new Date().toISOString(),
-        twilio_data: mergedTwilioData,
-      })
-      .eq('id', row.id)
-      .is('ended_at', null);
-
-    released += 1;
+        lastVerifiedAt: verifiedAt,
+      });
+      if (closed) released += 1;
+    }
   }
 
-  return released;
+  return { released, preserved };
 }
 
 /**
@@ -206,16 +336,16 @@ export async function POST(req: NextRequest) {
     // The agent's device.connect() triggers the TwiML App voice URL (/client)
     // which generates <Dial><Number>destination</Number></Dial>.
     if (resolvedAgent) {
-      const releasedCalls = await releaseAgentCallsBeforeNewDial({
+      const { released, preserved } = await reconcileAgentCallsBeforeNewDial({
         supabase,
         twilioClient,
         agentId: resolvedAgent.id,
         destination: destination_number,
       });
 
-      if (releasedCalls > 0) {
+      if (released > 0 || preserved > 0) {
         console.log(
-          `[DIAL] Released ${releasedCalls} previous call(s) before new dial for agent=${resolvedAgent.id}`
+          `[DIAL] Pre-dial reconcile agent=${resolvedAgent.id} released=${released} preserved=${preserved}`
         );
       }
 

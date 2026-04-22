@@ -136,15 +136,29 @@ export async function consumeSseStream(params: {
   onEvent: (event: CanonicalStreamEvent) => void;
   onStatus: (status: 'connecting' | 'connected' | 'disconnected') => void;
   signal: AbortSignal;
+  // Last canonical event id successfully applied before a prior
+  // disconnect. The backend replays persisted domain_events with a newer
+  // id so we don't miss transitions that happened mid-drop.
+  lastEventId?: string | null;
 }): Promise<void> {
-  const { baseUrl, jwt, onEvent, onStatus, signal } = params;
+  const { baseUrl, jwt, onEvent, onStatus, signal, lastEventId } = params;
   onStatus('connecting');
 
-  const response = await fetch(`${baseUrl}/api/v1/stream/events?scope=mine&client=voice_agent_desktop`, {
+  const streamUrl = new URL(`${baseUrl}/api/v1/stream/events`);
+  streamUrl.searchParams.set('scope', 'mine');
+  streamUrl.searchParams.set('client', 'voice_agent_desktop');
+  if (lastEventId) {
+    streamUrl.searchParams.set('last_event_id', lastEventId);
+  }
+
+  const response = await fetch(streamUrl.toString(), {
     method: 'GET',
     headers: {
       Authorization: `Bearer ${jwt}`,
       Accept: 'text/event-stream',
+      // Native EventSource header; we mirror it so the server sees the
+      // same signal whether it's a browser EventSource or a fetch reader.
+      ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
     },
     signal,
   });

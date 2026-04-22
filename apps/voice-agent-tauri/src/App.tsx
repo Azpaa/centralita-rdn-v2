@@ -12,6 +12,7 @@ import {
 import type {
   AgentStateSnapshot,
   BootstrapPayload,
+  CallPhase,
   CanonicalStreamEvent,
   VoiceCallView,
   VoiceDeviceStatus,
@@ -37,6 +38,12 @@ const REMOTE_ACCEPT_RETRY_DELAY_MS = 350;
 const REMOTE_ACCEPT_MAX_ATTEMPTS = 5;
 const REMOTE_COMMAND_TTL_MS = 10 * 60_000;
 const REMOTE_COMMAND_MAX_TRACKED = 200;
+// Unified dedup for canonical SSE events keyed by event.id. Catches
+// duplicates from both Twilio webhook retries (now collapsed server-side
+// via twilio_webhook_events) and SSE replay on reconnect, where we might
+// re-receive an event that was already applied before the disconnect.
+const PROCESSED_EVENT_ID_TTL_MS = 10 * 60_000;
+const PROCESSED_EVENT_ID_MAX_TRACKED = 500;
 const FALLBACK_RING_BEEP_INTERVAL_MS = 3000;
 const FALLBACK_RING_BEEP_DURATION_MS = 1200;
 const FALLBACK_RING_BEEP_FREQ_A_HZ = 440;
@@ -104,6 +111,29 @@ function upsertCall(list: VoiceCallView[], next: VoiceCallView): VoiceCallView[]
   return updated;
 }
 
+function derivePhase(args: {
+  backendStatus: string;
+  acceptInFlight: boolean;
+  hangupInFlight: boolean;
+  engineAttached: boolean;
+  engineAccepted: boolean;
+}): CallPhase {
+  if (args.hangupInFlight) return 'hanging_up';
+  if (args.acceptInFlight) return 'accepting';
+  if (args.backendStatus === 'in_progress') {
+    // Backend says media is up. Only promote to 'connected' once the engine
+    // confirms the Twilio Call fired its 'accept' event — otherwise the UI
+    // would claim audio is flowing during the "aceptas pero no escuchas"
+    // window between device.connect() returning and media actually opening.
+    if (args.engineAttached && args.engineAccepted) return 'connected';
+    return 'accepting';
+  }
+  if (args.backendStatus === 'ringing' || args.backendStatus === 'in_queue') {
+    return 'ringing';
+  }
+  return 'ended';
+}
+
 function isJwtOrAuthError(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -141,8 +171,6 @@ export default function App() {
   const [streamStatus, setStreamStatus] = useState<StreamStatus>('disconnected');
   const [calls, setCalls] = useState<VoiceCallView[]>([]);
   const [conferenceName, setConferenceName] = useState('');
-  // Map of callSid → conference name for incoming calls (from SSE events)
-  const [incomingConferences, setIncomingConferences] = useState<Map<string, string>>(new Map());
   const [lastEvent, setLastEvent] = useState('none');
   const [message, setMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -152,14 +180,36 @@ export default function App() {
   const accessTokenRef = useRef(accessToken);
   const sseControllerRef = useRef<AbortController | null>(null);
   const processedRemoteCommandIdsRef = useRef<Map<string, number>>(new Map());
+  const processedEventIdsRef = useRef<Map<string, number>>(new Map());
+  const lastAppliedEventIdRef = useRef<string | null>(null);
   const remoteAcceptInFlightRef = useRef<Set<string>>(new Set());
+  // Pending command_id per parent SID awaiting engine-level accept. Populated
+  // by executeRemoteAccept (SSE command) and consumed by handleVoiceAccepted
+  // when it POSTs /accept/confirm. Phase 4 contract: /accept is the request,
+  // /accept/confirm is the ack that our softphone actually has media.
+  const pendingAcceptCommandIdRef = useRef<Map<string, string>>(new Map());
   const lastStreamEventAtRef = useRef<number>(Date.now());
   const lastWakeTickRef = useRef<number>(Date.now());
   const availabilitySyncInFlightRef = useRef(false);
   const lastSyncedAvailabilityRef = useRef<boolean | null>(null);
   const reconnectVoiceRef = useRef<() => Promise<void>>(async () => {});
   const lastRecoveryTriggerAtRef = useRef<number>(0);
-  const localCallSidByParentSidRef = useRef<Map<string, string>>(new Map());
+  // Per-call in-flight action tracking. Phase 2: instead of maintaining a
+  // separate `localCallSidByParentSidRef` plus two redundant sets of
+  // booleans, these two refs model "we kicked off accept/hangup and are
+  // awaiting confirmation" — enough to drive the CallPhase state machine
+  // without a second source of truth for the call's lifecycle.
+  const acceptInFlightRef = useRef<Set<string>>(new Set());
+  const hangupInFlightRef = useRef<Set<string>>(new Set());
+  // Bumped each time the in-flight sets change, to trigger re-renders that
+  // pick up phase transitions driven by user actions.
+  const [inFlightVersion, setInFlightVersion] = useState(0);
+  const bumpInFlightVersion = useCallback(() => {
+    setInFlightVersion((v) => v + 1);
+  }, []);
+  // Ref to the voice engine so callbacks defined before useVoiceEngine() can
+  // reach disconnectCall/etc without a circular dependency.
+  const voiceRef = useRef<ReturnType<typeof useVoiceEngine> | null>(null);
   const ringtoneAudioRef = useRef<HTMLAudioElement | null>(null);
   const ringtoneRef = useRef<{
     context: AudioContext | null;
@@ -182,44 +232,74 @@ export default function App() {
       return;
     }
 
+    // Build the set of parent SIDs the backend considers active. Anything the
+    // engine still has attached that is NOT in this set is a stale media leg
+    // (usually because reconcile self-healed a lost webhook). Leaving it open
+    // causes "ghost busy" where Twilio.Device holds the audio session alive.
+    const activeParentSids = new Set<string>();
+    for (const call of snapshot.active_calls) {
+      if (typeof call.call_sid === 'string' && call.call_sid.length > 0) {
+        activeParentSids.add(call.call_sid);
+      }
+    }
+
+    const voice = voiceRef.current;
+    if (voice) {
+      const orphaned = voice.attachedCallSids.filter((sid) => !activeParentSids.has(sid));
+      if (orphaned.length > 0) {
+        void (async () => {
+          for (const parentSid of orphaned) {
+            try {
+              await voice.disconnectCall(parentSid);
+            } catch {
+              // best-effort; engine may already have cleaned up the leg.
+            }
+          }
+        })();
+      }
+    }
+
     setCalls((prev) => {
       const mutedBySid = new Map(prev.map((call) => [call.callSid, call.muted]));
+      // Preserve conference names learned from earlier snapshots / SSE events.
+      // This matters because a brand-new snapshot arriving before the next
+      // 'incoming_call' event might omit conference_name for a call we were
+      // just informed about via SSE. Keeping the last-known value prevents
+      // Accept from falling back to `call-<sid>` guesses.
+      const conferenceBySid = new Map(
+        prev
+          .filter((call) => typeof call.conferenceName === 'string' && call.conferenceName.length > 0)
+          .map((call) => [call.callSid, call.conferenceName as string])
+      );
       return snapshot.active_calls
         .filter((call) => typeof call.call_sid === 'string' && call.call_sid.length > 0)
-        .map((call) => ({
-          callSid: call.call_sid as string,
-          direction: call.direction,
-          status: call.status,
-          from: call.from || null,
-          to: call.to || null,
-          muted: mutedBySid.get(call.call_sid as string) ?? false,
-        }));
-    });
-
-    // Ensure ringing inbound calls have a known conference so Accept works
-    // even after reconnection (when the original SSE event was missed).
-    setIncomingConferences((prev) => {
-      let changed = false;
-      const next = new Map(prev);
-      for (const call of snapshot.active_calls) {
-        if (
-          call.direction === 'inbound'
-          && call.status === 'ringing'
-          && typeof call.call_sid === 'string'
-          && call.call_sid.length > 0
-          && !next.has(call.call_sid)
-        ) {
-          next.set(call.call_sid, `call-${call.call_sid}`);
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
+        .map((call) => {
+          const sid = call.call_sid as string;
+          const snapshotConference = typeof call.conference_name === 'string' && call.conference_name.length > 0
+            ? call.conference_name
+            : null;
+          const preservedConference = conferenceBySid.get(sid) ?? null;
+          const conferenceNameForCall = snapshotConference ?? preservedConference;
+          const phase = derivePhase({
+            backendStatus: call.status,
+            acceptInFlight: acceptInFlightRef.current.has(sid),
+            hangupInFlight: hangupInFlightRef.current.has(sid),
+            engineAttached: voice?.isCallAttached(sid) ?? false,
+            engineAccepted: voice?.isCallAccepted(sid) ?? false,
+          });
+          return {
+            callSid: sid,
+            direction: call.direction,
+            status: call.status,
+            from: call.from || null,
+            to: call.to || null,
+            muted: mutedBySid.get(sid) ?? false,
+            phase,
+            conferenceName: conferenceNameForCall,
+          };
+        });
     });
   }, []);
-
-  const resolveLocalCallSid = useCallback((parentCallSid: string) => (
-    localCallSidByParentSidRef.current.get(parentCallSid) ?? parentCallSid
-  ), []);
 
   const ensureFreshSession = useCallback(async (
     reason: string,
@@ -341,37 +421,91 @@ export default function App() {
     applySnapshot(result.data);
   }, [applySnapshot, backendUrl, withJwtRetry]);
 
-  const handleVoiceCallStarted = useCallback((callSid: string, direction: 'inbound' | 'outbound', destination: string | null) => {
-    setCalls((prev) => upsertCall(prev, {
-      callSid,
-      direction,
-      status: 'in_progress',
-      from: null,
-      to: destination,
-      muted: false,
-    }));
+  const handleVoiceCallStarted = useCallback((parentSid: string, direction: 'inbound' | 'outbound', destination: string | null) => {
+    // Engine has a Call object wired up. Media is NOT necessarily flowing
+    // yet — we're in the 'accepting' phase until the Twilio Call fires its
+    // 'accept' event (handleVoiceAccepted promotes to 'connected').
+    setCalls((prev) => {
+      const index = prev.findIndex((call) => call.callSid === parentSid);
+      if (index === -1) {
+        // Brand new call (typical for outbound).
+        return [
+          ...prev,
+          {
+            callSid: parentSid,
+            direction,
+            status: 'in_progress',
+            from: null,
+            to: destination,
+            muted: false,
+            phase: 'accepting',
+            conferenceName: null,
+          },
+        ];
+      }
+      // Call already tracked via SSE (typical inbound: 'ringing' status was
+      // set by the incoming_call handler). Don't regress its status — that
+      // will be updated authoritatively when backend emits call_answered.
+      const next = [...prev];
+      next[index] = {
+        ...next[index],
+        phase: 'accepting',
+      };
+      return next;
+    });
   }, []);
 
-  const handleVoiceAccepted = useCallback((callSid: string) => {
+  const handleVoiceAccepted = useCallback((parentSid: string) => {
+    // Twilio Call 'accept' event fired — media path is open. Promote to
+    // 'connected' so the UI reflects that audio is actually flowing. Also
+    // clear the accept-in-flight flag (if it was set via user click).
+    if (acceptInFlightRef.current.delete(parentSid)) {
+      bumpInFlightVersion();
+    }
     setCalls((prev) => prev.map((call) => (
-      call.callSid === callSid
-        ? { ...call, status: 'in_progress' }
+      call.callSid === parentSid
+        ? { ...call, status: 'in_progress', phase: 'connected' }
         : call
     )));
-  }, []);
 
-  const handleVoiceEnded = useCallback((callSid: string) => {
-    // Cleanup reverse mapping when a local media leg ends.
-    for (const [parentSid, localSid] of localCallSidByParentSidRef.current.entries()) {
-      if (localSid !== callSid) continue;
-      localCallSidByParentSidRef.current.delete(parentSid);
+    // Phase 4: tell the backend our softphone confirmed media. Fire-and-forget:
+    // a missed confirm only removes an observability signal, it does not stall
+    // the call. The backend stamps last_verified_at on receipt.
+    const engineAcceptedAt = new Date().toISOString();
+    const commandId = pendingAcceptCommandIdRef.current.get(parentSid) ?? null;
+    pendingAcceptCommandIdRef.current.delete(parentSid);
+
+    if (backendUrl && accessTokenRef.current) {
+      void (async () => {
+        const body: Record<string, unknown> = { engine_accepted_at: engineAcceptedAt };
+        if (commandId) body.command_id = commandId;
+        const result = await withJwtRetry(
+          `accept_confirm:${parentSid}`,
+          (jwt) => callCommand(backendUrl, jwt, `/api/v1/calls/${parentSid}/accept/confirm`, body),
+        );
+        if (!result.ok) {
+          console.warn(`[ACCEPT-CONFIRM] Failed for ${parentSid}: ${result.error}`);
+        }
+      })();
     }
-    setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
-  }, []);
+  }, [backendUrl, bumpInFlightVersion, withJwtRetry]);
 
-  const handleVoiceMutedChanged = useCallback((callSid: string, muted: boolean) => {
+  const handleVoiceEnded = useCallback((parentSid: string) => {
+    // Engine no longer holds a local leg for this SID. Clear any in-flight
+    // flags and drop the call from UI (unless a backend snapshot revives it,
+    // which would indicate a rare race where the server still thinks we're
+    // active after local media closed).
+    let bumped = false;
+    if (acceptInFlightRef.current.delete(parentSid)) bumped = true;
+    if (hangupInFlightRef.current.delete(parentSid)) bumped = true;
+    pendingAcceptCommandIdRef.current.delete(parentSid);
+    if (bumped) bumpInFlightVersion();
+    setCalls((prev) => prev.filter((call) => call.callSid !== parentSid));
+  }, [bumpInFlightVersion]);
+
+  const handleVoiceMutedChanged = useCallback((parentSid: string, muted: boolean) => {
     setCalls((prev) => prev.map((call) => (
-      call.callSid === callSid
+      call.callSid === parentSid
         ? { ...call, muted }
         : call
     )));
@@ -512,21 +646,23 @@ export default function App() {
     onInfo: handleVoiceInfo,
   });
 
+  useEffect(() => {
+    voiceRef.current = voice;
+  }, [voice]);
+
   const cleanupStaleLocalCalls = useCallback(async () => {
-    // Preserve local media legs that map to calls still marked in progress by backend.
-    const inProgressParentSids = calls
-      .filter((call) => call.status === 'in_progress')
-      .map((call) => call.callSid);
+    // Preserve local media legs that map to calls still marked in progress by
+    // backend. The engine now keys attached calls by parent SID so this is a
+    // straight set-difference against the active-calls list.
+    const inProgressParentSids = new Set(
+      calls
+        .filter((call) => call.status === 'in_progress')
+        .map((call) => call.callSid)
+    );
 
-    const preserve = new Set<string>();
-    for (const parentSid of inProgressParentSids) {
-      const localSid = localCallSidByParentSidRef.current.get(parentSid);
-      if (localSid) preserve.add(localSid);
-    }
-
-    const staleLocalSids = voice.attachedCallSids.filter((sid) => !preserve.has(sid));
-    for (const sid of staleLocalSids) {
-      await voice.disconnectCall(sid);
+    const staleParentSids = voice.attachedCallSids.filter((sid) => !inProgressParentSids.has(sid));
+    for (const parentSid of staleParentSids) {
+      await voice.disconnectCall(parentSid);
     }
   }, [calls, voice]);
 
@@ -607,42 +743,66 @@ export default function App() {
     }
   }, []);
 
+  // Resolves the conference name for a given parent SID by looking it up on
+  // the current call list. Falls back to the deterministic `call-<sid>`
+  // naming only as a last resort — if both snapshot and SSE events failed
+  // to deliver a conference_name, the backend probably didn't wire one and
+  // joinConference would fail anyway.
+  const resolveConferenceNameForParent = useCallback((parentSid: string): string => {
+    const existing = calls.find((call) => call.callSid === parentSid);
+    if (existing && existing.conferenceName) return existing.conferenceName;
+    return `call-${parentSid}`;
+  }, [calls]);
+
   const executeRemoteAccept = useCallback(async (callSid: string, commandId: string | null) => {
     if (commandId && wasRemoteCommandProcessed(commandId)) return;
     if (remoteAcceptInFlightRef.current.has(callSid)) return;
 
     remoteAcceptInFlightRef.current.add(callSid);
+    acceptInFlightRef.current.add(callSid);
+    if (commandId) {
+      pendingAcceptCommandIdRef.current.set(callSid, commandId);
+    }
+    bumpInFlightVersion();
     try {
-      stopIncomingRingtone();
       await cleanupStaleLocalCalls();
-      // For incoming calls, join the conference room
-      const confName = incomingConferences.get(callSid) || `call-${callSid}`;
+      const confName = resolveConferenceNameForParent(callSid);
       const result = await voice.joinConference({
         conferenceName: confName,
         parentCallSid: callSid,
       });
 
       if (result.ok) {
-        const localCallSid = result.data?.call_sid;
-        if (typeof localCallSid === 'string' && localCallSid.length > 0) {
-          localCallSidByParentSidRef.current.set(callSid, localCallSid);
-          // Ensure microphone starts unmuted on the new leg.
-          await voice.setMuted(localCallSid, false);
-        }
-        setCalls((prev) => prev.map((call) => (
-          call.callSid === callSid
-            ? { ...call, status: 'in_progress' }
-            : call
-        )));
+        // Only stop the ringtone once the media path is actually joined.
+        // Stopping earlier masks accept failures and leaves the user thinking
+        // they answered when no audio path exists.
+        stopIncomingRingtone();
+        // Ensure the microphone starts unmuted. Keyed by parent SID thanks to
+        // the engine's internal parent→local translation.
+        await voice.setMuted(callSid, false);
         if (commandId) markRemoteCommandProcessed(commandId);
         setMessage(`Orden remota ejecutada: unido a conferencia para llamada ${callSid}.`);
       } else {
+        // Accept failed — clear the in-flight flag so the UI reverts from
+        // 'accepting' back to 'ringing'. The ringtone keeps playing because
+        // we never stopped it in the failure path (intended).
+        acceptInFlightRef.current.delete(callSid);
+        pendingAcceptCommandIdRef.current.delete(callSid);
+        bumpInFlightVersion();
         setMessage(`No se pudo unir a conferencia para ${callSid}: ${result.error}`);
       }
     } finally {
       remoteAcceptInFlightRef.current.delete(callSid);
     }
-  }, [cleanupStaleLocalCalls, incomingConferences, markRemoteCommandProcessed, stopIncomingRingtone, voice, wasRemoteCommandProcessed]);
+  }, [
+    bumpInFlightVersion,
+    cleanupStaleLocalCalls,
+    markRemoteCommandProcessed,
+    resolveConferenceNameForParent,
+    stopIncomingRingtone,
+    voice,
+    wasRemoteCommandProcessed,
+  ]);
 
   // Track outbound connect requests we've already processed
   const processedOutboundRequestsRef = useRef<Set<string>>(new Set());
@@ -650,6 +810,42 @@ export default function App() {
   const handleCanonicalEvent = useCallback((event: CanonicalStreamEvent) => {
     lastStreamEventAtRef.current = Date.now();
     setLastEvent(event.type || 'unknown');
+
+    // Unified SSE event dedup by event.id.
+    //
+    // Previously we had per-handler sets (processedOutboundRequestsRef,
+    // processedRemoteCommandIdsRef, ...) that only caught duplicates within
+    // a single command type. Now that the backend persists a stable id
+    // shared across webhook delivery + canonical SSE publish + replay, we
+    // can dedup once at the top. This is especially important for the
+    // Last-Event-ID replay path, which intentionally re-sends events that
+    // were emitted while we were disconnected — some of which the backend
+    // cannot know for certain we already applied before the drop.
+    //
+    // Connected/snapshot/heartbeat events are idempotent by nature and
+    // carry ephemeral ids that we don't want to persist, so they skip.
+    if (
+      event.id
+      && event.type !== 'snapshot'
+      && event.type !== 'heartbeat'
+      && event.type !== 'connected'
+    ) {
+      const tracked = processedEventIdsRef.current;
+      const now = Date.now();
+      for (const [knownId, ts] of tracked.entries()) {
+        if (now - ts > PROCESSED_EVENT_ID_TTL_MS) tracked.delete(knownId);
+      }
+      if (tracked.has(event.id)) {
+        return;
+      }
+      tracked.set(event.id, now);
+      if (tracked.size > PROCESSED_EVENT_ID_MAX_TRACKED) {
+        const ordered = [...tracked.entries()].sort((a, b) => a[1] - b[1]);
+        const overflow = ordered.length - PROCESSED_EVENT_ID_MAX_TRACKED;
+        for (let i = 0; i < overflow; i += 1) tracked.delete(ordered[i][0]);
+      }
+      lastAppliedEventIdRef.current = event.id;
+    }
 
     if (event.type === 'snapshot') {
       const snapshot = (event.payload?.agent_state as AgentStateSnapshot | undefined) ?? null;
@@ -710,17 +906,9 @@ export default function App() {
     }
 
     if (event.type === 'incoming_call' && callSid) {
-      // Store conference name if provided (for Tauri to join via device.connect)
       const eventConferenceName = typeof event.payload?.conference_name === 'string'
         ? event.payload.conference_name
         : null;
-      if (eventConferenceName) {
-        setIncomingConferences((prev) => {
-          const next = new Map(prev);
-          next.set(callSid, eventConferenceName);
-          return next;
-        });
-      }
 
       setCalls((prev) => upsertCall(prev, {
         callSid,
@@ -729,17 +917,18 @@ export default function App() {
         from: payloadFrom,
         to: payloadTo,
         muted: false,
+        phase: 'ringing',
+        // Conference name carried on the incoming_call payload is the
+        // authoritative source until the snapshot catches up. Stored on the
+        // call view itself — no separate Map to keep in sync.
+        conferenceName: eventConferenceName,
       }));
     } else if (event.type === 'call_answered' && callSid) {
       stopIncomingRingtone();
       if (event.agent_user_id && localAgentUserId && event.agent_user_id !== localAgentUserId) {
+        // Another agent picked this call up — drop it from our list entirely.
         setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
-        setIncomingConferences((prev) => {
-          if (!prev.has(callSid)) return prev;
-          const next = new Map(prev);
-          next.delete(callSid);
-          return next;
-        });
+        if (acceptInFlightRef.current.delete(callSid)) bumpInFlightVersion();
       } else {
         setCalls((prev) => prev.map((call) => (
           call.callSid === callSid
@@ -753,12 +942,7 @@ export default function App() {
       }
       if (payloadStatus === 'in_progress' && event.agent_user_id && localAgentUserId && event.agent_user_id !== localAgentUserId) {
         setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
-        setIncomingConferences((prev) => {
-          if (!prev.has(callSid)) return prev;
-          const next = new Map(prev);
-          next.delete(callSid);
-          return next;
-        });
+        if (acceptInFlightRef.current.delete(callSid)) bumpInFlightVersion();
       } else {
         setCalls((prev) => prev.map((call) => (
           call.callSid === callSid
@@ -776,18 +960,11 @@ export default function App() {
         void executeRemoteAccept(callSid, payloadCommandId);
       }
     } else if (event.type === 'call_ended' && callSid) {
-      const mappedLocalSid = localCallSidByParentSidRef.current.get(callSid);
-      if (mappedLocalSid) {
-        void voice.disconnectCall(mappedLocalSid);
-        localCallSidByParentSidRef.current.delete(callSid);
-      }
+      // Engine is keyed by parent SID — one disconnect covers the local leg.
+      void voice.disconnectCall(callSid);
+      if (acceptInFlightRef.current.delete(callSid)) bumpInFlightVersion();
+      if (hangupInFlightRef.current.delete(callSid)) bumpInFlightVersion();
       setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
-      setIncomingConferences((prev) => {
-        if (!prev.has(callSid)) return prev;
-        const next = new Map(prev);
-        next.delete(callSid);
-        return next;
-      });
     }
 
     const refreshEvents = new Set([
@@ -803,7 +980,15 @@ export default function App() {
     if (refreshEvents.has(event.type)) {
       void refreshAgentSnapshot(`stream:${event.type}`);
     }
-  }, [agentState?.user_id, applySnapshot, executeRemoteAccept, refreshAgentSnapshot, stopIncomingRingtone, voice]);
+  }, [
+    agentState?.user_id,
+    applySnapshot,
+    bumpInFlightVersion,
+    executeRemoteAccept,
+    refreshAgentSnapshot,
+    stopIncomingRingtone,
+    voice,
+  ]);
 
   const hydrateBootstrapAndSession = useCallback(async () => {
     if (!backendUrl) return;
@@ -1003,6 +1188,7 @@ export default function App() {
             baseUrl: backendUrl,
             jwt: streamToken,
             signal: controller.signal,
+            lastEventId: lastAppliedEventIdRef.current,
             onStatus: (status) => {
               setStreamStatus(status);
               if (status === 'connected') {
@@ -1090,66 +1276,74 @@ export default function App() {
     if (!backendUrl || !accessTokenRef.current) return;
 
     if (action === 'accept') {
-      stopIncomingRingtone();
-      await cleanupStaleLocalCalls();
-      // Accept incoming call by joining the conference room
-      // Use the conference name from SSE event if available, otherwise derive from callSid
-      const confName = incomingConferences.get(callSid) || `call-${callSid}`;
-      const result = await voice.joinConference({
-        conferenceName: confName,
-        parentCallSid: callSid,
-      });
-      if (!result.ok) {
-        setMessage(`No se pudo unir a conferencia para ${callSid}: ${result.error}`);
-        return;
+      acceptInFlightRef.current.add(callSid);
+      bumpInFlightVersion();
+      try {
+        await cleanupStaleLocalCalls();
+        const confName = resolveConferenceNameForParent(callSid);
+        const result = await voice.joinConference({
+          conferenceName: confName,
+          parentCallSid: callSid,
+        });
+        if (!result.ok) {
+          // Accept failed — revert from 'accepting' back to 'ringing' so the
+          // user can retry. Ringtone stays on (we never stopped it).
+          acceptInFlightRef.current.delete(callSid);
+          bumpInFlightVersion();
+          setMessage(`No se pudo unir a conferencia para ${callSid}: ${result.error}`);
+          return;
+        }
+        // Conference join succeeded — media is either already open or the
+        // Twilio Call is about to fire 'accept'. Stop the ringtone now; the
+        // phase stays 'accepting' until handleVoiceAccepted promotes it.
+        stopIncomingRingtone();
+        await voice.setMuted(callSid, false);
+        setMessage(`Unido a conferencia para llamada ${callSid}`);
+      } catch (err) {
+        acceptInFlightRef.current.delete(callSid);
+        bumpInFlightVersion();
+        const message = err instanceof Error ? err.message : 'accept_failed';
+        setMessage(`Error aceptando ${callSid}: ${message}`);
       }
-      const localCallSid = result.data?.call_sid;
-      if (typeof localCallSid === 'string' && localCallSid.length > 0) {
-        localCallSidByParentSidRef.current.set(callSid, localCallSid);
-        await voice.setMuted(localCallSid, false);
-      }
-      stopIncomingRingtone();
-      setCalls((prev) => prev.map((call) => (
-        call.callSid === callSid
-          ? { ...call, status: 'in_progress' }
-          : call
-      )));
-      // Clean up the incoming conference mapping
-      setIncomingConferences((prev) => {
-        const next = new Map(prev);
-        next.delete(callSid);
-        return next;
-      });
-      setMessage(`Unido a conferencia para llamada ${callSid}`);
       return;
     }
 
     if (action === 'hangup') {
-      const local = await voice.disconnectCall(resolveLocalCallSid(callSid));
-      localCallSidByParentSidRef.current.delete(callSid);
-      const backend = await withJwtRetry(
-        `call_hangup:${callSid}`,
-        (jwt) => callCommand(
-          backendUrl,
-          jwt,
-          `/api/v1/calls/${callSid}/hangup`,
-          { target: 'all' }
-        )
-      );
+      // Order: backend first, then local tear-down. If backend fails the
+      // parent call stays active in Twilio and we have NOT ripped up the
+      // local media, so a retry or snapshot can still recover state. The
+      // 'hanging_up' phase gives the UI a clear signal during this window.
+      hangupInFlightRef.current.add(callSid);
+      bumpInFlightVersion();
+      try {
+        const backend = await withJwtRetry(
+          `call_hangup:${callSid}`,
+          (jwt) => callCommand(
+            backendUrl,
+            jwt,
+            `/api/v1/calls/${callSid}/hangup`,
+            { target: 'all' }
+          )
+        );
 
-      if (!backend.ok) {
-        const localInfo = local.ok ? ' (audio local ya desconectado)' : '';
-        setMessage(`Error colgar ${callSid}: ${backend.error}${localInfo}`);
-        return;
+        if (!backend.ok) {
+          setMessage(`Error colgar ${callSid}: ${backend.error}`);
+          return;
+        }
+
+        const local = await voice.disconnectCall(callSid);
+        const localInfo = local.ok ? '' : ` (aviso: fallo desconexion local — ${local.error})`;
+        setMessage(`Llamada ${callSid} colgada${localInfo}`);
+        void refreshAgentSnapshot('action:hangup');
+      } finally {
+        hangupInFlightRef.current.delete(callSid);
+        bumpInFlightVersion();
       }
-
-      setMessage(`Llamada ${callSid} colgada`);
-      void refreshAgentSnapshot('action:hangup');
       return;
     }
 
     const wantsMute = action === 'mute';
-    const muteResult = await voice.setMuted(resolveLocalCallSid(callSid), wantsMute);
+    const muteResult = await voice.setMuted(callSid, wantsMute);
     if (!muteResult.ok) {
       setMessage(muteResult.error);
       return;
@@ -1177,7 +1371,17 @@ export default function App() {
 
     setMessage(`${wantsMute ? 'Mute' : 'Unmute'} aplicado en ${callSid}`);
     void refreshAgentSnapshot(`action:${action}`);
-  }, [backendUrl, cleanupStaleLocalCalls, conferenceName, incomingConferences, refreshAgentSnapshot, resolveLocalCallSid, stopIncomingRingtone, voice, withJwtRetry]);
+  }, [
+    backendUrl,
+    bumpInFlightVersion,
+    cleanupStaleLocalCalls,
+    conferenceName,
+    refreshAgentSnapshot,
+    resolveConferenceNameForParent,
+    stopIncomingRingtone,
+    voice,
+    withJwtRetry,
+  ]);
 
   useEffect(() => () => {
     authSubscriptionRef.current?.unsubscribe();
@@ -1194,9 +1398,27 @@ export default function App() {
     ringtoneRef.current.context = null;
   }, [stopIncomingRingtone]);
 
+  // Derived view of calls with the CallPhase layered on top of in-flight
+  // action flags. Keeping this out of setCalls() means Accept/Hangup clicks
+  // immediately move the UI through 'accepting' / 'hanging_up' without
+  // waiting for the next snapshot tick.
+  const displayCalls = useMemo(() => {
+    void inFlightVersion; // track ref bumps
+    return calls.map((call) => ({
+      ...call,
+      phase: derivePhase({
+        backendStatus: call.status,
+        acceptInFlight: acceptInFlightRef.current.has(call.callSid),
+        hangupInFlight: hangupInFlightRef.current.has(call.callSid),
+        engineAttached: voice.isCallAttached(call.callSid),
+        engineAccepted: voice.isCallAccepted(call.callSid),
+      }),
+    }));
+  }, [calls, inFlightVersion, voice]);
+
   const hasInProgressCalls = useMemo(() => (
-    calls.some((call) => call.status === 'in_progress')
-  ), [calls]);
+    displayCalls.some((call) => call.phase === 'connected' || call.phase === 'accepting' || call.phase === 'hanging_up')
+  ), [displayCalls]);
 
   const hasAttachedLocalCalls = useMemo(() => (
     voice.attachedCallSids.length > 0
@@ -1205,11 +1427,10 @@ export default function App() {
   const hasIncomingRingingCalls = useMemo(() => (
     !hasInProgressCalls
     && !hasAttachedLocalCalls
-    && calls.some((call) => (
-      call.direction === 'inbound'
-      && (call.status === 'ringing' || call.status === 'in_queue')
+    && displayCalls.some((call) => (
+      call.direction === 'inbound' && call.phase === 'ringing'
     ))
-  ), [calls, hasAttachedLocalCalls, hasInProgressCalls]);
+  ), [displayCalls, hasAttachedLocalCalls, hasInProgressCalls]);
 
   useEffect(() => {
     if (!hasInProgressCalls && !hasAttachedLocalCalls) return;
@@ -1351,31 +1572,42 @@ export default function App() {
                   placeholder="conf-123"
                 />
               </label>
-              {calls.length === 0 && (
+              {displayCalls.length === 0 && (
                 <p className="muted">Sin llamadas activas/ringing.</p>
               )}
 
-              {calls.map((call) => {
-                const localControlSid = resolveLocalCallSid(call.callSid);
-                const attached = voice.isCallAttached(localControlSid);
-                const hasKnownConference = incomingConferences.has(call.callSid);
-                const canAccept = (attached || hasKnownConference) && call.status !== 'in_progress';
-                const canToggleMute = attached && call.status === 'in_progress';
+              {displayCalls.map((call) => {
+                const attached = voice.isCallAttached(call.callSid);
+                const hasKnownConference = Boolean(call.conferenceName);
+                // Accept is allowed only in the ringing phase. Either the
+                // engine is already attached (warm reconnect path) OR we have
+                // a known conference name to join.
+                const canAccept = call.phase === 'ringing' && (attached || hasKnownConference);
+                const canToggleMute = attached && call.phase === 'connected';
                 const muteNeedsConference = Boolean(conferenceName.trim());
+                const phaseLabel = (() => {
+                  switch (call.phase) {
+                    case 'ringing': return 'timbrando';
+                    case 'accepting': return 'conectando audio…';
+                    case 'connected': return 'audio activo';
+                    case 'hanging_up': return 'colgando…';
+                    case 'ended': return 'finalizada';
+                  }
+                })();
 
                 return (
                   <article key={call.callSid} className="call-row">
                     <div>
                       <p><strong>{call.callSid}</strong></p>
                       <p className="muted">
-                        {call.direction} - {call.status} - {call.from ?? '-'} -&gt; {call.to ?? '-'}
+                        {call.direction} - {call.status} ({phaseLabel}) - {call.from ?? '-'} -&gt; {call.to ?? '-'}
                       </p>
                       <p className="muted">
                         Motor local: {attached ? 'media enlazada' : 'sin media local enlazada'}
                       </p>
-                      {!attached && (
+                      {!attached && call.phase === 'ringing' && (
                         <p className="muted">
-                          Aceptar/mute requiere que esta llamada llegue al softphone local.
+                          Aceptar abrira la conferencia y enlazara la media local.
                         </p>
                       )}
                       {attached && !muteNeedsConference && (
@@ -1397,7 +1629,10 @@ export default function App() {
                       >
                         Aceptar
                       </button>
-                      <button onClick={() => void executeCallAction('hangup', call.callSid)}>
+                      <button
+                        disabled={call.phase === 'hanging_up'}
+                        onClick={() => void executeCallAction('hangup', call.callSid)}
+                      >
                         Colgar
                       </button>
                       <button

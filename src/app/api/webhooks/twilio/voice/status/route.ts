@@ -5,6 +5,7 @@ import { validateAndParseTwilioWebhook } from '@/lib/api/twilio-auth';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { emitEvent } from '@/lib/events/emitter';
+import { claimTwilioWebhookEvent } from '@/lib/events/twilio-idempotency';
 import type { CallRecord, CallStatus } from '@/lib/types/database';
 
 // Terminal states: once dial-action sets one of these, do not overwrite.
@@ -104,9 +105,31 @@ export async function POST(req: NextRequest) {
   const attemptIdHint = (searchParams.get('attempt_id') || '').trim();
   const targetUserIdHint = (searchParams.get('target_user_id') || '').trim();
   const callStatus = params.CallStatus || '';
+  const accountSid = params.AccountSid || '';
   const callDuration = params.CallDuration ? parseInt(params.CallDuration, 10) : 0;
   const normalizedDuration = Number.isFinite(callDuration) ? callDuration : 0;
   const timestamp = params.Timestamp || new Date().toISOString();
+
+  // Idempotency: Twilio retries on transient errors and occasionally
+  // double-fires callbacks. Dedup on (CallSid, CallStatus, AccountSid)
+  // so the handler runs exactly once. Callbacks without CallStatus
+  // (conference events) are not deduped — they carry no side-effect
+  // weight on call_records.
+  if (rawCallSid && callStatus && accountSid) {
+    const dedup = await claimTwilioWebhookEvent({
+      callSid: rawCallSid,
+      callStatus,
+      accountSid,
+      source: 'voice/status',
+      payload: params,
+    });
+    if (dedup.duplicate) {
+      console.log(
+        `[STATUS][IDEMPOTENT] Skipping duplicate callback call_sid=${rawCallSid} status=${callStatus} first_seen=${dedup.firstSeenAt ?? '-'}`,
+      );
+      return new NextResponse('OK', { status: 200 });
+    }
+  }
 
   const { trackedCallSid, currentRecord } = await resolveTrackedCallForStatus({
     callSid: rawCallSid,
@@ -118,7 +141,28 @@ export async function POST(req: NextRequest) {
   );
 
   if (!trackedCallSid) {
+    // Silent drop produces "ghost busy" states if the record exists under a SID we did not resolve.
+    // Log loudly so the pattern is visible in production logs and we can detect lost webhooks.
+    console.warn(
+      `[STATUS][DROP] No tracked call_record for webhook raw_call_sid=${rawCallSid || '-'} raw_parent_call_sid=${rawParentCallSid || '-'} status=${callStatus || '-'} timestamp=${timestamp}`
+    );
     return new NextResponse('OK', { status: 200 });
+  }
+
+  // Update freshness timestamp on every successful webhook resolution —
+  // even if we later decide to ignore the status (e.g. terminal record,
+  // conference-only callback). The signal of interest is "Twilio is
+  // still sending us callbacks for this call", not "the status changed".
+  // This is what lets the reconcile path distinguish a live call from
+  // a zombie without touching Twilio's API.
+  try {
+    const supabaseFreshness = createAdminClient();
+    await supabaseFreshness
+      .from('call_records')
+      .update({ last_webhook_at: new Date().toISOString() })
+      .eq('twilio_call_sid', trackedCallSid);
+  } catch (err) {
+    console.warn(`[STATUS] Failed updating last_webhook_at for ${trackedCallSid}:`, err);
   }
 
   // Conference status callbacks (join/leave/end) may hit this endpoint without CallStatus.

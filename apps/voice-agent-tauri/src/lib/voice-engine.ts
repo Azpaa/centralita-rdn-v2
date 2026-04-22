@@ -21,6 +21,12 @@ import type { VoiceDeviceStatus } from './types';
 const TOKEN_REFRESH_INTERVAL_MS = 5 * 60_000; // 5 minutes
 const HEALTH_CHECK_INTERVAL_MS = 20_000;
 const DEVICE_ERROR_RETRY_DELAY_MS = 1_500;
+// How long we wait for Twilio to assign a CallSid to a freshly connected
+// outbound Call. If it still isn't available after this window we tear the
+// call down instead of falling back to a synthetic SID (the synthetic SID
+// masked real failures and left orphaned media legs alive).
+const CALL_SID_RESOLUTION_TIMEOUT_MS = 3_500;
+const CALL_SID_POLL_INTERVAL_MS = 50;
 
 type VoiceActionResult = ApiResult<{
   call_sid: string;
@@ -28,19 +34,32 @@ type VoiceActionResult = ApiResult<{
 
 type ManagedCall = {
   call: Call;
-  sid: string;
+  // Canonical SID used by backend and all external control paths. For inbound
+  // conference joins this is the PSTN parent CallSid supplied by the caller.
+  // For outbound device.connect() it is the Twilio-assigned agent-leg SID.
+  parentSid: string;
+  // Twilio-assigned SID for the local media leg. For outbound this equals
+  // parentSid (the outbound leg IS the canonical call). For inbound it is
+  // different from parentSid (the agent's client leg joining the conference)
+  // — we keep it only for logging; nothing external should depend on it.
+  localSid: string;
   muted: boolean;
   direction: 'inbound' | 'outbound';
   destination: string | null;
+  // True once the Twilio Call fired its 'accept' event (i.e. media is flowing).
+  // Lets the UI show an accurate 'accepting' → 'connected' transition.
+  accepted: boolean;
 };
 
 type UseVoiceEngineParams = {
   baseUrl: string;
   accessToken: string;
-  onCallStarted?: (callSid: string, direction: 'inbound' | 'outbound', destination: string | null) => void;
-  onCallAccepted?: (callSid: string) => void;
-  onCallEnded?: (callSid: string) => void;
-  onCallMutedChanged?: (callSid: string, muted: boolean) => void;
+  // All callbacks speak in parent/canonical SIDs (the one the backend uses).
+  // The engine hides the local media-leg SID as an internal detail.
+  onCallStarted?: (parentSid: string, direction: 'inbound' | 'outbound', destination: string | null) => void;
+  onCallAccepted?: (parentSid: string) => void;
+  onCallEnded?: (parentSid: string) => void;
+  onCallMutedChanged?: (parentSid: string, muted: boolean) => void;
   onInfo?: (message: string) => void;
 };
 
@@ -50,19 +69,25 @@ type UseVoiceEngineResult = {
   identity: string;
   tokenExpired: boolean;
   lastError: string | null;
+  // Parent SIDs of calls currently attached to the softphone (media path alive).
   attachedCallSids: string[];
   connectOutbound: (params: {
     destination: string;
     callerId: string;
     callRecordId?: string;
   }) => Promise<VoiceActionResult>;
+  // parentCallSid is REQUIRED — Tauri must know the canonical SID up front.
+  // It becomes the key used for later disconnect/mute operations.
   joinConference: (params: {
     conferenceName: string;
-    parentCallSid?: string;
+    parentCallSid: string;
   }) => Promise<VoiceActionResult>;
-  disconnectCall: (callSid: string) => Promise<VoiceActionResult>;
-  setMuted: (callSid: string, muted: boolean) => Promise<VoiceActionResult>;
-  isCallAttached: (callSid: string) => boolean;
+  // All action APIs are keyed by parent SID. Internally we translate to the
+  // underlying Call reference, but callers never need to know about local SIDs.
+  disconnectCall: (parentSid: string) => Promise<VoiceActionResult>;
+  setMuted: (parentSid: string, muted: boolean) => Promise<VoiceActionResult>;
+  isCallAttached: (parentSid: string) => boolean;
+  isCallAccepted: (parentSid: string) => boolean;
   reconnectNow: () => Promise<void>;
 };
 
@@ -164,46 +189,109 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     setDeviceReason(reason);
   }, []);
 
-  const removeManagedCall = useCallback((callSid: string) => {
-    if (!callsRef.current.has(callSid)) return;
-    callsRef.current.delete(callSid);
+  const removeManagedCall = useCallback((parentSid: string) => {
+    if (!callsRef.current.has(parentSid)) return;
+    callsRef.current.delete(parentSid);
     syncAttachedCallSids();
-    onCallEndedRef.current?.(callSid);
+    onCallEndedRef.current?.(parentSid);
   }, [syncAttachedCallSids]);
 
-  const wireCallLifecycle = useCallback((call: Call, callSid: string, direction: 'inbound' | 'outbound', destination: string | null) => {
-    callsRef.current.set(callSid, {
+  const wireCallLifecycle = useCallback((
+    call: Call,
+    parentSid: string,
+    localSid: string,
+    direction: 'inbound' | 'outbound',
+    destination: string | null,
+  ) => {
+    callsRef.current.set(parentSid, {
       call,
-      sid: callSid,
+      parentSid,
+      localSid,
       muted: false,
       direction,
       destination,
+      accepted: false,
     });
     syncAttachedCallSids();
 
     call.on('accept', () => {
-      onCallAcceptedRef.current?.(callSid);
+      const managed = callsRef.current.get(parentSid);
+      if (managed) managed.accepted = true;
+      onCallAcceptedRef.current?.(parentSid);
     });
 
     call.on('disconnect', () => {
-      removeManagedCall(callSid);
+      removeManagedCall(parentSid);
     });
 
     call.on('cancel', () => {
-      removeManagedCall(callSid);
+      removeManagedCall(parentSid);
     });
 
     call.on('reject', () => {
-      removeManagedCall(callSid);
+      removeManagedCall(parentSid);
     });
 
     call.on('error', (err: { message?: string }) => {
       const message = err.message || 'Error en llamada de voz';
       setLastError(message);
-      onInfoRef.current?.(`Error de llamada ${callSid}: ${message}`);
-      removeManagedCall(callSid);
+      onInfoRef.current?.(`Error de llamada ${parentSid}: ${message}`);
+      removeManagedCall(parentSid);
     });
   }, [removeManagedCall, syncAttachedCallSids]);
+
+  // Waits until Twilio assigns a CallSid to the Call (populated in
+  // call.parameters.CallSid once the backend signals it) OR the call is
+  // rejected/canceled/disconnected. Returns null on timeout — callers must
+  // treat this as a fatal accept failure and tear down the Call. Previously
+  // the engine synthesized `conf-${Date.now()}` / `outbound-${Date.now()}`
+  // when Twilio hadn't populated CallSid yet, producing a ghost managed-call
+  // that never matched real events.
+  const waitForRealCallSid = useCallback((call: Call, timeoutMs: number): Promise<string | null> => {
+    return new Promise((resolve) => {
+      const existing = call.parameters?.CallSid;
+      if (typeof existing === 'string' && existing.length > 0) {
+        resolve(existing);
+        return;
+      }
+
+      let resolved = false;
+      const finish = (value: string | null) => {
+        if (resolved) return;
+        resolved = true;
+        clearInterval(poll);
+        clearTimeout(timer);
+        call.off('accept', onProgress);
+        (call as unknown as { off: (event: string, fn: () => void) => void }).off('ringing', onProgress);
+        call.off('disconnect', onFailure);
+        call.off('cancel', onFailure);
+        call.off('reject', onFailure);
+        call.off('error', onFailure);
+        resolve(value);
+      };
+
+      const checkNow = () => {
+        const sid = call.parameters?.CallSid;
+        if (typeof sid === 'string' && sid.length > 0) {
+          finish(sid);
+        }
+      };
+      const onProgress = () => checkNow();
+      const onFailure = () => finish(null);
+
+      const poll = setInterval(checkNow, CALL_SID_POLL_INTERVAL_MS);
+      const timer = setTimeout(() => finish(null), timeoutMs);
+
+      call.on('accept', onProgress);
+      // `ringing` exists on the SDK at runtime even though its name isn't
+      // in the public Call event union (varies between SDK versions).
+      (call as unknown as { on: (event: string, fn: () => void) => void }).on('ringing', onProgress);
+      call.on('disconnect', onFailure);
+      call.on('cancel', onFailure);
+      call.on('reject', onFailure);
+      call.on('error', onFailure);
+    });
+  }, []);
 
   // Create or refresh the Device with a fresh token.
   // We do NOT call device.register() — just keep a Device ready for connect().
@@ -401,23 +489,39 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         },
       });
 
-      const callSid = call.parameters?.CallSid || `outbound-${Date.now()}`;
-      wireCallLifecycle(call, callSid, 'outbound', connectParams.destination);
-      onCallStartedRef.current?.(callSid, 'outbound', connectParams.destination);
+      // Outbound: the Twilio-assigned CallSid IS the canonical/parent SID.
+      // Wait for it instead of faking one — a synthetic SID would make the
+      // backend and engine disagree on which call we're talking about.
+      const realSid = await waitForRealCallSid(call, CALL_SID_RESOLUTION_TIMEOUT_MS);
+      if (!realSid) {
+        try { call.disconnect(); } catch { /* best-effort */ }
+        const message = 'Twilio no asigno CallSid en el tiempo esperado; abortando llamada saliente.';
+        setLastError(message);
+        onInfoRef.current?.(message);
+        return { ok: false, error: message };
+      }
 
-      return { ok: true, data: { call_sid: callSid } };
+      wireCallLifecycle(call, realSid, realSid, 'outbound', connectParams.destination);
+      onCallStartedRef.current?.(realSid, 'outbound', connectParams.destination);
+
+      return { ok: true, data: { call_sid: realSid } };
     } catch (err) {
       const message = err instanceof Error ? err.message : 'connect_outbound_failed';
       setLastError(message);
       onInfoRef.current?.(`Error conectando llamada saliente: ${message}`);
       return { ok: false, error: message };
     }
-  }, [ensureDevice, wireCallLifecycle]);
+  }, [ensureDevice, waitForRealCallSid, wireCallLifecycle]);
 
   const joinConference = useCallback(async (conferenceParams: {
     conferenceName: string;
-    parentCallSid?: string;
+    parentCallSid: string;
   }): Promise<VoiceActionResult> => {
+    const parentSid = conferenceParams.parentCallSid;
+    if (!parentSid || parentSid.length === 0) {
+      return { ok: false, error: 'parentCallSid es obligatorio para unir el agente a la conferencia.' };
+    }
+
     try {
       let device = deviceRef.current;
       if (!device) {
@@ -433,32 +537,39 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         params: {
           To: `conference:${conferenceParams.conferenceName}`,
           UserId: identityRef.current,
-          ParentCallSid: conferenceParams.parentCallSid || '',
+          ParentCallSid: parentSid,
         },
       });
 
-      const callSid = call.parameters?.CallSid || `conf-${Date.now()}`;
-      wireCallLifecycle(call, callSid, 'inbound', null);
-      onCallStartedRef.current?.(callSid, 'inbound', null);
+      // The agent-leg CallSid (local) differs from the parent (PSTN) SID.
+      // We key everything by parent SID so external callers never need to
+      // know or translate between them. The local SID is captured for logs
+      // only; if Twilio doesn't supply one quickly the call is still usable
+      // (disconnect/mute go through the Call reference, not the SID).
+      const localSid = await waitForRealCallSid(call, CALL_SID_RESOLUTION_TIMEOUT_MS);
+      const effectiveLocalSid = localSid ?? `pending-${parentSid}`;
 
-      return { ok: true, data: { call_sid: callSid } };
+      wireCallLifecycle(call, parentSid, effectiveLocalSid, 'inbound', null);
+      onCallStartedRef.current?.(parentSid, 'inbound', null);
+
+      return { ok: true, data: { call_sid: parentSid } };
     } catch (err) {
       const message = err instanceof Error ? err.message : 'join_conference_failed';
       setLastError(message);
       onInfoRef.current?.(`Error uniendose a conferencia: ${message}`);
       return { ok: false, error: message };
     }
-  }, [ensureDevice, wireCallLifecycle]);
+  }, [ensureDevice, waitForRealCallSid, wireCallLifecycle]);
 
-  const disconnectCall = useCallback(async (callSid: string): Promise<VoiceActionResult> => {
-    const managed = callsRef.current.get(callSid);
+  const disconnectCall = useCallback(async (parentSid: string): Promise<VoiceActionResult> => {
+    const managed = callsRef.current.get(parentSid);
     if (!managed) {
       return { ok: false, error: 'La llamada no esta enlazada localmente al softphone.' };
     }
 
     try {
       managed.call.disconnect();
-      return { ok: true, data: { call_sid: callSid } };
+      return { ok: true, data: { call_sid: parentSid } };
     } catch (err) {
       const message = err instanceof Error ? err.message : 'disconnect_failed';
       setLastError(message);
@@ -466,8 +577,8 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     }
   }, []);
 
-  const setMuted = useCallback(async (callSid: string, muted: boolean): Promise<VoiceActionResult> => {
-    const managed = callsRef.current.get(callSid);
+  const setMuted = useCallback(async (parentSid: string, muted: boolean): Promise<VoiceActionResult> => {
+    const managed = callsRef.current.get(parentSid);
     if (!managed) {
       return { ok: false, error: 'No hay media local para mutear/desmutear esta llamada.' };
     }
@@ -475,8 +586,8 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     try {
       managed.call.mute(muted);
       managed.muted = muted;
-      onCallMutedChangedRef.current?.(callSid, muted);
-      return { ok: true, data: { call_sid: callSid } };
+      onCallMutedChangedRef.current?.(parentSid, muted);
+      return { ok: true, data: { call_sid: parentSid } };
     } catch (err) {
       const message = err instanceof Error ? err.message : 'mute_toggle_failed';
       setLastError(message);
@@ -484,8 +595,12 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     }
   }, []);
 
-  const isCallAttached = useCallback((callSid: string) => {
-    return callsRef.current.has(callSid);
+  const isCallAttached = useCallback((parentSid: string) => {
+    return callsRef.current.has(parentSid);
+  }, []);
+
+  const isCallAccepted = useCallback((parentSid: string) => {
+    return callsRef.current.get(parentSid)?.accepted === true;
   }, []);
 
   const reconnectNow = useCallback(async () => {
@@ -518,6 +633,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     disconnectCall,
     setMuted,
     isCallAttached,
+    isCallAccepted,
     reconnectNow,
   }), [
     attachedCallSids,
@@ -526,6 +642,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     deviceStatus,
     disconnectCall,
     identity,
+    isCallAccepted,
     isCallAttached,
     joinConference,
     lastError,

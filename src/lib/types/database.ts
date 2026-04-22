@@ -56,6 +56,29 @@ export type WebhookDeliveryLog = {
   created_at: string;
 };
 
+export type DomainEvent = {
+  id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+  agent_user_id: string | null;
+  target_user_ids: string[];
+  call_sid: string | null;
+  call_record_id: string | null;
+  created_at: string;
+  expires_at: string;
+};
+
+export type TwilioWebhookEvent = {
+  id: string;
+  call_sid: string;
+  call_status: string;
+  account_sid: string;
+  source: string;
+  payload: Record<string, unknown>;
+  received_at: string;
+  expires_at: string;
+};
+
 // --- Tablas (type alias, no interface, para compatibilidad con Record<string, unknown>) ---
 
 export type User = {
@@ -151,6 +174,8 @@ export type CallRecord = {
   phone_number_id: string | null;
   answered_by_user_id: string | null;
   twilio_data: Record<string, unknown> | null;
+  last_webhook_at: string | null;
+  last_verified_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -267,7 +292,7 @@ export interface Database {
       };
       call_records: {
         Row: CallRecord;
-        Insert: Omit<CallRecord, 'id' | 'created_at' | 'updated_at' | 'twilio_call_sid' | 'answered_at' | 'ended_at' | 'duration' | 'wait_time' | 'queue_id' | 'phone_number_id' | 'answered_by_user_id' | 'twilio_data'> & {
+        Insert: Omit<CallRecord, 'id' | 'created_at' | 'updated_at' | 'twilio_call_sid' | 'answered_at' | 'ended_at' | 'duration' | 'wait_time' | 'queue_id' | 'phone_number_id' | 'answered_by_user_id' | 'twilio_data' | 'last_webhook_at' | 'last_verified_at'> & {
           id?: string;
           created_at?: string;
           updated_at?: string;
@@ -280,6 +305,8 @@ export interface Database {
           phone_number_id?: string | null;
           answered_by_user_id?: string | null;
           twilio_data?: Record<string, unknown> | null;
+          last_webhook_at?: string | null;
+          last_verified_at?: string | null;
         };
         Update: Partial<Omit<CallRecord, 'id' | 'created_at'>>;
         Relationships: [];
@@ -346,6 +373,30 @@ export interface Database {
           delivered?: boolean;
         };
         Update: Partial<Omit<WebhookDeliveryLog, 'id' | 'created_at'>>;
+        Relationships: [];
+      };
+      domain_events: {
+        Row: DomainEvent;
+        Insert: Omit<DomainEvent, 'id' | 'created_at' | 'expires_at' | 'agent_user_id' | 'target_user_ids' | 'call_sid' | 'call_record_id'> & {
+          id?: string;
+          created_at?: string;
+          expires_at?: string;
+          agent_user_id?: string | null;
+          target_user_ids?: string[];
+          call_sid?: string | null;
+          call_record_id?: string | null;
+        };
+        Update: Partial<Omit<DomainEvent, 'id'>>;
+        Relationships: [];
+      };
+      twilio_webhook_events: {
+        Row: TwilioWebhookEvent;
+        Insert: Omit<TwilioWebhookEvent, 'id' | 'received_at' | 'expires_at'> & {
+          id?: string;
+          received_at?: string;
+          expires_at?: string;
+        };
+        Update: Partial<Omit<TwilioWebhookEvent, 'id'>>;
         Relationships: [];
       };
     };

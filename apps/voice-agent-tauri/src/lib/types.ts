@@ -41,6 +41,10 @@ export type AgentStateSnapshot = {
     status: string;
     from: string;
     to: string;
+    // Canonical conference room (if any) — needed by Tauri to join media via
+    // device.connect({ To: 'conference:<name>' }). Always present for inbound
+    // calls routed through a queue; may be null for legacy direct dials.
+    conference_name?: string | null;
   }>;
   source_of_truth: string;
   generated_at: string;
@@ -59,6 +63,26 @@ export type CanonicalStreamEvent = {
   };
 };
 
+// Explicit state machine for calls as the UI and engine see them.
+//
+//   ringing      — inbound, not accepted (ringtone on, Accept enabled)
+//   accepting    — user clicked Accept; media path not yet confirmed
+//   connected    — media flowing (Twilio Call 'accept' event fired)
+//   hanging_up   — hangup in flight; awaiting backend ack
+//   ended        — terminal (brief display before being dropped from list)
+//
+// Previously the UI multiplexed backend status + local presence + ad-hoc
+// flags. The explicit phase eliminates several race conditions — notably
+// the "you accepted but no audio" bug where phase went straight to
+// connected because stopIncomingRingtone was called before media was
+// confirmed.
+export type CallPhase =
+  | 'ringing'
+  | 'accepting'
+  | 'connected'
+  | 'hanging_up'
+  | 'ended';
+
 export type VoiceCallView = {
   callSid: string;
   direction: string;
@@ -66,6 +90,11 @@ export type VoiceCallView = {
   from: string | null;
   to: string | null;
   muted: boolean;
+  phase: CallPhase;
+  // Canonical conference room, propagated from SSE incoming_call events and
+  // the agent-state snapshot. Needed by the Accept flow to know which room
+  // to join without maintaining a separate in-memory Map.
+  conferenceName: string | null;
 };
 
 export type VoiceDeviceStatus =

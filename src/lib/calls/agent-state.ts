@@ -1,5 +1,6 @@
 import { createAdminClient } from '@/lib/supabase/admin';
 import { getTwilioClient } from '@/lib/twilio/client';
+import { emitEvent } from '@/lib/events/emitter';
 import type { CallRecord, CallStatus, User } from '@/lib/types/database';
 
 export type AgentOperationalStatus =
@@ -40,7 +41,7 @@ export type AgentRuntimeSnapshot = {
 const ACTIVE_STATUSES: Array<CallRecord['status']> = ['ringing', 'in_queue', 'in_progress'];
 const TERMINAL_TWILIO_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
 const SELF_HEAL_MIN_AGE_MS = 30 * 1000;
-const SELF_HEAL_MAX_CHECKS = 5;
+const SELF_HEAL_MAX_CHECKS = 10;
 
 type MinimalCallRecordRow = Pick<
   CallRecord,
@@ -53,6 +54,7 @@ type MinimalCallRecordRow = Pick<
   | 'started_at'
   | 'answered_by_user_id'
   | 'twilio_data'
+  | 'queue_id'
 >;
 
 function getTextFromTwilioData(data: Record<string, unknown> | null, key: string): string | null {
@@ -101,47 +103,126 @@ async function reconcileStaleActiveCalls(
 
   for (const row of candidates) {
     const callSid = row.twilio_call_sid as string;
+    const verifiedAt = new Date().toISOString();
 
     try {
       const liveCall = await twilioClient.calls(callSid).fetch();
       const liveStatus = (liveCall.status || '').toLowerCase();
-      if (!TERMINAL_TWILIO_STATUSES.has(liveStatus)) continue;
+      if (!TERMINAL_TWILIO_STATUSES.has(liveStatus)) {
+        // Still alive per Twilio. Record the verification so the next
+        // caller (e.g. dial pre-flight) knows we confirmed it's live
+        // recently and must not kill it.
+        await supabase
+          .from('call_records')
+          .update({ last_verified_at: verifiedAt })
+          .eq('id', row.id);
+        continue;
+      }
 
       const endedAt = liveCall.endTime
         ? new Date(liveCall.endTime).toISOString()
         : new Date().toISOString();
       const parsedDuration = parseInt(String(liveCall.duration ?? '0'), 10);
       const safeDuration = Number.isFinite(parsedDuration) ? parsedDuration : 0;
+      const terminalStatus = mapTerminalTwilioStatus(liveStatus);
 
-      await supabase
+      const { data: updateResult } = await supabase
         .from('call_records')
         .update({
-          status: mapTerminalTwilioStatus(liveStatus),
+          status: terminalStatus,
           ended_at: endedAt,
           duration: safeDuration,
+          last_verified_at: verifiedAt,
         })
         .eq('id', row.id)
         .eq('status', 'in_progress')
-        .is('ended_at', null);
+        .is('ended_at', null)
+        .select('id')
+        .maybeSingle();
 
       staleIds.add(row.id);
+
+      // Emit canonical SSE event so subscribers (Tauri softphone, web UI, RDN via webhooks)
+      // learn the call ended. Without this, the DB heals silently and the client remains
+      // stuck showing the call as active (root cause of post-call "pendiente" state).
+      if (updateResult) {
+        if (row.direction === 'inbound' && terminalStatus !== 'completed') {
+          await emitEvent('call.missed', {
+            call_sid: callSid,
+            direction: row.direction,
+            from: row.from_number ?? null,
+            to: row.to_number ?? null,
+            final_status: terminalStatus,
+            queue_id: row.queue_id ?? null,
+            terminal_source: 'agent_state_self_heal',
+          });
+        } else {
+          await emitEvent('call.completed', {
+            call_sid: callSid,
+            direction: row.direction,
+            status: terminalStatus,
+            from: row.from_number ?? null,
+            to: row.to_number ?? null,
+            queue_id: row.queue_id ?? null,
+            answered_by_user_id: row.answered_by_user_id ?? null,
+            duration: safeDuration,
+            wait_time: null,
+            answered_at: null,
+            ended_at: endedAt,
+            terminal_source: 'agent_state_self_heal',
+          });
+        }
+      }
     } catch (err) {
       const errorCode = (err as { code?: number; status?: number })?.code;
       const errorStatus = (err as { code?: number; status?: number })?.status;
       const isNotFound = errorCode === 20404 || errorStatus === 404;
       if (!isNotFound) continue;
 
-      await supabase
+      const endedAt = new Date().toISOString();
+      const { data: updateResult } = await supabase
         .from('call_records')
         .update({
           status: 'canceled',
-          ended_at: new Date().toISOString(),
+          ended_at: endedAt,
+          last_verified_at: verifiedAt,
         })
         .eq('id', row.id)
         .eq('status', 'in_progress')
-        .is('ended_at', null);
+        .is('ended_at', null)
+        .select('id')
+        .maybeSingle();
 
       staleIds.add(row.id);
+
+      if (updateResult) {
+        if (row.direction === 'inbound') {
+          await emitEvent('call.missed', {
+            call_sid: callSid,
+            direction: row.direction,
+            from: row.from_number ?? null,
+            to: row.to_number ?? null,
+            final_status: 'canceled' as CallStatus,
+            queue_id: row.queue_id ?? null,
+            terminal_source: 'agent_state_self_heal_twilio_404',
+          });
+        } else {
+          await emitEvent('call.completed', {
+            call_sid: callSid,
+            direction: row.direction,
+            status: 'canceled' as CallStatus,
+            from: row.from_number ?? null,
+            to: row.to_number ?? null,
+            queue_id: row.queue_id ?? null,
+            answered_by_user_id: row.answered_by_user_id ?? null,
+            duration: 0,
+            wait_time: null,
+            answered_at: null,
+            ended_at: endedAt,
+            terminal_source: 'agent_state_self_heal_twilio_404',
+          });
+        }
+      }
     }
   }
 
@@ -165,7 +246,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
   // Main assignment source: answered_by_user_id
   const answeredCallsQuery = await supabase
     .from('call_records')
-    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id')
     .eq('answered_by_user_id', userId)
     .in('status', ACTIVE_STATUSES)
     .is('ended_at', null)
@@ -175,7 +256,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
   // Secondary assignment source: resolved agent in twilio_data (RDN initiated/adopted)
   const resolvedAgentCallsQuery = await supabase
     .from('call_records')
-    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id')
     .eq('twilio_data->>resolved_agent_id', userId)
     .in('status', ACTIVE_STATUSES)
     .is('ended_at', null)
@@ -185,7 +266,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
   // Fallback source for legacy browser-originated calls
   const initiatedCallsQuery = await supabase
     .from('call_records')
-    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id')
     .eq('twilio_data->>initiated_by', userId)
     .in('status', ACTIVE_STATUSES)
     .is('ended_at', null)
@@ -195,7 +276,7 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
   // Ringing/in_queue calls currently targeted to this user (conference pre-answer routing).
   const targetedPendingCallsQuery = await supabase
     .from('call_records')
-    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id')
     .in('status', ['ringing', 'in_queue'] as CallRecord['status'][])
     .is('ended_at', null)
     .contains('twilio_data', { current_ring_target_user_ids: [userId] })

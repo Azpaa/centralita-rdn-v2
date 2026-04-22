@@ -142,14 +142,18 @@ function mapDomainEventType(event: EventType): CanonicalClientEventType {
   }
 }
 
-function buildCanonicalEvent(event: EventType, data: Record<string, unknown>): CanonicalClientEvent {
+function buildCanonicalEvent(
+  event: EventType,
+  data: Record<string, unknown>,
+  options?: { eventId?: string; timestamp?: string },
+): CanonicalClientEvent {
   const agentUserId = extractAgentUserId(data);
   const targetUserIds = extractTargetUserIds(data, agentUserId);
 
   return {
-    id: crypto.randomUUID(),
+    id: options?.eventId ?? crypto.randomUUID(),
     type: mapDomainEventType(event),
-    timestamp: new Date().toISOString(),
+    timestamp: options?.timestamp ?? new Date().toISOString(),
     domain_event: event,
     call_sid: getString(data, 'call_sid') ?? getString(data, 'twilio_call_sid'),
     call_record_id: getString(data, 'call_record_id'),
@@ -159,6 +163,30 @@ function buildCanonicalEvent(event: EventType, data: Record<string, unknown>): C
     target_user_ids: targetUserIds,
     payload: data,
   };
+}
+
+// Exported for domain_events replay path — given a persisted row, rebuild
+// the canonical SSE event preserving the stored event id so client-side
+// dedup by id stays consistent across reconnects.
+export function buildCanonicalEventFromStored(args: {
+  id: string;
+  event: EventType;
+  data: Record<string, unknown>;
+  timestamp: string;
+}): CanonicalClientEvent {
+  return buildCanonicalEvent(args.event, args.data, {
+    eventId: args.id,
+    timestamp: args.timestamp,
+  });
+}
+
+export function extractStreamTargetsFromDomainEvent(data: Record<string, unknown>): {
+  agentUserId: string | null;
+  targetUserIds: string[];
+} {
+  const agentUserId = extractAgentUserId(data);
+  const targetUserIds = extractTargetUserIds(data, agentUserId);
+  return { agentUserId, targetUserIds };
 }
 
 function shouldDeliverToSubscriber(subscriber: StreamSubscriber, event: CanonicalClientEvent): boolean {
@@ -189,9 +217,10 @@ export function publishCanonicalClientEvent(event: CanonicalClientEvent): void {
 export function publishCanonicalClientEventFromDomain(
   event: EventType,
   data: Record<string, unknown>,
+  options?: { eventId?: string; timestamp?: string },
 ): void {
   try {
-    const canonical = buildCanonicalEvent(event, data);
+    const canonical = buildCanonicalEvent(event, data, options);
     publishCanonicalClientEvent(canonical);
   } catch (err) {
     console.error(`[SSE] Error mapping domain event ${event} to canonical stream event:`, err);

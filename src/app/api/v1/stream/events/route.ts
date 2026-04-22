@@ -4,14 +4,23 @@ import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiBadRequest, apiForbidden } from '@/lib/api/response';
 import { resolveAgentRuntimeSnapshot } from '@/lib/calls/agent-state';
 import {
+  buildCanonicalEventFromStored,
   subscribeCanonicalClientEvents,
   type CanonicalClientEvent,
 } from '@/lib/events/client-stream';
+import { createAdminClient } from '@/lib/supabase/admin';
+import type { EventType } from '@/lib/events/emitter';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const HEARTBEAT_MS = 25_000;
+
+// Cap replay at a sane ceiling so an agent that reconnects after hours
+// doesn't flood their SSE with stale events. Anything older than this
+// should come from the snapshot, not from the event log.
+const REPLAY_MAX_EVENTS = 100;
+const REPLAY_MAX_AGE_MINUTES = 10;
 
 type ConnectedEvent = {
   id: string;
@@ -47,8 +56,66 @@ function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
-function toSseMessage(payload: unknown): string {
-  return `data: ${JSON.stringify(payload)}\n\n`;
+function toSseMessage(payload: unknown, eventId?: string | null): string {
+  // Per HTML5 SSE spec: `id:` field updates the browser's Last-Event-ID
+  // tracker automatically, so a native EventSource reconnect sends it as
+  // a header. We also surface the id in the JSON body for non-EventSource
+  // clients (fetch + reader) that read it directly.
+  const idLine = eventId ? `id: ${eventId}\n` : '';
+  return `${idLine}data: ${JSON.stringify(payload)}\n\n`;
+}
+
+type DomainEventRow = {
+  id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+async function loadReplayEvents(args: {
+  targetUserId: string;
+  lastEventId: string;
+  receiveAll: boolean;
+}): Promise<CanonicalClientEvent[]> {
+  const supabase = createAdminClient();
+
+  // Resolve the timestamp of the last seen event so we only replay newer
+  // ones. If the row is gone (TTL evicted) we fall back to the age cap.
+  const { data: anchor } = await supabase
+    .from('domain_events')
+    .select('created_at')
+    .eq('id', args.lastEventId)
+    .maybeSingle();
+
+  const cutoffIso = anchor?.created_at
+    ?? new Date(Date.now() - REPLAY_MAX_AGE_MINUTES * 60_000).toISOString();
+
+  let query = supabase
+    .from('domain_events')
+    .select('id, event_type, payload, created_at')
+    .gt('created_at', cutoffIso)
+    .order('created_at', { ascending: true })
+    .limit(REPLAY_MAX_EVENTS);
+
+  if (!args.receiveAll) {
+    // Events addressed to this user OR where they're the agent. Supabase
+    // array ops use `contains` / `cs` — both work with uuid[].
+    query = query.or(
+      `target_user_ids.cs.{${args.targetUserId}},agent_user_id.eq.${args.targetUserId}`,
+    );
+  }
+
+  const { data: rows, error } = await query;
+  if (error || !rows) return [];
+
+  return (rows as DomainEventRow[]).map((row) =>
+    buildCanonicalEventFromStored({
+      id: row.id,
+      event: row.event_type as EventType,
+      data: row.payload,
+      timestamp: row.created_at,
+    }),
+  );
 }
 
 export async function GET(req: NextRequest) {
@@ -99,6 +166,15 @@ export async function GET(req: NextRequest) {
     scope = 'agent';
   }
 
+  // Last-Event-ID drives replay. Browsers send it as a header on native
+  // EventSource auto-reconnect. Fetch-based clients (Tauri) cannot set
+  // arbitrary headers easily in some environments, so we accept a query
+  // param fallback.
+  const lastEventIdHeader = req.headers.get('last-event-id');
+  const lastEventIdParam = searchParams.get('last_event_id');
+  const lastEventIdRaw = lastEventIdHeader || lastEventIdParam;
+  const lastEventId = lastEventIdRaw && isUuid(lastEventIdRaw) ? lastEventIdRaw : null;
+
   const encoder = new TextEncoder();
   let unsubscribe: (() => void) | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -109,7 +185,8 @@ export async function GET(req: NextRequest) {
       const send = (payload: ConnectedEvent | SnapshotEvent | HeartbeatEvent | CanonicalClientEvent) => {
         if (isClosed) return;
         try {
-          controller.enqueue(encoder.encode(toSseMessage(payload)));
+          const eventId = 'id' in payload && typeof payload.id === 'string' ? payload.id : null;
+          controller.enqueue(encoder.encode(toSseMessage(payload, eventId)));
         } catch {
           // Stream already closed by client.
         }
@@ -204,6 +281,33 @@ export async function GET(req: NextRequest) {
             }
           } catch (err) {
             console.error('[SSE] Failed building initial snapshot:', err);
+          }
+        })();
+      }
+
+      // Replay de eventos faltantes desde domain_events cuando el cliente
+      // reconecta con Last-Event-ID. Hacemos esto DESPUÉS del snapshot
+      // para que el estado base llegue primero y los eventos se apliquen
+      // incrementalmente encima. Si no hay Last-Event-ID (conexión fresca)
+      // no replicamos nada — el snapshot ya es la verdad.
+      if (lastEventId && (targetUserId || receiveAll)) {
+        void (async () => {
+          try {
+            const replayEvents = await loadReplayEvents({
+              targetUserId: targetUserId ?? '',
+              lastEventId,
+              receiveAll,
+            });
+            for (const evt of replayEvents) {
+              send(evt);
+            }
+            if (replayEvents.length > 0) {
+              console.log(
+                `[SSE] Replayed ${replayEvents.length} event(s) for user=${targetUserId ?? 'all'} since id=${lastEventId}`,
+              );
+            }
+          } catch (err) {
+            console.error('[SSE] Replay failed:', err);
           }
         })();
       }
