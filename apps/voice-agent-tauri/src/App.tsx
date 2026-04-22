@@ -585,6 +585,7 @@ export default function App() {
 
     remoteAcceptInFlightRef.current.add(callSid);
     try {
+      stopIncomingRingtone();
       // For incoming calls, join the conference room
       const confName = incomingConferences.get(callSid) || `call-${callSid}`;
       const result = await voice.joinConference({
@@ -593,6 +594,11 @@ export default function App() {
       });
 
       if (result.ok) {
+        setCalls((prev) => prev.map((call) => (
+          call.callSid === callSid
+            ? { ...call, status: 'in_progress' }
+            : call
+        )));
         if (commandId) markRemoteCommandProcessed(commandId);
         setMessage(`Orden remota ejecutada: unido a conferencia para llamada ${callSid}.`);
       } else {
@@ -601,7 +607,7 @@ export default function App() {
     } finally {
       remoteAcceptInFlightRef.current.delete(callSid);
     }
-  }, [incomingConferences, markRemoteCommandProcessed, voice, wasRemoteCommandProcessed]);
+  }, [incomingConferences, markRemoteCommandProcessed, stopIncomingRingtone, voice, wasRemoteCommandProcessed]);
 
   // Track outbound connect requests we've already processed
   const processedOutboundRequestsRef = useRef<Set<string>>(new Set());
@@ -1044,6 +1050,7 @@ export default function App() {
     if (!backendUrl || !accessTokenRef.current) return;
 
     if (action === 'accept') {
+      stopIncomingRingtone();
       // Accept incoming call by joining the conference room
       // Use the conference name from SSE event if available, otherwise derive from callSid
       const confName = incomingConferences.get(callSid) || `call-${callSid}`;
@@ -1056,6 +1063,11 @@ export default function App() {
         return;
       }
       stopIncomingRingtone();
+      setCalls((prev) => prev.map((call) => (
+        call.callSid === callSid
+          ? { ...call, status: 'in_progress' }
+          : call
+      )));
       // Clean up the incoming conference mapping
       setIncomingConferences((prev) => {
         const next = new Map(prev);
@@ -1118,7 +1130,7 @@ export default function App() {
 
     setMessage(`${wantsMute ? 'Mute' : 'Unmute'} aplicado en ${callSid}`);
     void refreshAgentSnapshot(`action:${action}`);
-  }, [backendUrl, conferenceName, incomingConferences, refreshAgentSnapshot, voice, withJwtRetry]);
+  }, [backendUrl, conferenceName, incomingConferences, refreshAgentSnapshot, stopIncomingRingtone, voice, withJwtRetry]);
 
   useEffect(() => () => {
     authSubscriptionRef.current?.unsubscribe();
@@ -1139,18 +1151,23 @@ export default function App() {
     calls.some((call) => call.status === 'in_progress')
   ), [calls]);
 
+  const hasAttachedLocalCalls = useMemo(() => (
+    voice.attachedCallSids.length > 0
+  ), [voice.attachedCallSids]);
+
   const hasIncomingRingingCalls = useMemo(() => (
     !hasInProgressCalls
+    && !hasAttachedLocalCalls
     && calls.some((call) => (
       call.direction === 'inbound'
       && (call.status === 'ringing' || call.status === 'in_queue')
     ))
-  ), [calls, hasInProgressCalls]);
+  ), [calls, hasAttachedLocalCalls, hasInProgressCalls]);
 
   useEffect(() => {
-    if (!hasInProgressCalls) return;
+    if (!hasInProgressCalls && !hasAttachedLocalCalls) return;
     stopIncomingRingtone();
-  }, [hasInProgressCalls, stopIncomingRingtone]);
+  }, [hasAttachedLocalCalls, hasInProgressCalls, stopIncomingRingtone]);
 
   useEffect(() => {
     if (hasIncomingRingingCalls) {
