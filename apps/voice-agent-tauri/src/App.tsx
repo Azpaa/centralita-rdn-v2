@@ -272,7 +272,8 @@ export default function App() {
           .filter((call) => typeof call.conferenceName === 'string' && call.conferenceName.length > 0)
           .map((call) => [call.callSid, call.conferenceName as string])
       );
-      return snapshot.active_calls
+
+      const fromSnapshot = snapshot.active_calls
         .filter((call) => typeof call.call_sid === 'string' && call.call_sid.length > 0)
         .map((call) => {
           const sid = call.call_sid as string;
@@ -299,6 +300,26 @@ export default function App() {
             conferenceName: conferenceNameForCall,
           };
         });
+
+      // Snapshot-vs-SSE race guard. The incoming_call SSE event arrives as
+      // soon as the webhook emits, but the snapshot only sees the call once
+      // `current_ring_target_user_ids` has been stamped on twilio_data —
+      // which is a separate DB roundtrip happening ~50-200ms later. If we
+      // refresh the snapshot in that window, it returns active_calls=[]
+      // and would wipe a ringing call we already received via SSE.
+      //
+      // Fix: keep any local ringing/accepting call that is missing from
+      // the snapshot AND looks young (<10s). A stale ringing call older
+      // than that is either wrong or the backend's reconcile already
+      // marked it terminal, so dropping it is correct.
+      const snapshotSids = new Set(fromSnapshot.map((call) => call.callSid));
+      const preservedRinging = prev.filter((call) => {
+        if (snapshotSids.has(call.callSid)) return false;
+        if (call.phase !== 'ringing' && call.phase !== 'accepting') return false;
+        return true;
+      });
+
+      return [...fromSnapshot, ...preservedRinging];
     });
   }, []);
 
@@ -1202,9 +1223,25 @@ export default function App() {
       const now = Date.now();
       if (now - lastRecoveryTriggerAtRef.current < RECOVERY_RECONNECT_THROTTLE_MS) return;
       lastRecoveryTriggerAtRef.current = now;
-      sseControllerRef.current?.abort();
+
+      // Only tear down the SSE if it actually looks stale. A healthy stream
+      // receives heartbeats every 25s from the backend, so anything within
+      // ~30s means the socket is alive. Previously we aborted on every
+      // focus/online/visibility change, which on a user that frequently
+      // switches between windows (Tauri, RDN, browser) caused a continuous
+      // reconnect loop — and any incoming_call emitted during the
+      // reconnect window landed on an orphaned worker bucket and got
+      // dropped before Last-Event-ID replay could recover it.
+      const msSinceLastEvent = now - lastStreamEventAtRef.current;
+      const streamLooksHealthy = msSinceLastEvent < 30_000;
+
+      if (!streamLooksHealthy) {
+        sseControllerRef.current?.abort();
+        void reconnectVoiceRef.current();
+      }
+
+      // Cheap and always-safe: refresh snapshot + warm up ringtone audio.
       void refreshAgentSnapshot(`recover:${reason}`);
-      void reconnectVoiceRef.current();
       void primeIncomingRingtone();
     };
 
