@@ -348,7 +348,21 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
           deviceRef.current.updateToken(tokenResult.data.token);
           setHealthy('Token renovado — listo para llamadas');
           return deviceRef.current;
-        } catch {
+        } catch (updateErr) {
+          // If the token update throws AND there are active Calls, DO
+          // NOT destroy the Device. Destroying would kill the Call and
+          // tear down the conference (endConferenceOnExit). The Call
+          // carries its own per-call JWT so it can outlive a bad Device
+          // token update. Log and bail; the next refresh interval or
+          // the health check will retry after the call ends.
+          if (callsRef.current.size > 0) {
+            const message = updateErr instanceof Error ? updateErr.message : 'token_update_failed';
+            console.warn(
+              `[voice-engine] updateToken failed mid-call (${message}); keeping existing Device alive until calls drain.`,
+            );
+            setHealthy('Token renovado tras fallo puntual (conservando llamada activa)');
+            return deviceRef.current;
+          }
           try { deviceRef.current.destroy(); } catch { /* ignore */ }
           deviceRef.current = null;
         }
@@ -648,6 +662,22 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       onInfoRef.current?.('El motor de voz ya se esta inicializando.');
       return;
     }
+
+    // Guard: never tear down the Device while there are active Calls.
+    // `device.destroy()` disconnects every Call it owns, and the agent
+    // leg is wired with `endConferenceOnExit: true` so dropping it also
+    // kills the remote caller and RDN. Wake-gap detection and
+    // recoverRealtime both call reconnectNow; with a background Tauri
+    // window WebView2 throttles timers enough to trigger wake-gap
+    // spuriously mid-call, and this guard is what keeps that from
+    // collapsing the whole conference.
+    if (callsRef.current.size > 0) {
+      onInfoRef.current?.(
+        `Reinicio del motor pospuesto: hay ${callsRef.current.size} llamada(s) activa(s). Se procesara al colgar.`,
+      );
+      return;
+    }
+
     if (deviceRef.current) {
       try { deviceRef.current.destroy(); } catch { /* ignore */ }
       deviceRef.current = null;
