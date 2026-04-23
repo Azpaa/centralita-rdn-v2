@@ -411,9 +411,25 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     }
   }, [setHealthy, setProblem]);
 
-  // Initialize device when session is ready
+  // Initialize device when session is ready.
+  //
+  // IMPORTANT: deps intentionally use `hasSession` (boolean) instead of the
+  // raw `accessToken` string. Supabase auto-refreshes the access token every
+  // ~55 min of a logged-in session — if we depended on the token string,
+  // every refresh would re-run this effect, the cleanup would call
+  // `device.destroy()`, the active Twilio Call would end, the agent leg
+  // would leave the conference, and because the agent leg is wired with
+  // `endConferenceOnExit: true` Twilio would tear down the WHOLE conference
+  // (caller + RDN + Tauri drop simultaneously — exactly the "mid-call
+  // everyone hangs up" symptom observed in production).
+  //
+  // With `hasSession` the effect only re-runs on login/logout, not on
+  // token refreshes. `ensureDevice` already reads the latest token via
+  // `accessTokenRef.current` and updates the Device with `updateToken`,
+  // so token rotation stays transparent to the live call.
+  const hasSession = Boolean(accessToken);
   useEffect(() => {
-    if (!baseUrl || !accessToken) {
+    if (!baseUrl || !hasSession) {
       enabledRef.current = false;
       if (tokenRefreshTimerRef.current) {
         clearInterval(tokenRefreshTimerRef.current);
@@ -472,7 +488,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       setDeviceStatus('disconnected');
       setDeviceReason('Motor de voz detenido');
     };
-  }, [accessToken, baseUrl, ensureDevice, syncAttachedCallSids]);
+  }, [hasSession, baseUrl, ensureDevice, syncAttachedCallSids]);
 
   // ─── Call actions ────────────────────────────────────────────────────────
 
