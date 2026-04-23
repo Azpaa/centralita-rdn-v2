@@ -152,33 +152,33 @@ export async function POST(
     return `call-${callSid}`;
   })();
 
-  // Server-side accept-idempotency. RDN retries POST /accept when it doesn't
-  // see a timely confirm (their default is ~2-5s). Without this, every retry
-  // emits a brand-new canonical event (unique event.id), Tauri's id-dedup
-  // can't catch it, and the softphone races a second device.connect() on an
-  // already-attached call — the "bucle infinito" observed in production.
+  // Server-side accept-idempotency.
   //
-  // Strategy: stamp accept_last_requested_at on twilio_data and short-circuit
-  // if we already asked within the window. If the caller supplies a
-  // command_id that matches the last one we emitted, the dedupe window is
-  // even longer (same logical request).
-  const nowMs = Date.now();
-  const ACCEPT_DEDUPE_WINDOW_MS = 5_000;
-  const lastRequestedAtRaw = twilioData.accept_last_requested_at;
-  const lastRequestedAtMs = typeof lastRequestedAtRaw === 'string'
-    ? Date.parse(lastRequestedAtRaw)
-    : NaN;
-  const ageMs = Number.isFinite(lastRequestedAtMs) ? nowMs - lastRequestedAtMs : Infinity;
+  // Original intent: RDN retries POST /accept when it doesn't see a timely
+  // confirm. Without any guard, every retry emits a brand-new canonical
+  // event with a unique event.id — Tauri's id-dedupe won't catch it, and
+  // the softphone could race a second device.connect().
+  //
+  // Revised policy: short-circuit ONLY when the call has already been
+  // confirmed end-to-end (accept_confirmed_at present). In that case the
+  // softphone has media open and re-emitting a command would do nothing
+  // useful. If no confirm yet, we MUST re-emit on every retry: the first
+  // attempt may have reached the server but the canonical event may have
+  // died mid-flight (SSE socket churn, worker race), and if we short-
+  // circuit the retries, the softphone never gets a second chance. Tauri
+  // itself protects against duplicate joinConference via the
+  // `alreadyAttached` + `remoteAcceptInFlightRef` guards (see
+  // executeRemoteAccept in App.tsx), so re-emission is safe.
   const confirmedAt = typeof twilioData.accept_confirmed_at === 'string'
     ? twilioData.accept_confirmed_at
     : null;
 
-  if (ageMs < ACCEPT_DEDUPE_WINDOW_MS || confirmedAt) {
+  if (confirmedAt) {
     const lastCommandId = typeof twilioData.accept_last_command_id === 'string'
       ? twilioData.accept_last_command_id
       : null;
     console.log(
-      `[ACCEPT] ${callSid}: idempotent short-circuit age_ms=${Number.isFinite(ageMs) ? ageMs : -1} confirmed_at=${confirmedAt ?? '-'} last_command_id=${lastCommandId ?? '-'}`
+      `[ACCEPT] ${callSid}: already confirmed (${confirmedAt}) — idempotent short-circuit last_command_id=${lastCommandId ?? '-'}`
     );
     return apiSuccess({
       requested: true,
@@ -193,10 +193,21 @@ export async function POST(
         : null,
       command_id: lastCommandId,
       confirmed_at: confirmedAt,
-      note: confirmedAt
-        ? 'Llamada ya confirmada por el softphone.'
-        : 'Accept reciente aún en vuelo; no se re-emite evento.',
+      note: 'Llamada ya confirmada por el softphone.',
     });
+  }
+
+  // Track retry count in twilio_data for observability — not to gate.
+  const lastRequestedAtRaw = twilioData.accept_last_requested_at;
+  const nowMs = Date.now();
+  const lastRequestedAtMs = typeof lastRequestedAtRaw === 'string'
+    ? Date.parse(lastRequestedAtRaw)
+    : NaN;
+  const ageSincePreviousMs = Number.isFinite(lastRequestedAtMs) ? nowMs - lastRequestedAtMs : -1;
+  if (ageSincePreviousMs >= 0 && ageSincePreviousMs < 10_000) {
+    console.log(
+      `[ACCEPT] ${callSid}: retry within ${ageSincePreviousMs}ms — re-emitting (not confirmed yet)`,
+    );
   }
 
   // Decide which surface should execute this accept: desktop (Tauri) if it's

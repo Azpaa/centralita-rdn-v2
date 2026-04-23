@@ -105,12 +105,19 @@ function upsertCall(list: VoiceCallView[], next: VoiceCallView): VoiceCallView[]
   if (index === -1) return [...list, next];
 
   const updated = [...list];
+  // Preserve the existing firstSeenAt — an upsert is an update, not a re-add.
+  // If we overwrote firstSeenAt on every upsert, the applySnapshot age-gate
+  // would never purge phantom rings.
+  const previous = updated[index];
   updated[index] = {
-    ...updated[index],
+    ...previous,
     ...next,
+    firstSeenAt: previous.firstSeenAt,
   };
   return updated;
 }
+
+const RINGING_PRESERVATION_MS = 15_000;
 
 function derivePhase(args: {
   backendStatus: string;
@@ -273,6 +280,9 @@ export default function App() {
           .map((call) => [call.callSid, call.conferenceName as string])
       );
 
+      const firstSeenBySid = new Map(prev.map((call) => [call.callSid, call.firstSeenAt]));
+      const nowMs = Date.now();
+
       const fromSnapshot = snapshot.active_calls
         .filter((call) => typeof call.call_sid === 'string' && call.call_sid.length > 0)
         .map((call) => {
@@ -298,6 +308,7 @@ export default function App() {
             muted: mutedBySid.get(sid) ?? false,
             phase,
             conferenceName: conferenceNameForCall,
+            firstSeenAt: firstSeenBySid.get(sid) ?? nowMs,
           };
         });
 
@@ -308,15 +319,18 @@ export default function App() {
       // refresh the snapshot in that window, it returns active_calls=[]
       // and would wipe a ringing call we already received via SSE.
       //
-      // Fix: keep any local ringing/accepting call that is missing from
-      // the snapshot AND looks young (<10s). A stale ringing call older
-      // than that is either wrong or the backend's reconcile already
-      // marked it terminal, so dropping it is correct.
+      // Fix: preserve local ringing/accepting calls ONLY while young
+      // (< RINGING_PRESERVATION_MS). Beyond that, if the snapshot still
+      // doesn't know about the call, it means the backend has deemed it
+      // terminal (caller hung up, reconcile ended it) and we must let
+      // the snapshot purge it — otherwise Tauri rings forever on a
+      // call that doesn't exist anymore.
       const snapshotSids = new Set(fromSnapshot.map((call) => call.callSid));
       const preservedRinging = prev.filter((call) => {
         if (snapshotSids.has(call.callSid)) return false;
         if (call.phase !== 'ringing' && call.phase !== 'accepting') return false;
-        return true;
+        const ageMs = nowMs - call.firstSeenAt;
+        return ageMs < RINGING_PRESERVATION_MS;
       });
 
       return [...fromSnapshot, ...preservedRinging];
@@ -462,6 +476,7 @@ export default function App() {
             muted: false,
             phase: 'accepting',
             conferenceName: null,
+            firstSeenAt: Date.now(),
           },
         ];
       }
@@ -1019,6 +1034,7 @@ export default function App() {
         to: payloadTo,
         muted: false,
         phase: 'ringing',
+        firstSeenAt: Date.now(),
         // Conference name carried on the incoming_call payload is the
         // authoritative source until the snapshot catches up. Stored on the
         // call view itself — no separate Map to keep in sync.

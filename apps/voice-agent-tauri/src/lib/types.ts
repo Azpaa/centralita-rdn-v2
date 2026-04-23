@@ -95,6 +95,13 @@ export type VoiceCallView = {
   // the agent-state snapshot. Needed by the Accept flow to know which room
   // to join without maintaining a separate in-memory Map.
   conferenceName: string | null;
+  // Local wall-clock of when we first rendered this call in the UI. Used by
+  // applySnapshot's merge to decide how long to preserve a ringing call that
+  // the backend snapshot doesn't yet know about (race window between the
+  // incoming_call SSE emit and the ring_targets DB stamp). Beyond ~15s the
+  // snapshot should have caught up — if it hasn't, the call is almost
+  // certainly phantom (terminal webhook never arrived, etc.) and we purge.
+  firstSeenAt: number;
 };
 
 export type VoiceDeviceStatus =
