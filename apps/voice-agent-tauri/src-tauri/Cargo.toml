@@ -1,6 +1,6 @@
 [package]
 name = "voice-agent-tauri"
-version = "0.1.8"
+version = "0.1.9"
 description = "RDN Voice Agent desktop app"
 authors = ["RDN"]
 edition = "2021"

@@ -8,6 +8,7 @@ import {
   subscribeCanonicalClientEvents,
   type CanonicalClientEvent,
 } from '@/lib/events/client-stream';
+import { triggerReconcileOutboxDrainInBackground } from '@/lib/events/reconcile-outbox';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { EventType } from '@/lib/events/emitter';
 
@@ -220,6 +221,15 @@ export async function GET(req: NextRequest) {
           user_id: targetUserId,
         },
       });
+
+      // Opportunistically drain the reconcile outbox on every SSE connect.
+      // When the Supabase edge reconcile cron self-heals a stuck call it
+      // parks the terminal event in `reconcile_event_outbox` because it
+      // can't reach our emitter from Deno. Draining here gives newly-
+      // connected softphones a chance to receive the events that backed
+      // up while they were disconnected, on top of the normal Last-Event-ID
+      // replay (those rows are not in domain_events yet).
+      triggerReconcileOutboxDrainInBackground('sse_connect');
 
       // Snapshot inicial canónico del agente (cuando el stream está scoped a agente).
       if (targetUserId) {

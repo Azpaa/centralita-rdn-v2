@@ -1,0 +1,70 @@
+﻿import { NextRequest } from 'next/server';
+import { createAdminClient } from '@/lib/supabase/admin';
+import { authenticate, isAuthenticated, requireRole } from '@/lib/api/auth';
+import { apiSuccess, apiNotFound, apiBadRequest } from '@/lib/api/response';
+import { availabilitySchema } from '@/lib/api/validation';
+import { auditLog } from '@/lib/api/audit';
+import { emitEvent } from '@/lib/events/emitter';
+import type { User } from '@/lib/types/database';
+
+interface Params {
+  params: Promise<{ id: string }>;
+}
+
+// PATCH /api/v1/users/:id/availability
+export async function PATCH(req: NextRequest, { params }: Params) {
+  const auth = await authenticate(req);
+  if (!isAuthenticated(auth)) return auth;
+
+  const { id } = await params;
+  const isSelfUpdate =
+    auth.authMethod === 'session'
+    && Boolean(auth.userId)
+    && auth.userId === id;
+
+  if (!isSelfUpdate) {
+    const roleCheck = requireRole(auth, 'admin');
+    if (roleCheck !== true) return roleCheck;
+  }
+
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return apiBadRequest('Body JSON invÃ¡lido');
+  }
+
+  const parsed = availabilitySchema.safeParse(body);
+  if (!parsed.success) {
+    return apiBadRequest('Datos invÃ¡lidos', parsed.error.flatten().fieldErrors);
+  }
+
+  const supabase = createAdminClient();
+
+  const { data, error } = await supabase
+    .from('users')
+    .update({ available: parsed.data.available })
+    .eq('id', id)
+    .eq('active', true)
+    .is('deleted_at', null)
+    .select()
+    .single();
+
+  if (error || !data) return apiNotFound('Usuario');
+
+  await auditLog('user.availability_changed', 'user', id, auth.userId, {
+    available: parsed.data.available,
+  });
+
+  // Emitir evento de disponibilidad para RDN
+  const user = data as User;
+  emitEvent(parsed.data.available ? 'agent.available' : 'agent.unavailable', {
+    user_id: id,
+    rdn_user_id: user.rdn_user_id ?? null,
+    name: user.name,
+    available: parsed.data.available,
+  });
+
+  return apiSuccess(data);
+}
+

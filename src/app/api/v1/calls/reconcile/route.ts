@@ -5,6 +5,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { emitEvent } from '@/lib/events/emitter';
+import { drainReconcileOutbox } from '@/lib/events/reconcile-outbox';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -80,8 +81,19 @@ export async function POST(req: NextRequest) {
 
   const allStuck = [...(stuckInProgress || []), ...(stuckRinging || [])];
 
+  // Always drain the reconcile outbox before/after the sweep. The Supabase
+  // edge cron is the primary writer; draining here catches any entries the
+  // edge left pending (e.g. missing RDN webhook delivery) even when this
+  // endpoint itself finds no stuck rows locally.
+  const outboxBefore = await drainReconcileOutbox();
+
   if (allStuck.length === 0) {
-    return apiSuccess({ reconciled: 0, checked: 0, message: 'No stuck calls found' });
+    return apiSuccess({
+      reconciled: 0,
+      checked: 0,
+      message: 'No stuck calls found',
+      outbox: outboxBefore,
+    });
   }
 
   for (const call of allStuck) {
@@ -143,6 +155,22 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  console.log(`[RECONCILE] Done: checked=${checked} reconciled=${reconciled}`);
-  return apiSuccess({ reconciled, checked, total_stuck: allStuck.length, details });
+  // A second drain after the sweep covers any new outbox rows that may
+  // have landed while we were iterating (the edge cron runs on its own
+  // schedule and may overlap ours).
+  const outboxAfter = await drainReconcileOutbox();
+
+  console.log(
+    `[RECONCILE] Done: checked=${checked} reconciled=${reconciled} outbox_before=${outboxBefore.delivered}/${outboxBefore.drained} outbox_after=${outboxAfter.delivered}/${outboxAfter.drained}`,
+  );
+  return apiSuccess({
+    reconciled,
+    checked,
+    total_stuck: allStuck.length,
+    details,
+    outbox: {
+      before: outboxBefore,
+      after: outboxAfter,
+    },
+  });
 }

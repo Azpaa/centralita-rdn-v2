@@ -1,0 +1,151 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-open-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --background: #ffffff;
+  --foreground: #333333;
+  --card: #fdfdfd;
+  --card-foreground: #333333;
+  --popover: #ffffff;
+  --popover-foreground: #333333;
+  --primary: #1e5b78;
+  --primary-hover: #4f90b2;
+  --primary-foreground: #ffffff;
+  --secondary: #edf4f8;
+  --secondary-foreground: #1e5b78;
+  --muted: #f8f9fa;
+  --muted-foreground: #666c72;
+  --accent: #e7f1f6;
+  --accent-foreground: #1e5b78;
+  --destructive: #bb3d32;
+  --border: #ededed;
+  --input: #e6ecef;
+  --ring: #4f90b2;
+  --chart-1: #1e5b78;
+  --chart-2: #4f90b2;
+  --chart-3: #2c6c8f;
+  --chart-4: #78acc7;
+  --chart-5: #10394d;
+  --radius: 0.5rem;
+  --sidebar: #12384d;
+  --sidebar-foreground: #f2f7fa;
+  --sidebar-primary: #4f90b2;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgba(255, 255, 255, 0.12);
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: rgba(255, 255, 255, 0.14);
+  --sidebar-ring: #8ec0da;
+}
+
+.dark {
+  --background: #0f1f28;
+  --foreground: #f2f5f7;
+  --card: #152b37;
+  --card-foreground: #f2f5f7;
+  --popover: #152b37;
+  --popover-foreground: #f2f5f7;
+  --primary: #78acc7;
+  --primary-hover: #96c4db;
+  --primary-foreground: #0d2230;
+  --secondary: #1c3a4c;
+  --secondary-foreground: #d8e8f1;
+  --muted: #1a3240;
+  --muted-foreground: #afc0ca;
+  --accent: #22475b;
+  --accent-foreground: #e2edf3;
+  --destructive: #e17e75;
+  --border: rgba(255, 255, 255, 0.12);
+  --input: rgba(255, 255, 255, 0.14);
+  --ring: #96c4db;
+  --chart-1: #78acc7;
+  --chart-2: #5f98b5;
+  --chart-3: #c1dcea;
+  --chart-4: #4a7e9b;
+  --chart-5: #9bc5da;
+  --sidebar: #0f2d3d;
+  --sidebar-foreground: #ecf5fa;
+  --sidebar-primary: #8bc2de;
+  --sidebar-primary-foreground: #0d2230;
+  --sidebar-accent: rgba(255, 255, 255, 0.14);
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: rgba(255, 255, 255, 0.16);
+  --sidebar-ring: #9bc9df;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    background-image:
+      radial-gradient(circle at 8% -10%, rgba(79, 144, 178, 0.2), transparent 40%),
+      radial-gradient(circle at 92% -20%, rgba(30, 91, 120, 0.14), transparent 42%),
+      linear-gradient(180deg, #ffffff 0%, #f4f8fb 100%);
+    min-height: 100vh;
+  }
+  html {
+    @apply font-sans;
+  }
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    color: var(--primary);
+    letter-spacing: -0.015em;
+  }
+  a {
+    color: var(--primary);
+  }
+  a:hover {
+    color: var(--primary-hover);
+  }
+}

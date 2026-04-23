@@ -79,6 +79,19 @@ export type TwilioWebhookEvent = {
   expires_at: string;
 };
 
+// Written by the Supabase edge `reconcile-calls` function when it self-heals
+// a stuck call. The Next.js app drains this table via
+// `drainReconcileOutbox` and re-emits each row through the canonical
+// `emitEvent` pipeline, so RDN webhooks and SSE subscribers get notified.
+export type ReconcileEventOutboxRow = {
+  id: number;
+  call_sid: string;
+  event: 'call.completed' | 'call.missed';
+  payload: Record<string, unknown>;
+  created_at: string;
+  delivered_at: string | null;
+};
+
 // --- Tablas (type alias, no interface, para compatibilidad con Record<string, unknown>) ---
 
 export type User = {
@@ -397,6 +410,16 @@ export interface Database {
           expires_at?: string;
         };
         Update: Partial<Omit<TwilioWebhookEvent, 'id'>>;
+        Relationships: [];
+      };
+      reconcile_event_outbox: {
+        Row: ReconcileEventOutboxRow;
+        Insert: Omit<ReconcileEventOutboxRow, 'id' | 'created_at' | 'delivered_at'> & {
+          id?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+        };
+        Update: Partial<Omit<ReconcileEventOutboxRow, 'id'>>;
         Relationships: [];
       };
     };

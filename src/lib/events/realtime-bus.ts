@@ -36,6 +36,36 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
 const WORKER_ID = crypto.randomUUID();
 const WORKER_TAG = WORKER_ID.slice(0, 8);
 
+/**
+ * Cross-worker fanout is OFF by default. It only adds value when the Next.js
+ * app is horizontally scaled (Vercel multi-Lambda, or PM2 cluster). On a
+ * single-process VPS it is pure overhead: every publish incurs an HTTPS
+ * round-trip to Supabase Realtime + a timeout budget that can block the
+ * Twilio webhook response.
+ *
+ * Set `ENABLE_CROSS_WORKER_REALTIME=1` (or "true") to enable. Any falsy value
+ * — including unset — leaves broadcast + receiver as no-ops.
+ *
+ * We log the decision once at module load so it's obvious in boot logs.
+ */
+const CROSS_WORKER_ENABLED = (() => {
+  const raw = process.env.ENABLE_CROSS_WORKER_REALTIME;
+  if (!raw) return false;
+  const normalized = raw.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+})();
+
+if (CROSS_WORKER_ENABLED) {
+  console.log(`[RealtimeBus] cross-worker ENABLED worker=${WORKER_TAG}`);
+} else {
+  // Only log once per process, and only in dev-friendly form.
+  if (process.env.NODE_ENV !== 'test') {
+    console.log(
+      `[RealtimeBus] cross-worker DISABLED worker=${WORKER_TAG} (set ENABLE_CROSS_WORKER_REALTIME=1 to enable)`,
+    );
+  }
+}
+
 type BroadcastPayload = {
   event: CanonicalClientEvent;
   from_worker: string;
@@ -88,6 +118,13 @@ function getOrCreateBus(): ReceiverBus {
  * Vercel timeout that kills the whole call flow.
  */
 export async function broadcastClientEvent(event: CanonicalClientEvent): Promise<void> {
+  if (!CROSS_WORKER_ENABLED) {
+    // Single-process deployment: the in-memory bus has already delivered
+    // the event locally. Skipping the REST broadcast keeps the publish
+    // path cheap and predictable.
+    return;
+  }
+
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) {
@@ -159,6 +196,8 @@ export async function broadcastClientEvent(event: CanonicalClientEvent): Promise
  * pattern avoids that and makes reasoning trivial.
  */
 export function ensureCrossWorkerReceiver(forward: ForwardHandler): void {
+  if (!CROSS_WORKER_ENABLED) return;
+
   const bus = getOrCreateBus();
 
   if (!bus.forward) {
@@ -275,6 +314,7 @@ export function getWorkerId(): string {
  */
 export function getRealtimeBusStatus(): {
   worker_id: string;
+  cross_worker_enabled: boolean;
   status: ReceiverBus['status'];
   has_forward: boolean;
   reconnect_attempts: number;
@@ -283,9 +323,21 @@ export function getRealtimeBusStatus(): {
   dropped_self_count: number;
 } | null {
   const bus = globalThis.__centralitaRealtimeReceiver;
-  if (!bus) return null;
+  if (!bus) {
+    return {
+      worker_id: WORKER_ID,
+      cross_worker_enabled: CROSS_WORKER_ENABLED,
+      status: 'idle',
+      has_forward: false,
+      reconnect_attempts: 0,
+      received_count: 0,
+      forwarded_count: 0,
+      dropped_self_count: 0,
+    };
+  }
   return {
     worker_id: WORKER_ID,
+    cross_worker_enabled: CROSS_WORKER_ENABLED,
     status: bus.status,
     has_forward: !!bus.forward,
     reconnect_attempts: bus.reconnectAttempts,

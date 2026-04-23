@@ -497,6 +497,8 @@ export async function createCallRecord(params: {
 
 // --- Actualizar estado de llamada ---
 
+const TERMINAL_CALL_STATUSES: CallStatus[] = ['completed', 'busy', 'no_answer', 'failed', 'canceled'];
+
 export async function updateCallStatus(
   twilioCallSid: string,
   updates: {
@@ -517,6 +519,49 @@ export async function updateCallStatus(
   if (updates.duration !== undefined) updateData.duration = updates.duration;
   if (updates.waitTime !== undefined) updateData.wait_time = updates.waitTime;
   if (updates.answeredByUserId) updateData.answered_by_user_id = updates.answeredByUserId;
+
+  // When the call reaches a terminal state we also wipe
+  // `current_ring_target_user_ids` in twilio_data. Without this, any user
+  // that happened to be in the ring pool at the moment of termination stays
+  // pinned to the call in `resolveAgentRuntimeSnapshot` (targeted-pending
+  // query), which is the exact "todos los usuarios se quedan bloqueados"
+  // symptom observed in production. agent-connect already clears it on
+  // answer; this covers the miss/no-answer/cancelled paths.
+  const isTerminalUpdate = Boolean(
+    updates.status && TERMINAL_CALL_STATUSES.includes(updates.status as CallStatus),
+  );
+
+  if (isTerminalUpdate) {
+    const { data: existing } = await supabase
+      .from('call_records')
+      .select('twilio_data')
+      .eq('twilio_call_sid', twilioCallSid)
+      .maybeSingle();
+
+    const existingTwilioData = (
+      existing?.twilio_data
+      && typeof existing.twilio_data === 'object'
+      && !Array.isArray(existing.twilio_data)
+    )
+      ? (existing.twilio_data as Record<string, unknown>)
+      : null;
+
+    if (existingTwilioData) {
+      const currentRingTargets = Array.isArray(existingTwilioData.current_ring_target_user_ids)
+        ? (existingTwilioData.current_ring_target_user_ids as unknown[])
+        : null;
+
+      if (currentRingTargets && currentRingTargets.length > 0) {
+        updateData.twilio_data = {
+          ...existingTwilioData,
+          current_ring_target_user_ids: [],
+          current_round_robin_attempt_id: null,
+          ring_cleared_at: new Date().toISOString(),
+          ring_cleared_reason: `terminal_status_${updates.status}`,
+        };
+      }
+    }
+  }
 
   const { error } = await supabase
     .from('call_records')

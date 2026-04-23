@@ -42,6 +42,12 @@ const ACTIVE_STATUSES: Array<CallRecord['status']> = ['ringing', 'in_queue', 'in
 const TERMINAL_TWILIO_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
 const SELF_HEAL_MIN_AGE_MS = 30 * 1000;
 const SELF_HEAL_MAX_CHECKS = 10;
+// Ringing/in_queue rows get a tighter freshness threshold than in_progress:
+// a call that never got picked up should not pin the user for 30s of the
+// snapshot. 20s covers the typical ring timeout (ring_all/round-robin is
+// usually 15-20s per attempt) while still avoiding false positives during
+// an active ringing window.
+const SELF_HEAL_RINGING_MIN_AGE_MS = 20 * 1000;
 
 type MinimalCallRecordRow = Pick<
   CallRecord,
@@ -86,6 +92,36 @@ function mapTerminalTwilioStatus(status: string): CallStatus {
   return status as CallStatus;
 }
 
+/**
+ * Build a merged twilio_data that clears `current_ring_target_user_ids`
+ * (and its round-robin companion) when a call reaches terminal.
+ *
+ * Motivation: `resolveAgentRuntimeSnapshot` targets pending users via
+ * `current_ring_target_user_ids`; if we heal a stale ringing row but leave
+ * that array populated, those users remain pinned to the ghost call until
+ * a fresh webhook finally lands — which may never come. This matches the
+ * same cleanup that `updateCallStatus` does on the happy path so the
+ * snapshot stays coherent regardless of which writer healed the row.
+ */
+function withClearedRingTargets(
+  existing: Record<string, unknown> | null | undefined,
+  reason: string,
+): Record<string, unknown> | null {
+  if (!existing || typeof existing !== 'object' || Array.isArray(existing)) return null;
+  const current = existing as Record<string, unknown>;
+  const ringTargets = Array.isArray(current.current_ring_target_user_ids)
+    ? (current.current_ring_target_user_ids as unknown[])
+    : null;
+  if (!ringTargets || ringTargets.length === 0) return null;
+  return {
+    ...current,
+    current_ring_target_user_ids: [],
+    current_round_robin_attempt_id: null,
+    ring_cleared_at: new Date().toISOString(),
+    ring_cleared_reason: reason,
+  };
+}
+
 async function reconcileStaleActiveCalls(
   rows: MinimalCallRecordRow[],
 ): Promise<MinimalCallRecordRow[]> {
@@ -96,7 +132,15 @@ async function reconcileStaleActiveCalls(
 
   const candidates = rows
     .filter((row) => {
-      if (row.status !== 'in_progress') return false;
+      // Ringing/in_queue rows can also go stale: if Twilio cancelled all the
+      // ring legs and we never got a terminal webhook for the parent, the
+      // row stays "ringing" and pins every target in the candidate pool,
+      // blocking them from receiving the next call. Previously only
+      // in_progress rows were reconciled, so a dropped final webhook on a
+      // ringing call left agents ghost-targeted until the cron ran.
+      if (row.status !== 'in_progress' && row.status !== 'ringing' && row.status !== 'in_queue') {
+        return false;
+      }
       if (!row.twilio_call_sid || row.twilio_call_sid.startsWith('pending-')) return false;
 
       // Consider the freshest signal we have. Phase 4 pattern:
@@ -112,7 +156,11 @@ async function reconcileStaleActiveCalls(
         Number.isFinite(startedAtMs) ? startedAtMs : 0,
       );
       if (latestSignalMs === 0) return false;
-      return (nowMs - latestSignalMs) >= SELF_HEAL_MIN_AGE_MS;
+      const ageMs = nowMs - latestSignalMs;
+      const threshold = row.status === 'in_progress'
+        ? SELF_HEAL_MIN_AGE_MS
+        : SELF_HEAL_RINGING_MIN_AGE_MS;
+      return ageMs >= threshold;
     })
     .slice(0, SELF_HEAL_MAX_CHECKS);
 
@@ -141,16 +189,23 @@ async function reconcileStaleActiveCalls(
       const safeDuration = Number.isFinite(parsedDuration) ? parsedDuration : 0;
       const terminalStatus = mapTerminalTwilioStatus(liveStatus);
 
+      const mergedTwilioData = withClearedRingTargets(
+        row.twilio_data as Record<string, unknown> | null | undefined,
+        'agent_state_self_heal',
+      );
+      const healPatch: Record<string, unknown> = {
+        status: terminalStatus,
+        ended_at: endedAt,
+        duration: safeDuration,
+        last_verified_at: verifiedAt,
+      };
+      if (mergedTwilioData) healPatch.twilio_data = mergedTwilioData;
+
       const { data: updateResult } = await supabase
         .from('call_records')
-        .update({
-          status: terminalStatus,
-          ended_at: endedAt,
-          duration: safeDuration,
-          last_verified_at: verifiedAt,
-        })
+        .update(healPatch)
         .eq('id', row.id)
-        .eq('status', 'in_progress')
+        .in('status', ACTIVE_STATUSES)
         .is('ended_at', null)
         .select('id')
         .maybeSingle();
@@ -195,15 +250,22 @@ async function reconcileStaleActiveCalls(
       if (!isNotFound) continue;
 
       const endedAt = new Date().toISOString();
+      const mergedTwilioData = withClearedRingTargets(
+        row.twilio_data as Record<string, unknown> | null | undefined,
+        'agent_state_self_heal_twilio_404',
+      );
+      const cancelPatch: Record<string, unknown> = {
+        status: 'canceled',
+        ended_at: endedAt,
+        last_verified_at: verifiedAt,
+      };
+      if (mergedTwilioData) cancelPatch.twilio_data = mergedTwilioData;
+
       const { data: updateResult } = await supabase
         .from('call_records')
-        .update({
-          status: 'canceled',
-          ended_at: endedAt,
-          last_verified_at: verifiedAt,
-        })
+        .update(cancelPatch)
         .eq('id', row.id)
-        .eq('status', 'in_progress')
+        .in('status', ACTIVE_STATUSES)
         .is('ended_at', null)
         .select('id')
         .maybeSingle();

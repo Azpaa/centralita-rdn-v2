@@ -783,6 +783,34 @@ export default function App() {
   ) => {
     if (remoteAcceptInFlightRef.current.has(callSid)) return;
 
+    // Idempotency: if the engine already has media for this call, a new
+    // accept command is almost certainly a retry (RDN re-POST, SSE replay
+    // after reconnect, or duplicate canonical event). Re-running
+    // joinConference would call device.connect() a second time, which
+    // either fails silently or races the existing leg. Instead, re-fire
+    // the /accept/confirm ACK so the backend's freshness stamp catches up
+    // and stop.
+    const alreadyAttached = voiceRef.current?.isCallAttached(callSid) === true;
+    if (alreadyAttached) {
+      stopIncomingRingtone();
+      if (acceptInFlightRef.current.delete(callSid)) bumpInFlightVersion();
+      if (commandId) markRemoteCommandProcessed(commandId);
+
+      if (backendUrl && accessTokenRef.current) {
+        void (async () => {
+          const body: Record<string, unknown> = {
+            engine_accepted_at: new Date().toISOString(),
+          };
+          if (commandId) body.command_id = commandId;
+          await withJwtRetry(
+            `accept_confirm_reack:${callSid}`,
+            (jwt) => callCommand(backendUrl, jwt, `/api/v1/calls/${callSid}/accept/confirm`, body),
+          );
+        })();
+      }
+      return;
+    }
+
     remoteAcceptInFlightRef.current.add(callSid);
     acceptInFlightRef.current.add(callSid);
     if (commandId) {
@@ -831,12 +859,14 @@ export default function App() {
       remoteAcceptInFlightRef.current.delete(callSid);
     }
   }, [
+    backendUrl,
     bumpInFlightVersion,
     cleanupStaleLocalCalls,
     markRemoteCommandProcessed,
     resolveConferenceNameForParent,
     stopIncomingRingtone,
     voice,
+    withJwtRetry,
   ]);
 
   // Track outbound connect requests we've already processed

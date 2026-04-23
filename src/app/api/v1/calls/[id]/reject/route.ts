@@ -5,6 +5,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { requireCallControlPermission } from '@/lib/calls/ownership';
 import { emitEvent } from '@/lib/events/emitter';
+import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { auditLog } from '@/lib/api/audit';
 
 /**
@@ -50,17 +51,15 @@ export async function POST(
     const endedAt = new Date().toISOString();
 
     if (!alreadyClosed && callRow?.id) {
-      const { error: updErr } = await supabase
-        .from('call_records')
-        .update({
-          status: 'canceled',
-          ended_at: endedAt,
-        })
-        .eq('id', callRow.id)
-        .is('ended_at', null);
-      if (updErr) {
-        console.error(`[REJECT] Failed to mark ${callSid} canceled:`, updErr);
-      }
+      // Go through updateCallStatus (rather than a raw supabase.update) so
+      // the terminal path also wipes `current_ring_target_user_ids` —
+      // otherwise any agent that was in the ring pool at the moment of
+      // reject stays pinned in resolveAgentRuntimeSnapshot until a real
+      // webhook lands, which may never happen for a rejected call.
+      await updateCallStatus(callSid, {
+        status: 'canceled',
+        endedAt,
+      });
     }
 
     // Kill the leg in Twilio — best-effort, never block the event emission on

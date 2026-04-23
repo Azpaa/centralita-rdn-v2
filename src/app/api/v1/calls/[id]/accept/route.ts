@@ -136,18 +136,68 @@ export async function POST(
   const supabase = createAdminClient();
   const { data: callRow } = await supabase
     .from('call_records')
-    .select('twilio_data')
+    .select('twilio_data, answered_by_user_id, status')
     .eq('twilio_call_sid', callSid)
     .maybeSingle();
 
+  const twilioDataRaw = callRow?.twilio_data;
+  const twilioData =
+    twilioDataRaw && typeof twilioDataRaw === 'object' && !Array.isArray(twilioDataRaw)
+      ? (twilioDataRaw as Record<string, unknown>)
+      : {};
+
   const conferenceName = (() => {
-    const data = callRow?.twilio_data;
-    if (data && typeof data === 'object' && !Array.isArray(data)) {
-      const value = (data as Record<string, unknown>).conference_name;
-      if (typeof value === 'string' && value.length > 0) return value;
-    }
+    const value = twilioData.conference_name;
+    if (typeof value === 'string' && value.length > 0) return value;
     return `call-${callSid}`;
   })();
+
+  // Server-side accept-idempotency. RDN retries POST /accept when it doesn't
+  // see a timely confirm (their default is ~2-5s). Without this, every retry
+  // emits a brand-new canonical event (unique event.id), Tauri's id-dedup
+  // can't catch it, and the softphone races a second device.connect() on an
+  // already-attached call — the "bucle infinito" observed in production.
+  //
+  // Strategy: stamp accept_last_requested_at on twilio_data and short-circuit
+  // if we already asked within the window. If the caller supplies a
+  // command_id that matches the last one we emitted, the dedupe window is
+  // even longer (same logical request).
+  const nowMs = Date.now();
+  const ACCEPT_DEDUPE_WINDOW_MS = 5_000;
+  const lastRequestedAtRaw = twilioData.accept_last_requested_at;
+  const lastRequestedAtMs = typeof lastRequestedAtRaw === 'string'
+    ? Date.parse(lastRequestedAtRaw)
+    : NaN;
+  const ageMs = Number.isFinite(lastRequestedAtMs) ? nowMs - lastRequestedAtMs : Infinity;
+  const confirmedAt = typeof twilioData.accept_confirmed_at === 'string'
+    ? twilioData.accept_confirmed_at
+    : null;
+
+  if (ageMs < ACCEPT_DEDUPE_WINDOW_MS || confirmedAt) {
+    const lastCommandId = typeof twilioData.accept_last_command_id === 'string'
+      ? twilioData.accept_last_command_id
+      : null;
+    console.log(
+      `[ACCEPT] ${callSid}: idempotent short-circuit age_ms=${Number.isFinite(ageMs) ? ageMs : -1} confirmed_at=${confirmedAt ?? '-'} last_command_id=${lastCommandId ?? '-'}`
+    );
+    return apiSuccess({
+      requested: true,
+      idempotent: true,
+      call_sid: callSid,
+      target_user_ids: targetUserIds,
+      preferred_executor: typeof twilioData.accept_last_preferred_executor === 'string'
+        ? twilioData.accept_last_preferred_executor
+        : null,
+      executor_user_id: typeof twilioData.accept_last_executor_user_id === 'string'
+        ? twilioData.accept_last_executor_user_id
+        : null,
+      command_id: lastCommandId,
+      confirmed_at: confirmedAt,
+      note: confirmedAt
+        ? 'Llamada ya confirmada por el softphone.'
+        : 'Accept reciente aún en vuelo; no se re-emite evento.',
+    });
+  }
 
   // Decide which surface should execute this accept: desktop (Tauri) if it's
   // present locally, otherwise the browser dashboard.
@@ -180,6 +230,26 @@ export async function POST(
 
   const commandId = crypto.randomUUID();
   const requestedAt = new Date().toISOString();
+
+  // Persist the accept-request fingerprint BEFORE emitting the event. If
+  // two requests arrive within the dedupe window, the second reads the
+  // fingerprint written by the first and short-circuits. We update inside
+  // a merge so we don't blow away conference_name or other routing data
+  // that the webhook wrote earlier.
+  const mergedAcceptTrace: Record<string, unknown> = {
+    ...twilioData,
+    accept_last_requested_at: requestedAt,
+    accept_last_command_id: commandId,
+    accept_last_preferred_executor: preferredExecutor ?? null,
+    accept_last_executor_user_id: executorUserId ?? null,
+    accept_last_requested_by_user_id: auth.userId ?? null,
+    accept_last_requested_via: auth.authMethod,
+  };
+
+  await supabase
+    .from('call_records')
+    .update({ twilio_data: mergedAcceptTrace })
+    .eq('twilio_call_sid', callSid);
 
   await publishCanonicalClientEvent({
     id: commandId,
