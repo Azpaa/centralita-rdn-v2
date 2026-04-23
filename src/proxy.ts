@@ -49,7 +49,10 @@ function applyApiCorsHeaders(response: NextResponse, origin: string | null) {
 
   response.headers.set('Access-Control-Allow-Origin', origin)
   response.headers.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
-  response.headers.set('Access-Control-Allow-Headers', 'Authorization,Content-Type,Accept')
+  response.headers.set(
+    'Access-Control-Allow-Headers',
+    'Authorization,Content-Type,Accept,Last-Event-ID',
+  )
   response.headers.set('Access-Control-Expose-Headers', 'Content-Type,X-Request-Id')
   response.headers.set('Vary', 'Origin')
 }

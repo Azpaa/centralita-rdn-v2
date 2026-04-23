@@ -27,7 +27,7 @@ const nextConfig: NextConfig = {
           },
           {
             key: "Access-Control-Allow-Headers",
-            value: "Content-Type, Authorization, X-Request-Id",
+            value: "Content-Type, Authorization, X-Request-Id, Last-Event-ID, Accept",
           },
           {
             key: "Access-Control-Max-Age",

@@ -165,9 +165,13 @@ export async function consumeSseStream(params: {
       headers: {
         Authorization: `Bearer ${jwt}`,
         Accept: 'text/event-stream',
-        // Native EventSource header; we mirror it so the server sees the
-        // same signal whether it's a browser EventSource or a fetch reader.
-        ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
+        // Last-Event-ID travels via the `last_event_id` query param (see
+        // streamUrl above). We deliberately do NOT send the native
+        // `Last-Event-ID` header because WebView2's CORS preflight
+        // rejects any request header not present in
+        // Access-Control-Allow-Headers — and adding it there is not
+        // enough either, because preflight caches are per-header-set.
+        // Query param alone is the cleanest cross-runtime contract.
       },
       signal,
     });
