@@ -99,7 +99,10 @@ export async function emitEvent(
     // Debe publicarse siempre, incluso cuando no haya webhooks externos activos.
     // Await is required so the Supabase Realtime broadcast completes before
     // this Lambda returns — otherwise Vercel may freeze us mid-broadcast
-    // and cross-worker subscribers never receive the event.
+    // and cross-worker subscribers never receive the event. The broadcast
+    // itself is bounded by a 2.5s hard timeout inside realtime-bus so a
+    // slow Supabase can't stall the Twilio webhook.
+    console.log(`[EVENT] publishing ${event} id=${eventId} agent=${agentUserId ?? '-'} targets=[${targetUserIds.join(',')}]`);
     await publishCanonicalClientEventFromDomain(event, data, { eventId, timestamp });
 
     processPendingWebhookDeliveries().catch((err) => {

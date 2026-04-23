@@ -202,17 +202,43 @@ function shouldDeliverToSubscriber(subscriber: StreamSubscriber, event: Canonica
 
 function publishToLocalSubscribers(event: CanonicalClientEvent): void {
   const bus = getBusState();
-  if (bus.subscribers.size === 0) return;
+  if (bus.subscribers.size === 0) {
+    console.log(
+      `[SSE] no local subscribers event=${event.type} id=${event.id} sid=${event.call_sid ?? '-'}`,
+    );
+    return;
+  }
 
+  let delivered = 0;
   for (const subscriber of bus.subscribers.values()) {
     if (!shouldDeliverToSubscriber(subscriber, event)) continue;
 
     try {
       subscriber.onEvent(event);
+      delivered += 1;
     } catch (err) {
       console.warn(`[SSE] Failed delivering canonical event to subscriber ${subscriber.id}:`, err);
     }
   }
+
+  if (delivered === 0) {
+    console.log(
+      `[SSE] no matching subscriber event=${event.type} id=${event.id} sid=${event.call_sid ?? '-'} total_subs=${bus.subscribers.size} agent=${event.agent_user_id ?? '-'} targets=[${(event.target_user_ids ?? []).join(',')}]`,
+    );
+  } else {
+    console.log(
+      `[SSE] delivered event=${event.type} id=${event.id} sid=${event.call_sid ?? '-'} to=${delivered}/${bus.subscribers.size}`,
+    );
+  }
+}
+
+// Module-scoped forwarder so `ensureCrossWorkerReceiver` registers a SINGLE
+// stable function reference across all SSE subscribers. The old code passed
+// a fresh arrow function per subscribe call, which meant the receiver
+// couldn't dedupe and cross-worker events were fanned out multiple times
+// (or, worse, held references to closures of long-gone streams).
+function forwardCrossWorkerEvent(remoteEvent: CanonicalClientEvent): void {
+  publishToLocalSubscribers(remoteEvent);
 }
 
 /**
@@ -270,11 +296,9 @@ export function subscribeCanonicalClientEvents(params: {
   // Opening an SSE stream means this worker is now serving a client. Make
   // sure we're also wired to receive broadcasts from OTHER workers so
   // events published on those workers still reach this subscriber. The
-  // receiver is a per-process singleton — subsequent calls just add to
-  // its handler set (see realtime-bus.ts).
-  ensureCrossWorkerReceiver((remoteEvent) => {
-    publishToLocalSubscribers(remoteEvent);
-  });
+  // receiver is a per-process singleton — passing the SAME forwarder
+  // reference every time is what makes its idempotency actually work.
+  ensureCrossWorkerReceiver(forwardCrossWorkerEvent);
 
   const bus = getBusState();
   const subscriber: StreamSubscriber = {
@@ -286,9 +310,15 @@ export function subscribeCanonicalClientEvents(params: {
   };
 
   bus.subscribers.set(subscriber.id, subscriber);
+  console.log(
+    `[SSE] subscriber added id=${subscriber.id} user=${params.targetUserId ?? '-'} kind=${params.clientKind ?? '-'} receiveAll=${params.receiveAll} total_subs=${bus.subscribers.size}`,
+  );
 
   return () => {
     bus.subscribers.delete(subscriber.id);
+    console.log(
+      `[SSE] subscriber removed id=${subscriber.id} user=${params.targetUserId ?? '-'} remaining=${bus.subscribers.size}`,
+    );
   };
 }
 
