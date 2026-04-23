@@ -269,11 +269,29 @@ export default function App() {
       const ORPHAN_MIN_AGE_MS = 15_000;
       const orphaned = voice.attachedCallSids.filter((sid) => {
         if (activeParentSids.has(sid)) return false;
+        // HARD guard: never reap a Call that has already fired its
+        // 'accept' event. Accepted means media is flowing end-to-end.
+        // If the remote carrier actually drops, Twilio's SDK will fire
+        // its own Call.on('disconnect') and we clean up there. Basing
+        // a hang-up decision on the snapshot for an accepted Call is
+        // always wrong — the snapshot can lag for many reasons
+        // (webhook delivery hiccup, reconcile cron transient, etc.)
+        // and taking Tauri off the line is fatal because the agent
+        // leg has endConferenceOnExit=true and the whole room dies.
+        if (voice.isCallAccepted(sid)) return false;
         const ageMs = voice.getCallAttachedMsAgo(sid);
         if (ageMs === null) return false;
         return ageMs >= ORPHAN_MIN_AGE_MS;
       });
       if (orphaned.length > 0) {
+        console.warn(
+          `[applySnapshot] orphan reaper disconnecting ${orphaned.length} call(s) not in snapshot:`,
+          orphaned.map((sid) => ({
+            sid,
+            ageMs: voice.getCallAttachedMsAgo(sid),
+            snapshotActiveSids: [...activeParentSids],
+          })),
+        );
         void (async () => {
           for (const parentSid of orphaned) {
             try {
@@ -1104,6 +1122,21 @@ export default function App() {
         void executeRemoteAccept(callSid, payloadCommandId, conferenceNameFromEvent);
       }
     } else if (event.type === 'call_ended' && callSid) {
+      // Backend says this call is terminal. Log enough detail to tell a
+      // legitimate natural hangup apart from a backend mistake (wrong
+      // reconcile, lost webhook, etc.) when debugging "la llamada se
+      // colgó sola" reports.
+      const terminalSource = typeof event.payload?.terminal_source === 'string'
+        ? event.payload.terminal_source
+        : null;
+      const finalStatus = typeof event.payload?.status === 'string'
+        ? event.payload.status
+        : (typeof event.payload?.final_status === 'string' ? event.payload.final_status : null);
+      const domainEvent = event.domain_event ?? null;
+      console.warn(
+        `[call_ended] sid=${callSid} domain_event=${domainEvent} final_status=${finalStatus ?? '-'} terminal_source=${terminalSource ?? '-'} accepted=${voice.isCallAccepted(callSid)}`,
+      );
+
       // Engine is keyed by parent SID — one disconnect covers the local leg.
       void voice.disconnectCall(callSid);
       if (acceptInFlightRef.current.delete(callSid)) bumpInFlightVersion();
