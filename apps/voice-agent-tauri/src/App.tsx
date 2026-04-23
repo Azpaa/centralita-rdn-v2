@@ -1316,6 +1316,19 @@ export default function App() {
     };
   }, [backendUrl, ensureFreshSession, primeIncomingRingtone, refreshAgentSnapshot]);
 
+  // Latest-handler ref so the SSE loop doesn't re-subscribe every time
+  // `handleCanonicalEvent` is re-memoised (which happens each time `calls`
+  // or `voice` changes — i.e. constantly during any active call). Before
+  // this, the SSE useEffect depended on `handleCanonicalEvent` directly,
+  // so each state tick triggered cleanup → controller.abort() → new
+  // fetch(). Network tab showed thousands of `/stream/events` requests
+  // of ~950B each (just enough for `connected` + `snapshot` before the
+  // next re-subscribe killed it), hiding real events inside the churn.
+  const handleCanonicalEventRef = useRef(handleCanonicalEvent);
+  useEffect(() => {
+    handleCanonicalEventRef.current = handleCanonicalEvent;
+  }, [handleCanonicalEvent]);
+
   useEffect(() => {
     if (!accessToken || !backendUrl) return;
 
@@ -1355,7 +1368,9 @@ export default function App() {
                 lastStreamEventAtRef.current = Date.now();
               }
             },
-            onEvent: handleCanonicalEvent,
+            // Read via ref every time rather than capturing the current
+            // closure — this is what breaks the SSE-reconnect storm.
+            onEvent: (event) => handleCanonicalEventRef.current(event),
           });
           attempt = 0;
         } catch (err) {
@@ -1407,7 +1422,11 @@ export default function App() {
       }
       setStreamStatus('disconnected');
     };
-  }, [accessToken, backendUrl, ensureFreshSession, handleCanonicalEvent]);
+    // NOTE: deliberately DO NOT include `handleCanonicalEvent` here.
+    // See the handleCanonicalEventRef above for the reasoning — keeping
+    // it in the deps was the single cause of the SSE-reconnect loop that
+    // hid incoming_call / accept commands during active calls.
+  }, [accessToken, backendUrl, ensureFreshSession]);
 
   const login = useCallback(async () => {
     if (!supabaseRef.current) {
