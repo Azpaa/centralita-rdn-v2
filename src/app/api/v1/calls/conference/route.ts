@@ -45,8 +45,8 @@ export async function POST(req: NextRequest) {
   const client = getTwilioClient();
 
   try {
-    const publishConferenceUpdated = (payload: Record<string, unknown>) => {
-      publishCanonicalClientEvent({
+    const publishConferenceUpdated = async (payload: Record<string, unknown>) => {
+      await publishCanonicalClientEvent({
         id: crypto.randomUUID(),
         type: 'conference_updated',
         timestamp: new Date().toISOString(),
@@ -118,7 +118,7 @@ export async function POST(req: NextRequest) {
           auth_method: auth.authMethod,
         });
 
-        publishConferenceUpdated({
+        await publishConferenceUpdated({
           action: 'create',
           conference_name: conferenceName,
           call_sid: callSid,
@@ -173,7 +173,7 @@ export async function POST(req: NextRequest) {
           auth_method: auth.authMethod,
         });
 
-        publishConferenceUpdated({
+        await publishConferenceUpdated({
           action: 'add',
           conference_name: conferenceName,
           destination,
@@ -218,7 +218,7 @@ export async function POST(req: NextRequest) {
           auth_method: auth.authMethod,
         });
 
-        publishConferenceUpdated({
+        await publishConferenceUpdated({
           action: 'leave',
           conference_name: conferenceName,
           participant_sid: participantSid,
@@ -258,7 +258,7 @@ export async function POST(req: NextRequest) {
           auth_method: auth.authMethod,
         });
 
-        publishConferenceUpdated({
+        await publishConferenceUpdated({
           action: 'kick',
           conference_name: conferenceName,
           participant_sid: participantSid,

@@ -97,7 +97,10 @@ export async function emitEvent(
 
     // Canal canónico backend -> clientes (web / futuro Tauri).
     // Debe publicarse siempre, incluso cuando no haya webhooks externos activos.
-    publishCanonicalClientEventFromDomain(event, data, { eventId, timestamp });
+    // Await is required so the Supabase Realtime broadcast completes before
+    // this Lambda returns — otherwise Vercel may freeze us mid-broadcast
+    // and cross-worker subscribers never receive the event.
+    await publishCanonicalClientEventFromDomain(event, data, { eventId, timestamp });
 
     processPendingWebhookDeliveries().catch((err) => {
       console.error('[EVENT] Error processing pending deliveries:', err);

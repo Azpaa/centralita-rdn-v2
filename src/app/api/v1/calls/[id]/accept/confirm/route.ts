@@ -121,7 +121,7 @@ export async function POST(
   const eventId = crypto.randomUUID();
   const targetUserIds = callRow.answered_by_user_id ? [callRow.answered_by_user_id] : [];
 
-  publishCanonicalClientEvent({
+  await publishCanonicalClientEvent({
     id: eventId,
     type: 'call_updated',
     timestamp: confirmedAt,

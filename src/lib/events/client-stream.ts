@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import type { EventType } from '@/lib/events/emitter';
+import { broadcastClientEvent, ensureCrossWorkerReceiver } from './realtime-bus';
 
 export type CanonicalClientEventType =
   | 'connected'
@@ -199,7 +200,7 @@ function shouldDeliverToSubscriber(subscriber: StreamSubscriber, event: Canonica
   return false;
 }
 
-export function publishCanonicalClientEvent(event: CanonicalClientEvent): void {
+function publishToLocalSubscribers(event: CanonicalClientEvent): void {
   const bus = getBusState();
   if (bus.subscribers.size === 0) return;
 
@@ -214,14 +215,47 @@ export function publishCanonicalClientEvent(event: CanonicalClientEvent): void {
   }
 }
 
-export function publishCanonicalClientEventFromDomain(
+/**
+ * Publish a canonical client event.
+ *
+ * Two-stage fanout:
+ *  1. Deliver synchronously to same-worker SSE subscribers via the in-memory
+ *     bus. This is the common case and the fast path.
+ *  2. Broadcast the event via Supabase Realtime so OTHER workers can deliver
+ *     it to subscribers held on their side. This exists because Vercel
+ *     serverless runs each request on whatever Lambda is warm — the SSE is
+ *     on one, the control POST is often on another.
+ *
+ * IMPORTANT: this is async. Callers inside API route handlers MUST await it
+ * before returning the HTTP response, otherwise Vercel may freeze the Lambda
+ * mid-broadcast and the event never reaches remote workers.
+ */
+export async function publishCanonicalClientEvent(event: CanonicalClientEvent): Promise<void> {
+  publishToLocalSubscribers(event);
+  await broadcastClientEvent(event);
+}
+
+/**
+ * Synchronous variant for call sites that cannot await (legacy emitter
+ * paths). Fires broadcast as a background task; on Vercel this only
+ * reliably completes if the surrounding handler stays alive long enough.
+ * Prefer `publishCanonicalClientEvent` in new code.
+ */
+export function publishCanonicalClientEventSync(event: CanonicalClientEvent): void {
+  publishToLocalSubscribers(event);
+  void broadcastClientEvent(event).catch((err) => {
+    console.warn('[SSE] Background broadcast failed:', err);
+  });
+}
+
+export async function publishCanonicalClientEventFromDomain(
   event: EventType,
   data: Record<string, unknown>,
   options?: { eventId?: string; timestamp?: string },
-): void {
+): Promise<void> {
   try {
     const canonical = buildCanonicalEvent(event, data, options);
-    publishCanonicalClientEvent(canonical);
+    await publishCanonicalClientEvent(canonical);
   } catch (err) {
     console.error(`[SSE] Error mapping domain event ${event} to canonical stream event:`, err);
   }
@@ -233,6 +267,15 @@ export function subscribeCanonicalClientEvents(params: {
   clientKind?: string | null;
   onEvent: (event: CanonicalClientEvent) => void;
 }): () => void {
+  // Opening an SSE stream means this worker is now serving a client. Make
+  // sure we're also wired to receive broadcasts from OTHER workers so
+  // events published on those workers still reach this subscriber. The
+  // receiver is a per-process singleton — subsequent calls just add to
+  // its handler set (see realtime-bus.ts).
+  ensureCrossWorkerReceiver((remoteEvent) => {
+    publishToLocalSubscribers(remoteEvent);
+  });
+
   const bus = getBusState();
   const subscriber: StreamSubscriber = {
     id: crypto.randomUUID(),

@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { NextRequest } from 'next/server';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
-import { apiSuccess, apiBadRequest, apiError, apiInternalError } from '@/lib/api/response';
+import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
 import { dialSchema } from '@/lib/api/validation';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { createCallRecord } from '@/lib/twilio/call-engine';
@@ -368,28 +368,23 @@ export async function POST(req: NextRequest) {
     // which generates <Dial><Number>destination</Number></Dial>.
     if (resolvedAgent) {
       // Decide which surface will pick up the outbound_connect_request.
-      // - RDN/M2M callers: we REQUIRE at least one active softphone stream
-      //   for the agent, otherwise the 200 response is a lie — the call
-      //   never dials because nobody is listening to execute it.
-      // - Session callers (panel web): they already have the Device locally
-      //   and will fire device.connect() themselves inside makeOutboundCall,
-      //   so we don't gate on stream presence for them — the stream event is
-      //   just an informational echo.
+      //
+      // IMPORTANT: the SSE subscriber map lives on this Node process only.
+      // In production (Vercel serverless) the SSE connection is held by one
+      // Lambda while this POST may land on a different Lambda — that
+      // Lambda's map is empty even when Tauri is actually listening. We
+      // therefore do NOT 409 when no local subscriber is visible: publish
+      // with preferred_executor=null and let Tauri fall back to legacy
+      // default-execute behaviour on whichever worker has the SSE.
+      //
+      // Session callers (panel web) already have the Device locally and
+      // will fire device.connect() themselves inside makeOutboundCall, so
+      // the stream event is just an informational echo for them.
       const preferredExecutor = pickPreferredExecutorForUser(resolvedAgent.id);
 
       if (auth.authMethod === 'api_key' && !preferredExecutor) {
-        await auditLog('call.dial', 'call_record', null, auth.userId, {
-          destination: destination_number,
-          from: from_number,
-          initiator: resolvedAgent.name,
-          source: commandSource,
-          resolved_agent_id: resolvedAgent.id,
-          rejected_reason: 'no_softphone_active',
-        });
-        return apiError(
-          409,
-          'NO_SOFTPHONE_ACTIVE',
-          'No hay softphone activo (ni desktop ni web) para el agente destino. La llamada saliente no se puede iniciar.'
+        console.warn(
+          `[DIAL] ${resolvedAgent.id}: no local SSE subscriber on this worker. Publishing outbound_connect_request with preferred_executor=null (legacy fallback).`
         );
       }
 

@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { NextRequest } from 'next/server';
 import { z } from 'zod';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
-import { apiBadRequest, apiError, apiSuccess } from '@/lib/api/response';
+import { apiBadRequest, apiSuccess } from '@/lib/api/response';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { requireCallControlPermission } from '@/lib/calls/ownership';
 import {
@@ -150,10 +150,18 @@ export async function POST(
   })();
 
   // Decide which surface should execute this accept: desktop (Tauri) if it's
-  // present, otherwise the browser dashboard. If no softphone surface is
-  // subscribed for ANY of the resolved targets, the command would evaporate
-  // into the void — reply 409 so RDN's UI can surface the real state instead
-  // of spinning on "aceptando" forever.
+  // present locally, otherwise the browser dashboard.
+  //
+  // IMPORTANT: the subscribers Map lives in `globalThis` on this Node process
+  // only. In production (Vercel serverless) the SSE connection is held by one
+  // Lambda while this POST may land on a different Lambda — that Lambda's
+  // map is empty even when Tauri is actually listening. We must NOT 409 in
+  // that case (it turns cross-worker into "no softphone" false negatives).
+  //
+  // Policy: if we see a subscriber locally, stamp preferred_executor for
+  // same-worker accuracy. If we don't, publish with preferred_executor=null
+  // and let Tauri fall back to legacy "default-execute" behaviour. Proper
+  // fix is cluster-wide presence (tracked as a follow-up).
   let preferredExecutor: 'desktop' | 'browser' | null = null;
   let executorUserId: string | null = null;
   for (const uid of targetUserIds) {
@@ -165,23 +173,15 @@ export async function POST(
   }
 
   if (!preferredExecutor) {
-    await auditLog('call.accept_requested', 'call_record', callSid, auth.userId, {
-      call_sid: callSid,
-      target_user_ids: targetUserIds,
-      rejected_reason: 'no_softphone_active',
-      auth_method: auth.authMethod,
-    });
-    return apiError(
-      409,
-      'NO_SOFTPHONE_ACTIVE',
-      'No hay softphone activo (ni desktop ni web) para el agente destino.'
+    console.warn(
+      `[ACCEPT] ${callSid}: no local SSE subscriber on this worker for ${targetUserIds.join(',')}. Publishing with preferred_executor=null (legacy fallback so Tauri default-executes via whichever worker holds the SSE).`
     );
   }
 
   const commandId = crypto.randomUUID();
   const requestedAt = new Date().toISOString();
 
-  publishCanonicalClientEvent({
+  await publishCanonicalClientEvent({
     id: commandId,
     type: 'call_updated',
     timestamp: requestedAt,
