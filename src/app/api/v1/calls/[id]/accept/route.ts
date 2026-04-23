@@ -2,10 +2,13 @@ import crypto from 'crypto';
 import { NextRequest } from 'next/server';
 import { z } from 'zod';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
-import { apiBadRequest, apiSuccess } from '@/lib/api/response';
+import { apiBadRequest, apiError, apiSuccess } from '@/lib/api/response';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { requireCallControlPermission } from '@/lib/calls/ownership';
-import { publishCanonicalClientEvent } from '@/lib/events/client-stream';
+import {
+  pickPreferredExecutorForUser,
+  publishCanonicalClientEvent,
+} from '@/lib/events/client-stream';
 import { auditLog } from '@/lib/api/audit';
 
 const acceptSchema = z.object({
@@ -146,6 +149,35 @@ export async function POST(
     return `call-${callSid}`;
   })();
 
+  // Decide which surface should execute this accept: desktop (Tauri) if it's
+  // present, otherwise the browser dashboard. If no softphone surface is
+  // subscribed for ANY of the resolved targets, the command would evaporate
+  // into the void — reply 409 so RDN's UI can surface the real state instead
+  // of spinning on "aceptando" forever.
+  let preferredExecutor: 'desktop' | 'browser' | null = null;
+  let executorUserId: string | null = null;
+  for (const uid of targetUserIds) {
+    const pick = pickPreferredExecutorForUser(uid);
+    if (!pick) continue;
+    executorUserId = uid;
+    preferredExecutor = pick;
+    if (pick === 'desktop') break; // desktop wins, stop scanning
+  }
+
+  if (!preferredExecutor) {
+    await auditLog('call.accept_requested', 'call_record', callSid, auth.userId, {
+      call_sid: callSid,
+      target_user_ids: targetUserIds,
+      rejected_reason: 'no_softphone_active',
+      auth_method: auth.authMethod,
+    });
+    return apiError(
+      409,
+      'NO_SOFTPHONE_ACTIVE',
+      'No hay softphone activo (ni desktop ni web) para el agente destino.'
+    );
+  }
+
   const commandId = crypto.randomUUID();
   const requestedAt = new Date().toISOString();
 
@@ -154,13 +186,15 @@ export async function POST(
     type: 'call_updated',
     timestamp: requestedAt,
     call_sid: callSid,
-    agent_user_id: targetUserIds[0] ?? null,
+    agent_user_id: executorUserId ?? targetUserIds[0] ?? null,
     target_user_ids: targetUserIds,
     payload: {
       command: 'accept',
       command_id: commandId,
       call_sid: callSid,
       conference_name: conferenceName,
+      preferred_executor: preferredExecutor,
+      executor_user_id: executorUserId,
       target_user_ids: targetUserIds,
       requested_at: requestedAt,
       requested_by_user_id: auth.userId ?? null,
@@ -171,6 +205,8 @@ export async function POST(
   await auditLog('call.accept_requested', 'call_record', callSid, auth.userId, {
     call_sid: callSid,
     target_user_ids: targetUserIds,
+    preferred_executor: preferredExecutor,
+    executor_user_id: executorUserId,
     requested_user_id: parsed.data.user_id ?? null,
     requested_rdn_user_id: parsed.data.rdn_user_id ?? null,
     auth_method: auth.authMethod,
@@ -180,7 +216,9 @@ export async function POST(
     requested: true,
     call_sid: callSid,
     target_user_ids: targetUserIds,
+    preferred_executor: preferredExecutor,
+    executor_user_id: executorUserId,
     command_id: commandId,
-    note: 'Solicitud enviada al cliente agente. La aceptacion final depende de softphone activo.',
+    note: 'Solicitud enviada al softphone activo del agente.',
   });
 }

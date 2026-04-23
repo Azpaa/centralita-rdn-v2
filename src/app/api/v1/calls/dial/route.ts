@@ -1,13 +1,14 @@
 import crypto from 'crypto';
 import { NextRequest } from 'next/server';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
-import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
+import { apiSuccess, apiBadRequest, apiError, apiInternalError } from '@/lib/api/response';
 import { dialSchema } from '@/lib/api/validation';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { createCallRecord } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { auditLog } from '@/lib/api/audit';
 import { emitEvent } from '@/lib/events/emitter';
+import { pickPreferredExecutorForUser } from '@/lib/events/client-stream';
 import type { CallStatus, PhoneNumber, User } from '@/lib/types/database';
 
 const PRE_DIAL_RELEASE_STATUSES: CallStatus[] = ['in_progress', 'ringing', 'in_queue', 'pending_agent'];
@@ -366,6 +367,32 @@ export async function POST(req: NextRequest) {
     // The agent's device.connect() triggers the TwiML App voice URL (/client)
     // which generates <Dial><Number>destination</Number></Dial>.
     if (resolvedAgent) {
+      // Decide which surface will pick up the outbound_connect_request.
+      // - RDN/M2M callers: we REQUIRE at least one active softphone stream
+      //   for the agent, otherwise the 200 response is a lie — the call
+      //   never dials because nobody is listening to execute it.
+      // - Session callers (panel web): they already have the Device locally
+      //   and will fire device.connect() themselves inside makeOutboundCall,
+      //   so we don't gate on stream presence for them — the stream event is
+      //   just an informational echo.
+      const preferredExecutor = pickPreferredExecutorForUser(resolvedAgent.id);
+
+      if (auth.authMethod === 'api_key' && !preferredExecutor) {
+        await auditLog('call.dial', 'call_record', null, auth.userId, {
+          destination: destination_number,
+          from: from_number,
+          initiator: resolvedAgent.name,
+          source: commandSource,
+          resolved_agent_id: resolvedAgent.id,
+          rejected_reason: 'no_softphone_active',
+        });
+        return apiError(
+          409,
+          'NO_SOFTPHONE_ACTIVE',
+          'No hay softphone activo (ni desktop ni web) para el agente destino. La llamada saliente no se puede iniciar.'
+        );
+      }
+
       const { released, preserved } = await reconcileAgentCallsBeforeNewDial({
         supabase,
         twilioClient,
@@ -389,7 +416,7 @@ export async function POST(req: NextRequest) {
       }
 
       console.log(
-        `[DIAL] Resolved agent id=${resolvedAgent.id} name=${resolvedAgent.name} rdn_user_id=${resolvedAgent.rdn_user_id ?? '-'}`
+        `[DIAL] Resolved agent id=${resolvedAgent.id} name=${resolvedAgent.name} rdn_user_id=${resolvedAgent.rdn_user_id ?? '-'} preferred_executor=${preferredExecutor ?? 'none'}`
       );
       console.log(
         `[DIAL] Emitting outbound_connect_request to agent ${resolvedAgent.id} for destination ${destination_number}`
@@ -413,6 +440,7 @@ export async function POST(req: NextRequest) {
           resolved_agent_name: resolvedAgent.name,
           resolved_agent_available: resolvedAgent.available,
           metadata_json: metadataJson,
+          preferred_executor: preferredExecutor ?? null,
         },
       });
 
@@ -431,6 +459,7 @@ export async function POST(req: NextRequest) {
         outbound_connect_request: true,
         destination_number,
         caller_id: from_number,
+        preferred_executor: preferredExecutor ?? null,
         metadata_json: metadataJson,
       });
 
@@ -442,6 +471,7 @@ export async function POST(req: NextRequest) {
         requested_user_id: user_id ?? null,
         requested_rdn_user_id: rdn_user_id ?? null,
         resolved_agent_id: resolvedAgent.id,
+        preferred_executor: preferredExecutor ?? null,
         attach_mode: 'device_connect',
       });
 
@@ -452,6 +482,7 @@ export async function POST(req: NextRequest) {
         to: destination_number,
         attach_mode: 'device_connect',
         source: commandSource,
+        preferred_executor: preferredExecutor,
         agent: {
           id: resolvedAgent.id,
           rdn_user_id: resolvedAgent.rdn_user_id,

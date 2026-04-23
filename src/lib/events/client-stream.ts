@@ -269,3 +269,44 @@ export function hasActiveDesktopStreamForUser(userId: string): boolean {
   }
   return false;
 }
+
+/**
+ * Any SSE client (desktop Tauri OR browser dashboard OR admin receiveAll)
+ * subscribed for this user. Used by control endpoints (accept/reject/dial)
+ * to decide if issuing a command is pointless — if nobody is listening,
+ * there's nothing to execute and the endpoint should report that back
+ * instead of queueing a silent ghost command.
+ */
+export function hasActiveStreamForUser(userId: string): boolean {
+  const bus = getBusState();
+  for (const subscriber of bus.subscribers.values()) {
+    if (subscriber.receiveAll) continue; // admin-all doesn't count as "the agent is listening"
+    if (subscriber.targetUserId !== userId) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Pick which surface should execute a command for this user.
+ *
+ * Rules:
+ * - If desktop (Tauri) is present, desktop wins — it's the stable
+ *   always-on softphone. Browser ignores.
+ * - If only browser is present, browser executes.
+ * - If nothing is present, return null — caller should 409 the request
+ *   instead of emitting a silent command.
+ */
+export type PreferredExecutor = 'desktop' | 'browser';
+
+export function pickPreferredExecutorForUser(userId: string): PreferredExecutor | null {
+  const bus = getBusState();
+  let sawBrowser = false;
+  for (const subscriber of bus.subscribers.values()) {
+    if (subscriber.receiveAll) continue;
+    if (subscriber.targetUserId !== userId) continue;
+    if (isDesktopClientKind(subscriber.clientKind)) return 'desktop';
+    sawBrowser = true;
+  }
+  return sawBrowser ? 'browser' : null;
+}

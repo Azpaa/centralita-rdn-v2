@@ -904,6 +904,17 @@ export default function App() {
     const payloadCommandId = typeof event.payload?.command_id === 'string'
       ? event.payload.command_id
       : null;
+    // Backend tags every control event with the surface it expects to run
+    // the command. If the backend saw no Tauri stream and fell back to the
+    // browser dashboard, we must NOT also run it here — otherwise two
+    // surfaces race on the same accept / device.connect call.
+    // Missing preferred_executor is legacy behaviour (pre-migration) where
+    // only Tauri handled things; we default to running to avoid breaking
+    // older backends that haven't been redeployed yet.
+    const preferredExecutor = typeof event.payload?.preferred_executor === 'string'
+      ? event.payload.preferred_executor
+      : null;
+    const isForBrowserOnly = preferredExecutor === 'browser';
     const localAgentUserId = agentState?.user_id ?? null;
 
     // Handle outbound connect requests from backend (RDN dial)
@@ -919,6 +930,10 @@ export default function App() {
       : null;
 
     if (isOutboundConnectRequest && destinationNumber && callerId) {
+      if (isForBrowserOnly) {
+        // Backend picked the browser dashboard — stay out of the way.
+        return;
+      }
       const requestKey = callRecordId || event.id;
       if (!processedOutboundRequestsRef.current.has(requestKey)) {
         processedOutboundRequestsRef.current.add(requestKey);
@@ -992,6 +1007,11 @@ export default function App() {
       }
 
       if (payloadCommand === 'accept') {
+        if (isForBrowserOnly) {
+          // Backend routed this accept to the browser dashboard.
+          // Tauri must stand down so both surfaces don't race on call.accept().
+          return;
+        }
         const conferenceNameFromEvent = typeof event.payload?.conference_name === 'string'
           ? event.payload.conference_name
           : null;

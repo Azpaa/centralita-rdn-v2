@@ -170,6 +170,25 @@ export function CallWidget() {
   const hiddenSinceRef = useRef<number | null>(null);
   const consecutiveInitFailuresRef = useRef(0);
 
+  // Dedup SSE-driven command execution so duplicate events (reconnect replay,
+  // the same event delivered twice) don't double-accept / double-reject /
+  // double-dial the same call.
+  const processedOutboundRequestsRef = useRef<Set<string>>(new Set());
+  const processedAcceptCommandsRef = useRef<Set<string>>(new Set());
+  const processedRejectCommandsRef = useRef<Set<string>>(new Set());
+
+  // Latest-bound handler refs so handleCanonicalStreamEvent (defined early)
+  // can reach functions declared later in the component without recreating
+  // the SSE subscription every render.
+  const answerCallRef = useRef<(() => void) | null>(null);
+  const rejectCallRef = useRef<(() => void) | null>(null);
+  const connectOutboundFromBackendRef = useRef<
+    | ((args: { destination: string; callerId: string; callRecordId?: string }) => Promise<void>)
+    | null
+  >(null);
+  const identityRef = useRef('');
+  identityRef.current = identity;
+
   // ─── Helpers ────────────────────────────────────────────────────────────────
 
   const getActiveCall = useCallback((): CallSlot | undefined => {
@@ -336,6 +355,105 @@ export function CallWidget() {
       const snapshot = event.payload?.agent_state ?? null;
       applyBackendSnapshot(snapshot, 'stream_snapshot');
       return;
+    }
+
+    // ── Executor routing for RDN-driven commands ────────────────────────────
+    // Backend stamps every control event with `preferred_executor` — it picks
+    // either 'desktop' (Tauri) or 'browser' (this widget). Only act when the
+    // browser is the chosen surface. If it's 'desktop', Tauri is running and
+    // we must keep hands off to avoid a race on call.accept / device.connect.
+    // If the tag is missing (legacy backend), we also skip — Tauri defaults
+    // to running in that case, so running here too would double-act.
+    const preferredExecutor = typeof event.payload?.preferred_executor === 'string'
+      ? event.payload.preferred_executor
+      : null;
+    const isForBrowser = preferredExecutor === 'browser';
+
+    if (isForBrowser) {
+      const targetAgent = event.agent_user_id ?? null;
+      const localIdentity = identityRef.current;
+      const executorUserId = typeof event.payload?.executor_user_id === 'string'
+        ? event.payload.executor_user_id
+        : null;
+      const targetUserIds = Array.isArray(event.payload?.target_user_ids)
+        ? (event.payload.target_user_ids as unknown[]).filter(
+            (id): id is string => typeof id === 'string' && id.length > 0,
+          )
+        : [];
+
+      // Command must be addressed to the currently logged in agent on this
+      // browser. Agent identity comes from the /token response.
+      const isForUs = Boolean(
+        localIdentity && (
+          (executorUserId && executorUserId === localIdentity)
+          || (targetAgent && targetAgent === localIdentity)
+          || targetUserIds.includes(localIdentity)
+          || (!executorUserId && !targetAgent && targetUserIds.length === 0)
+        )
+      );
+
+      if (isForUs) {
+        const payloadCommand = typeof event.payload?.command === 'string'
+          ? event.payload.command
+          : null;
+        const payloadCommandId = typeof event.payload?.command_id === 'string'
+          ? event.payload.command_id
+          : null;
+
+        const dedupAdd = (bucket: Set<string>, key: string) => {
+          bucket.add(key);
+          if (bucket.size > 100) {
+            const entries = [...bucket];
+            bucket.clear();
+            for (const entry of entries.slice(-50)) bucket.add(entry);
+          }
+        };
+
+        // Outbound dial coming from RDN/M2M: backend already created the
+        // pending_agent call_record, now we must run device.connect() so
+        // Twilio Voice TwiML attaches us to the destination.
+        const isOutboundConnectRequest = Boolean(event.payload?.outbound_connect_request);
+        const destinationNumber = typeof event.payload?.destination_number === 'string'
+          ? event.payload.destination_number
+          : null;
+        const callerIdFromEvent = typeof event.payload?.caller_id === 'string'
+          ? event.payload.caller_id
+          : null;
+        const callRecordIdFromEvent = typeof event.payload?.call_record_id === 'string'
+          ? event.payload.call_record_id
+          : null;
+
+        if (isOutboundConnectRequest && destinationNumber && callerIdFromEvent) {
+          const requestKey = callRecordIdFromEvent || event.id;
+          if (!processedOutboundRequestsRef.current.has(requestKey)) {
+            dedupAdd(processedOutboundRequestsRef.current, requestKey);
+            void connectOutboundFromBackendRef.current?.({
+              destination: destinationNumber,
+              callerId: callerIdFromEvent,
+              callRecordId: callRecordIdFromEvent ?? undefined,
+            });
+          }
+        }
+
+        // Accept / reject commands for an incoming call — the Twilio Device
+        // already has the Call in incomingCallRef (from device.on('incoming')),
+        // so we just trigger the same action a click on the UI would.
+        if (event.type === 'call_updated' && payloadCommand === 'accept') {
+          const dedupKey = payloadCommandId || event.id;
+          if (!processedAcceptCommandsRef.current.has(dedupKey)) {
+            dedupAdd(processedAcceptCommandsRef.current, dedupKey);
+            answerCallRef.current?.();
+          }
+        }
+
+        if (event.type === 'call_updated' && payloadCommand === 'reject') {
+          const dedupKey = payloadCommandId || event.id;
+          if (!processedRejectCommandsRef.current.has(dedupKey)) {
+            dedupAdd(processedRejectCommandsRef.current, dedupKey);
+            rejectCallRef.current?.();
+          }
+        }
+      }
     }
 
     const triggersSnapshotRefresh = new Set([
@@ -738,6 +856,7 @@ export function CallWidget() {
     setIncomingInfo('');
     setWidgetState('active');
   }, [addCallSlot, setupCallHandlers]);
+  answerCallRef.current = answerCall;
 
   const rejectCall = useCallback(() => {
     incomingCallRef.current?.reject();
@@ -746,6 +865,7 @@ export function CallWidget() {
     if (callsRef.current.length === 0) setWidgetState('idle');
     else setWidgetState('active');
   }, []);
+  rejectCallRef.current = rejectCall;
 
   const hangupCall = useCallback(async (callId: string) => {
     const slot = callsRef.current.find(c => c.id === callId);
@@ -875,6 +995,50 @@ export function CallWidget() {
       setError('Error al iniciar llamada');
     }
   }, [addCallSlot, fromNumber, identity, muteCall, setupCallHandlers, softphoneStatus, unmuteCall]);
+
+  // Runs when the backend forwards an outbound_connect_request via SSE
+  // targeted at this browser (RDN-originated dial, backend picked browser
+  // because no Tauri is listening). The /dial endpoint already created the
+  // pending call_record — all that's left is firing device.connect() so the
+  // Twilio client webhook emits the Dial TwiML.
+  const connectOutboundFromBackend = useCallback(async ({
+    destination,
+    callerId,
+    callRecordId,
+  }: {
+    destination: string;
+    callerId: string;
+    callRecordId?: string;
+  }) => {
+    if (!deviceRef.current || softphoneStatus !== 'connected') {
+      console.warn('[CallWidget] RDN outbound ignored: device not connected.');
+      setError('Softphone no operativo para llamada saliente RDN.');
+      return;
+    }
+
+    if (!identity) {
+      console.warn('[CallWidget] RDN outbound ignored: identity not resolved yet.');
+      return;
+    }
+
+    try {
+      const call = await deviceRef.current.connect({
+        params: {
+          To: destination,
+          CallerId: callerId,
+          UserId: identity,
+          CallRecordId: callRecordId ?? '',
+        },
+      });
+      const callId = addCallSlot(call, destination, 'outbound');
+      setupCallHandlers(call, callId);
+      setWidgetState('active');
+    } catch (err) {
+      console.error('[CallWidget] RDN outbound connect failed:', err);
+      setError('Error iniciando llamada saliente RDN');
+    }
+  }, [addCallSlot, identity, setupCallHandlers, softphoneStatus]);
+  connectOutboundFromBackendRef.current = connectOutboundFromBackend;
 
   // ─── Transfer (cold) ──────────────────────────────────────────────────────
 
