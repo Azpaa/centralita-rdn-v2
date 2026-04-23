@@ -1542,30 +1542,54 @@ export default function App() {
     }
 
     const wantsMute = action === 'mute';
+    // Muting locally is sufficient for "silence my mic to the caller" — the
+    // Twilio Voice SDK stops sending the local audio stream before it hits
+    // the conference, so the other side hears nothing. The backend mute
+    // endpoint is really for "mute someone ELSE in the conference", which
+    // is a separate admin operation.
     const muteResult = await voice.setMuted(callSid, wantsMute);
     if (!muteResult.ok) {
       setMessage(muteResult.error);
       return;
     }
 
-    if (conferenceName.trim()) {
-      const path = wantsMute
-        ? `/api/v1/calls/${callSid}/mute`
-        : `/api/v1/calls/${callSid}/unmute`;
+    // Resolve the conference name in this priority:
+    //   1. An explicit value typed in the conferenceName input (override /
+    //      debug use — muting a different participant, etc.).
+    //   2. The call's own stored conferenceName (from SSE/snapshot — the
+    //      normal case for "mute myself in this call").
+    //   3. The deterministic fallback `call-<sid>` used by the backend.
+    // Previously this flow required the user to type something in the
+    // input and then blindly trusted it; if empty, the backend call was
+    // skipped, and if wrong, the backend returned 400 and we rolled the
+    // local mute back. Both behaviours were surprising for the operator.
+    const activeCall = calls.find((c) => c.callSid === callSid) ?? null;
+    const explicitConference = conferenceName.trim();
+    const resolvedConference = explicitConference
+      || activeCall?.conferenceName
+      || `call-${callSid}`;
 
-      const backend = await withJwtRetry(
-        `call_${action}:${callSid}`,
-        (jwt) => callCommand(backendUrl, jwt, path, {
-          conference_name: conferenceName.trim(),
-        })
-      );
+    const path = wantsMute
+      ? `/api/v1/calls/${callSid}/mute`
+      : `/api/v1/calls/${callSid}/unmute`;
 
-      if (!backend.ok) {
-        // Rollback local mute state if server mute in conference fails.
-        await voice.setMuted(callSid, !wantsMute);
-        setMessage(`Error ${action} en conferencia: ${backend.error}`);
-        return;
-      }
+    const backend = await withJwtRetry(
+      `call_${action}:${callSid}`,
+      (jwt) => callCommand(backendUrl, jwt, path, {
+        conference_name: resolvedConference,
+      })
+    );
+
+    if (!backend.ok) {
+      // DO NOT rollback the local mute. The agent's mic is already
+      // silenced at the SDK level, which is the functional intent of
+      // clicking Mute. The backend mute only matters when trying to
+      // mute ANOTHER participant; if that lookup fails (no conference
+      // match, Twilio API hiccup, etc.) we just surface the warning
+      // without reversing what the user just did. Keeps the button
+      // behaviour predictable.
+      setMessage(`${wantsMute ? 'Mute' : 'Unmute'} local aplicado; backend no pudo reflejarlo en la conferencia: ${backend.error}`);
+      return;
     }
 
     setMessage(`${wantsMute ? 'Mute' : 'Unmute'} aplicado en ${callSid}`);
@@ -1573,6 +1597,7 @@ export default function App() {
   }, [
     backendUrl,
     bumpInFlightVersion,
+    calls,
     cleanupStaleLocalCalls,
     conferenceName,
     refreshAgentSnapshot,
