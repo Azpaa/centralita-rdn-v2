@@ -151,19 +151,41 @@ export async function consumeSseStream(params: {
     streamUrl.searchParams.set('last_event_id', lastEventId);
   }
 
-  const response = await fetch(streamUrl.toString(), {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${jwt}`,
-      Accept: 'text/event-stream',
-      // Native EventSource header; we mirror it so the server sees the
-      // same signal whether it's a browser EventSource or a fetch reader.
-      ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
-    },
-    signal,
-  });
+  // Log the exact URL + JWT tail so operators can correlate with backend
+  // logs when SSE fails (paste both into pm2 logs and find the matching
+  // subscriber id). Helps separate "never reached backend" from "backend
+  // closed the stream".
+  const jwtTail = jwt.length > 12 ? `...${jwt.slice(-8)}` : '<short>';
+  console.log(`[SSE] connecting url=${streamUrl.toString()} jwt=${jwtTail} lastEventId=${lastEventId ?? '-'}`);
+
+  let response: Response;
+  try {
+    response = await fetch(streamUrl.toString(), {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: 'text/event-stream',
+        // Native EventSource header; we mirror it so the server sees the
+        // same signal whether it's a browser EventSource or a fetch reader.
+        ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
+      },
+      signal,
+    });
+  } catch (fetchErr) {
+    // WebView2 surfaces most transport errors (TLS, DNS, HTTP/2 reset,
+    // CORS preflight, mixed content, proxy refusal) as a bare
+    // `TypeError: Failed to fetch`. Re-throw with the fetched URL so the
+    // catch site can render it prominently.
+    const wrapped = new Error(
+      `fetch_failed url=${streamUrl.toString()} err=${(fetchErr as Error)?.message ?? String(fetchErr)}`,
+      { cause: fetchErr },
+    );
+    console.error('[SSE] initial fetch failed', fetchErr);
+    throw wrapped;
+  }
 
   if (!response.ok || !response.body) {
+    console.warn(`[SSE] stream non-OK status=${response.status}`);
     throw new Error(`stream_http_${response.status}`);
   }
 

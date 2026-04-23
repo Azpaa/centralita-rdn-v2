@@ -1342,7 +1342,27 @@ export default function App() {
         } catch (err) {
           setStreamStatus('disconnected');
           if (cancelled) break;
-          const message = String(err);
+
+          // Build a richer error description so the UI surfaces enough info
+          // to debug WebView2-specific failures (e.g. the opaque
+          // `TypeError: Failed to fetch` that masks CORS, HTTP/2 resets,
+          // TLS, and network-stack issues). We also dump the raw object to
+          // the console (visible via DevTools → Console, F12) so
+          // err.cause / err.stack / nested objects are inspectable.
+          const errObj = err as Error & { cause?: unknown };
+          const parts: string[] = [];
+          if (errObj?.name) parts.push(errObj.name);
+          if (errObj?.message) parts.push(errObj.message);
+          const cause = errObj?.cause;
+          if (cause) {
+            const causeMsg = (cause as Error)?.message ?? String(cause);
+            if (causeMsg) parts.push(`cause=${causeMsg}`);
+          }
+          const detail = parts.filter(Boolean).join(' / ') || String(err);
+
+          console.error('[SSE] fetch failed', errObj, { cause, stack: errObj?.stack });
+
+          const message = detail;
           if (isJwtOrAuthError(message)) {
             await ensureFreshSession('stream:auth_error', {
               forceRefresh: true,
