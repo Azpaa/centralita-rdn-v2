@@ -110,23 +110,43 @@ export async function POST(
     mergedTwilioData.accept_engine_accepted_at = parsed.data.engine_accepted_at;
   }
 
+  // Tauri's device.connect path bypasses the /agent-connect webhook that
+  // normally stamps `answered_by_user_id` + `status='in_progress'` on the
+  // call_record. Without that stamp, agent-state snapshots return
+  // active_calls=[] for this user — and Tauri's applySnapshot orphan-
+  // reaper would then disconnect the just-joined leg. /accept/confirm is
+  // our authoritative signal that the client has media; do the stamp
+  // here so the snapshot catches up within a single roundtrip.
+  const confirmingUserId = auth.userId ?? null;
+  const shouldStampAnsweredBy = Boolean(
+    confirmingUserId && !callRow.answered_by_user_id,
+  );
+  const callUpdate: Record<string, unknown> = {
+    twilio_data: mergedTwilioData,
+    last_verified_at: confirmedAt,
+  };
+  if (shouldStampAnsweredBy) {
+    callUpdate.answered_by_user_id = confirmingUserId;
+    callUpdate.answered_at = confirmedAt;
+    callUpdate.status = 'in_progress';
+  }
+
   await supabase
     .from('call_records')
-    .update({
-      twilio_data: mergedTwilioData,
-      last_verified_at: confirmedAt,
-    })
+    .update(callUpdate)
     .eq('id', callRow.id);
 
+  const resolvedAnsweredBy = callRow.answered_by_user_id ?? confirmingUserId;
+
   const eventId = crypto.randomUUID();
-  const targetUserIds = callRow.answered_by_user_id ? [callRow.answered_by_user_id] : [];
+  const targetUserIds = resolvedAnsweredBy ? [resolvedAnsweredBy] : [];
 
   await publishCanonicalClientEvent({
     id: eventId,
     type: 'call_updated',
     timestamp: confirmedAt,
     call_sid: callSid,
-    agent_user_id: callRow.answered_by_user_id ?? null,
+    agent_user_id: resolvedAnsweredBy,
     target_user_ids: targetUserIds,
     payload: {
       command: 'accept_confirmed',
@@ -135,8 +155,32 @@ export async function POST(
       confirmed_at: confirmedAt,
       engine_accepted_at: parsed.data.engine_accepted_at ?? null,
       confirmed_by_user_id: auth.userId ?? null,
+      answered_by_user_id: resolvedAnsweredBy,
     },
   });
+
+  // Also emit a proper domain `call.answered` event when we just stamped
+  // answered_by_user_id — RDN's webhook consumer and any other observer
+  // tracks the lifecycle off this canonical event rather than inspecting
+  // the raw call_updated control commands.
+  if (shouldStampAnsweredBy && confirmingUserId) {
+    const { emitEvent } = await import('@/lib/events/emitter');
+    const { data: agentData } = await supabase
+      .from('users')
+      .select('rdn_user_id')
+      .eq('id', confirmingUserId)
+      .maybeSingle();
+    const rdnUserId = (agentData as { rdn_user_id?: string | null } | null)?.rdn_user_id ?? null;
+    emitEvent('call.answered', {
+      call_sid: callSid,
+      direction: 'inbound',
+      status: 'in_progress',
+      answered_by_user_id: confirmingUserId,
+      user_id: confirmingUserId,
+      rdn_user_id: rdnUserId,
+      source: 'accept_confirm',
+    });
+  }
 
   await auditLog('call.accept_confirmed', 'call_record', callRow.id, auth.userId, {
     call_sid: callSid,

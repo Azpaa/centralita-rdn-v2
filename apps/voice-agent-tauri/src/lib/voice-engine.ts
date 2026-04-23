@@ -49,6 +49,12 @@ type ManagedCall = {
   // True once the Twilio Call fired its 'accept' event (i.e. media is flowing).
   // Lets the UI show an accurate 'accepting' → 'connected' transition.
   accepted: boolean;
+  // Wall-clock of when we wired the Call into the engine. Used by the App
+  // to suppress the snapshot-orphan reaper during the window where backend
+  // hasn't yet stamped `answered_by_user_id` on the call_record (Tauri's
+  // device.connect path bypasses /agent-connect, so the stamp happens via
+  // /accept/confirm which is a separate roundtrip).
+  attachedAt: number;
 };
 
 type UseVoiceEngineParams = {
@@ -88,6 +94,11 @@ type UseVoiceEngineResult = {
   setMuted: (parentSid: string, muted: boolean) => Promise<VoiceActionResult>;
   isCallAttached: (parentSid: string) => boolean;
   isCallAccepted: (parentSid: string) => boolean;
+  // Returns how many milliseconds ago the call was wired into the engine,
+  // or null if the call isn't attached. Used to guard the orphan-cleanup
+  // pass in applySnapshot from killing calls that backend hasn't yet
+  // stamped as answered.
+  getCallAttachedMsAgo: (parentSid: string) => number | null;
   reconnectNow: () => Promise<void>;
 };
 
@@ -211,6 +222,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       direction,
       destination,
       accepted: false,
+      attachedAt: Date.now(),
     });
     syncAttachedCallSids();
 
@@ -603,6 +615,12 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     return callsRef.current.get(parentSid)?.accepted === true;
   }, []);
 
+  const getCallAttachedMsAgo = useCallback((parentSid: string) => {
+    const managed = callsRef.current.get(parentSid);
+    if (!managed) return null;
+    return Date.now() - managed.attachedAt;
+  }, []);
+
   const reconnectNow = useCallback(async () => {
     if (!enabledRef.current) {
       const message = 'No se puede reiniciar el motor: sesion no activa o backend no configurado.';
@@ -634,6 +652,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     setMuted,
     isCallAttached,
     isCallAccepted,
+    getCallAttachedMsAgo,
     reconnectNow,
   }), [
     attachedCallSids,
@@ -641,6 +660,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     deviceReason,
     deviceStatus,
     disconnectCall,
+    getCallAttachedMsAgo,
     identity,
     isCallAccepted,
     isCallAttached,

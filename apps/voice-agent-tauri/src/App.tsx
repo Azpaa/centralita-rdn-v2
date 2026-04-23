@@ -253,7 +253,26 @@ export default function App() {
 
     const voice = voiceRef.current;
     if (voice) {
-      const orphaned = voice.attachedCallSids.filter((sid) => !activeParentSids.has(sid));
+      // Only consider a locally-attached call "orphaned" if the backend
+      // hasn't seen it AND it was attached long enough ago that backend
+      // must have had a chance to catch up.
+      //
+      // Context: the Tauri accept path (device.connect to a conference)
+      // bypasses the /agent-connect webhook that stamps
+      // `answered_by_user_id` on the call_record. That stamp only lands
+      // once Tauri's /accept/confirm POST completes — which is a separate
+      // roundtrip happening on the Call's 'accept' event. Until then the
+      // snapshot doesn't list this call as active for the user, and an
+      // unconditional orphan-reaper would disconnect the just-joined
+      // leg the instant the first snapshot returned (exactly the symptom
+      // observed: "le doy aceptar y se cuelga justo cuando se conecta").
+      const ORPHAN_MIN_AGE_MS = 15_000;
+      const orphaned = voice.attachedCallSids.filter((sid) => {
+        if (activeParentSids.has(sid)) return false;
+        const ageMs = voice.getCallAttachedMsAgo(sid);
+        if (ageMs === null) return false;
+        return ageMs >= ORPHAN_MIN_AGE_MS;
+      });
       if (orphaned.length > 0) {
         void (async () => {
           for (const parentSid of orphaned) {
