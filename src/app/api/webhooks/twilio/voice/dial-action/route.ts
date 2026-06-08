@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
   const supabase = createAdminClient();
   const { data: callRecord } = await supabase
     .from('call_records')
-    .select('direction, started_at, queue_id, phone_number_id, from_number, to_number, answered_by_user_id')
+    .select('direction, started_at, queue_id, phone_number_id, from_number, to_number, answered_by_user_id, twilio_data')
     .eq('twilio_call_sid', callSid)
     .single();
 
@@ -42,6 +42,35 @@ export async function POST(req: NextRequest) {
   const fromNumber = record?.from_number ?? null;
   const toNumber = record?.to_number ?? null;
   const answeredByUserId = record?.answered_by_user_id ?? null;
+
+  // ── Guard de hold en curso ────────────────────────────────────────────────
+  // Cuando /hold pone en espera una llamada SALIENTE (`<Dial>`), redirige al
+  // cliente a la música de espera; eso termina el `<Dial>` del agente, que llega
+  // aquí. Sin este guard, la lógica de abajo daría la llamada por terminada y
+  // colgaría al agente (el bug "se cuelga al poner en espera"). En su lugar
+  // aparcamos la leg del agente viva con un `<Pause>`; /resume la re-puentea.
+  const twilioData =
+    record?.twilio_data && typeof record.twilio_data === 'object' && !Array.isArray(record.twilio_data)
+      ? (record.twilio_data as Record<string, unknown>)
+      : {};
+  const holdRestructure =
+    twilioData.hold_restructure
+    && typeof twilioData.hold_restructure === 'object'
+    && !Array.isArray(twilioData.hold_restructure)
+      ? (twilioData.hold_restructure as Record<string, unknown>)
+      : null;
+  if (holdRestructure && holdRestructure.held === true) {
+    const restructuredAt =
+      typeof holdRestructure.at === 'string' ? Date.parse(holdRestructure.at) : NaN;
+    const isFresh = Number.isFinite(restructuredAt) && Date.now() - restructuredAt < 60_000;
+    if (isFresh) {
+      console.log(
+        `[DIAL-ACTION] Hold en curso para ${callSid} — aparcando la leg del agente en vez de colgar`
+      );
+      twiml.pause({ length: 3600 });
+      return twimlResponse(twiml);
+    }
+  }
 
   // Si la llamada fue contestada y completada → hubo conversación real
   // Para conferencias, el DialCallStatus puede no ser exactamente 'completed'
