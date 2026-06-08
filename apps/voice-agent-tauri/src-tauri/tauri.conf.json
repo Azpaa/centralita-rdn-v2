@@ -16,12 +16,11 @@
         "width": 1100,
         "height": 820,
         "minWidth": 920,
-        "minHeight": 700,
-        "devtools": true
+        "minHeight": 700
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob: mediastream:; connect-src 'self' https: wss:; worker-src 'self' blob:; child-src 'self' blob:; object-src 'none'; frame-src 'none'; base-uri 'self'"
     }
   },
   "bundle": {

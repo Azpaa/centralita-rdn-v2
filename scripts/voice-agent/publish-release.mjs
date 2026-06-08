@@ -106,6 +106,20 @@ async function main() {
   const signaturePath = findSignatureForInstaller(installerPath, files);
   const installerFileName = path.basename(installerPath);
   const arch = inferArch(installerFileName);
+
+  // Enforce signing by default. The Tauri auto-updater verifies the installer
+  // against the pubkey baked into the app and REJECTS anything unsigned, so
+  // publishing without a .sig silently leaves the update channel broken. Fail
+  // loudly instead. Set ALLOW_UNSIGNED_RELEASE=true only for a manual-download
+  // -only release (no auto-update).
+  if (!signaturePath && process.env.ALLOW_UNSIGNED_RELEASE !== 'true') {
+    console.error('[voice-agent] No se encontro firma (.sig) para el instalador.');
+    console.error('[voice-agent] El auto-updater de Tauri RECHAZA builds sin firmar: publicar asi deja el canal de actualizacion roto.');
+    console.error('[voice-agent] Compila con TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD (createUpdaterArtifacts ya esta activo) para generar el .sig.');
+    console.error('[voice-agent] Para publicar a proposito SIN firma (solo descarga manual), re-ejecuta con ALLOW_UNSIGNED_RELEASE=true.');
+    process.exit(1);
+  }
+
   const versionDir = path.resolve(PUBLIC_DOWNLOADS_BASE, `v${version}`);
   await resetDir(versionDir);
 
@@ -148,7 +162,7 @@ async function main() {
   if (signatureFileName) {
     console.log(`[voice-agent] Firma: ${signatureFileName}`);
   } else {
-    console.log('[voice-agent] Firma no encontrada (opcional).');
+    console.warn('[voice-agent] AVISO: release SIN firma (ALLOW_UNSIGNED_RELEASE=true). El auto-update NO funcionara; solo descarga manual.');
   }
   console.log(`[voice-agent] Manifest actualizado: ${TAURI_RELEASES_MANIFEST_PATH}`);
   console.log(`[voice-agent] Public manifest: ${PUBLIC_LATEST_MANIFEST_PATH}`);

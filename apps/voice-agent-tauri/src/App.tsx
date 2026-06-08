@@ -1548,13 +1548,21 @@ export default function App() {
       hangupInFlightRef.current.add(callSid);
       bumpInFlightVersion();
       try {
+        // Only tear down ALL legs when we actually own this call locally
+        // (accepted/attached). For a call we have not joined — e.g. one still
+        // ringing, or another agent's call surfaced in a shared view —
+        // target:'all' would collapse a conference we are not part of and cut
+        // a caller another agent was about to answer. Fall back to 'self' so we
+        // only ever drop our own leg.
+        const ownsCall = voice.isCallAttached(callSid) || voice.isCallAccepted(callSid);
+        const hangupTarget = ownsCall ? 'all' : 'self';
         const backend = await withJwtRetry(
           `call_hangup:${callSid}`,
           (jwt) => callCommand(
             backendUrl,
             jwt,
             `/api/v1/calls/${callSid}/hangup`,
-            { target: 'all' }
+            { target: hangupTarget }
           )
         );
 
