@@ -149,20 +149,29 @@ export async function POST(req: NextRequest) {
     return new NextResponse('OK', { status: 200 });
   }
 
-  // Update freshness timestamp on every successful webhook resolution —
-  // even if we later decide to ignore the status (e.g. terminal record,
-  // conference-only callback). The signal of interest is "Twilio is
-  // still sending us callbacks for this call", not "the status changed".
-  // This is what lets the reconcile path distinguish a live call from
-  // a zombie without touching Twilio's API.
-  try {
-    const supabaseFreshness = createAdminClient();
-    await supabaseFreshness
-      .from('call_records')
-      .update({ last_webhook_at: new Date().toISOString() })
-      .eq('twilio_call_sid', trackedCallSid);
-  } catch (err) {
-    console.warn(`[STATUS] Failed updating last_webhook_at for ${trackedCallSid}:`, err);
+  // Update the freshness timestamp ONLY when this callback actually proves the
+  // tracked (parent) call is alive. The reconcile self-heal reads
+  // last_webhook_at to decide "is this call still live?"; if we stamp it for
+  // every resolved callback, an agent RING leg (which resolves to the parent
+  // via parent_call_sid) keeps the parent looking fresh even after the caller
+  // has dropped — which blinds the self-heal and produces the "ghost busy"
+  // agent. A callback proves parent liveness only when it is the parent leg's
+  // own callback, or when a leg actually connected (answered / in-progress).
+  const callbackProvesParentLive = (
+    rawCallSid === trackedCallSid
+    || callStatus === 'answered'
+    || callStatus === 'in-progress'
+  );
+  if (callbackProvesParentLive) {
+    try {
+      const supabaseFreshness = createAdminClient();
+      await supabaseFreshness
+        .from('call_records')
+        .update({ last_webhook_at: new Date().toISOString() })
+        .eq('twilio_call_sid', trackedCallSid);
+    } catch (err) {
+      console.warn(`[STATUS] Failed updating last_webhook_at for ${trackedCallSid}:`, err);
+    }
   }
 
   // Conference status callbacks (join/leave/end) may hit this endpoint without CallStatus.

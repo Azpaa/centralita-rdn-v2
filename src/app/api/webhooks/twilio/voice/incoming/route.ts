@@ -381,15 +381,24 @@ export async function POST(req: NextRequest) {
       return twimlResponse(twiml);
     }
 
-    // Advance round-robin index
+    // Advance round-robin index with an optimistic guard: only write if the
+    // index is still what we read. Two calls arriving together both read the
+    // same index; without the guard both write the same "next" value, losing
+    // an increment and skipping agents. (Note: this prevents index skew but
+    // not the rarer case where both already selected the same target above —
+    // fully eliminating that needs an atomic select-and-advance DB function.)
     if (queue.strategy !== 'ring_all') {
-      await supabase
+      const { error: rotateErr } = await supabase
         .from('queues')
         .update({
           current_index: (queue.current_index + 1) % operators.length,
           last_rotated_at: new Date().toISOString(),
         })
-        .eq('id', queue.id);
+        .eq('id', queue.id)
+        .eq('current_index', queue.current_index);
+      if (rotateErr) {
+        console.warn(`[INCOMING] Round-robin index advance failed for queue ${queue.id}: ${rotateErr.message}`);
+      }
     }
 
     // Put the caller into the conference (they hear hold music until agent joins)

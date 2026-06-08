@@ -288,6 +288,69 @@ export async function GET(req: NextRequest) {
                 }
                 console.log(`[SSE] Triggered re-ring for ${ringingCalls.length} pending call(s) on reconnect`);
               }
+
+              // Re-deliver a pending, unconfirmed accept command to THIS
+              // reconnecting client. Accept commands are published over the
+              // in-memory bus and are NOT persisted to domain_events, so
+              // Last-Event-ID replay cannot recover them: if the SSE was
+              // mid-reconnect when accept fired, the command was lost and the
+              // call just rings until timeout (the "le doy aceptar y sigue
+              // sonando" miss). Resend with the SAME command_id so the
+              // softphone's command dedup makes it a no-op if already handled.
+              try {
+                const acceptCallSids = snapshot.active_calls
+                  .map((c) => c.call_sid)
+                  .filter((sid): sid is string => typeof sid === 'string' && sid.length > 0);
+                if (acceptCallSids.length > 0) {
+                  const supabaseAccept = createAdminClient();
+                  const { data: acceptRows } = await supabaseAccept
+                    .from('call_records')
+                    .select('twilio_call_sid, twilio_data')
+                    .in('twilio_call_sid', acceptCallSids);
+                  const nowMs = Date.now();
+                  for (const row of acceptRows ?? []) {
+                    const td = (row.twilio_data && typeof row.twilio_data === 'object' && !Array.isArray(row.twilio_data))
+                      ? (row.twilio_data as Record<string, unknown>)
+                      : {};
+                    const commandId = typeof td.accept_last_command_id === 'string' ? td.accept_last_command_id : null;
+                    const confirmedAt = typeof td.accept_confirmed_at === 'string' ? td.accept_confirmed_at : null;
+                    const requestedAt = typeof td.accept_last_requested_at === 'string' ? td.accept_last_requested_at : null;
+                    const executorUserId = typeof td.accept_last_executor_user_id === 'string' ? td.accept_last_executor_user_id : null;
+                    const preferredExecutor = typeof td.accept_last_preferred_executor === 'string' ? td.accept_last_preferred_executor : null;
+                    const conferenceName = typeof td.conference_name === 'string' && td.conference_name.length > 0
+                      ? td.conference_name
+                      : `call-${row.twilio_call_sid}`;
+                    const requestedMs = requestedAt ? Date.parse(requestedAt) : NaN;
+                    const isFresh = Number.isFinite(requestedMs) && (nowMs - requestedMs) < 60_000;
+                    // Skip: no pending accept, already confirmed, stale, or
+                    // addressed to a different agent than this stream.
+                    if (!commandId || confirmedAt || !isFresh) continue;
+                    if (executorUserId && executorUserId !== targetUserId) continue;
+                    send({
+                      id: commandId,
+                      type: 'call_updated',
+                      timestamp: requestedAt ?? new Date().toISOString(),
+                      call_sid: row.twilio_call_sid,
+                      agent_user_id: executorUserId ?? (targetUserId as string),
+                      target_user_ids: [targetUserId as string],
+                      payload: {
+                        command: 'accept',
+                        command_id: commandId,
+                        call_sid: row.twilio_call_sid,
+                        conference_name: conferenceName,
+                        preferred_executor: preferredExecutor,
+                        executor_user_id: executorUserId,
+                        target_user_ids: [targetUserId],
+                        requested_at: requestedAt,
+                        resent_on_reconnect: true,
+                      },
+                    });
+                    console.log(`[SSE] Re-sent pending accept command_id=${commandId} call_sid=${row.twilio_call_sid} user=${targetUserId} on reconnect`);
+                  }
+                }
+              } catch (acceptErr) {
+                console.warn('[SSE] Pending-accept re-emit failed:', acceptErr);
+              }
             }
           } catch (err) {
             console.error('[SSE] Failed building initial snapshot:', err);

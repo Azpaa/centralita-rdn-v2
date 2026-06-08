@@ -120,10 +120,18 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
   // Añadir filtro temporal: ignorar registros de más de 4 horas (posibles fantasmas)
   const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
 
+  // A leg reserves its agent briefly between dial and answer; cap how long a
+  // pending_agent/ringing row can keep an agent busy so a leaked pending dial
+  // can't pin them for hours (in_progress keeps the 4h window + live-verify).
+  const reserveMaxAgeMs = 2 * 60 * 1000;
+
   let query = supabase
     .from('call_records')
-    .select('answered_by_user_id, twilio_data, twilio_call_sid, started_at')
-    .in('status', ['in_progress'] as CallStatus[])
+    .select('answered_by_user_id, twilio_data, twilio_call_sid, started_at, status')
+    // in_progress = active call. pending_agent/ringing = an outbound leg the
+    // agent already owns (answered_by_user_id is set on dial); without these,
+    // an inbound call could be routed to an agent mid-dial → double-assignment.
+    .in('status', ['in_progress', 'pending_agent', 'ringing'] as CallStatus[])
     .not('answered_by_user_id', 'is', null)
     .is('ended_at', null)
     .gte('started_at', fourHoursAgo);
@@ -142,6 +150,7 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
     twilio_data: Record<string, unknown> | null;
     twilio_call_sid: string | null;
     started_at: string;
+    status: CallStatus | null;
   }>) {
     const transferReleased = Boolean(
       call.twilio_data
@@ -153,6 +162,15 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
     );
     if (transferReleased) {
       continue;
+    }
+
+    // For the short-lived reservation states, only count fresh rows so a
+    // stuck/leaked pending dial can't keep the agent busy indefinitely.
+    if (call.status === 'pending_agent' || call.status === 'ringing') {
+      const reserveAgeMs = nowMs - Date.parse(call.started_at);
+      if (!Number.isFinite(reserveAgeMs) || reserveAgeMs >= reserveMaxAgeMs) {
+        continue;
+      }
     }
 
     const callSid = call.twilio_call_sid;
@@ -520,6 +538,42 @@ export async function updateCallStatus(
   if (updates.waitTime !== undefined) updateData.wait_time = updates.waitTime;
   if (updates.answeredByUserId) updateData.answered_by_user_id = updates.answeredByUserId;
 
+  const incomingIsTerminal = Boolean(
+    updates.status && TERMINAL_CALL_STATUSES.includes(updates.status as CallStatus),
+  );
+
+  // Read the current row once: used both for the terminal-resurrection guard
+  // and for ring-target cleanup on terminal transitions.
+  const { data: existing } = await supabase
+    .from('call_records')
+    .select('status, ended_at, twilio_data')
+    .eq('twilio_call_sid', twilioCallSid)
+    .maybeSingle();
+
+  const existingStatus = (existing?.status ?? null) as CallStatus | null;
+  const existingIsTerminal = Boolean(
+    (existingStatus && TERMINAL_CALL_STATUSES.includes(existingStatus)) || existing?.ended_at,
+  );
+
+  // GUARD: never resurrect a call that already reached a terminal state.
+  // A late or duplicate whisper/agent-connect/client callback (Twilio retry,
+  // a leg answering a canceled ring a beat late) can otherwise re-stamp
+  // status='in_progress' + answered_by_user_id on a finished call, pinning the
+  // agent as ghost-busy with no live Twilio call behind it. Terminal->terminal
+  // refinements (stamping ended_at/duration on an already-terminal row) still
+  // pass through.
+  if (existingIsTerminal && !incomingIsTerminal) {
+    delete updateData.status;
+    delete updateData.answered_by_user_id;
+    delete updateData.answered_at;
+    if (Object.keys(updateData).length === 0) {
+      console.log(
+        `[CALL-ENGINE] Ignoring non-terminal update on terminal call ${twilioCallSid} (status=${existingStatus ?? 'ended'})`,
+      );
+      return;
+    }
+  }
+
   // When the call reaches a terminal state we also wipe
   // `current_ring_target_user_ids` in twilio_data. Without this, any user
   // that happened to be in the ring pool at the moment of termination stays
@@ -527,39 +581,27 @@ export async function updateCallStatus(
   // query), which is the exact "todos los usuarios se quedan bloqueados"
   // symptom observed in production. agent-connect already clears it on
   // answer; this covers the miss/no-answer/cancelled paths.
-  const isTerminalUpdate = Boolean(
-    updates.status && TERMINAL_CALL_STATUSES.includes(updates.status as CallStatus),
-  );
+  const existingTwilioData = (
+    existing?.twilio_data
+    && typeof existing.twilio_data === 'object'
+    && !Array.isArray(existing.twilio_data)
+  )
+    ? (existing.twilio_data as Record<string, unknown>)
+    : null;
 
-  if (isTerminalUpdate) {
-    const { data: existing } = await supabase
-      .from('call_records')
-      .select('twilio_data')
-      .eq('twilio_call_sid', twilioCallSid)
-      .maybeSingle();
-
-    const existingTwilioData = (
-      existing?.twilio_data
-      && typeof existing.twilio_data === 'object'
-      && !Array.isArray(existing.twilio_data)
-    )
-      ? (existing.twilio_data as Record<string, unknown>)
+  if (incomingIsTerminal && existingTwilioData) {
+    const currentRingTargets = Array.isArray(existingTwilioData.current_ring_target_user_ids)
+      ? (existingTwilioData.current_ring_target_user_ids as unknown[])
       : null;
 
-    if (existingTwilioData) {
-      const currentRingTargets = Array.isArray(existingTwilioData.current_ring_target_user_ids)
-        ? (existingTwilioData.current_ring_target_user_ids as unknown[])
-        : null;
-
-      if (currentRingTargets && currentRingTargets.length > 0) {
-        updateData.twilio_data = {
-          ...existingTwilioData,
-          current_ring_target_user_ids: [],
-          current_round_robin_attempt_id: null,
-          ring_cleared_at: new Date().toISOString(),
-          ring_cleared_reason: `terminal_status_${updates.status}`,
-        };
-      }
+    if (currentRingTargets && currentRingTargets.length > 0) {
+      updateData.twilio_data = {
+        ...existingTwilioData,
+        current_ring_target_user_ids: [],
+        current_round_robin_attempt_id: null,
+        ring_cleared_at: new Date().toISOString(),
+        ring_cleared_reason: `terminal_status_${updates.status}`,
+      };
     }
   }
 
