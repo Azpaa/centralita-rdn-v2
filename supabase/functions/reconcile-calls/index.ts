@@ -101,6 +101,30 @@ Deno.serve(async (req) => {
   let reconciled = 0;
 
   try {
+    // Self-heal del lock de ejecución única. Si una ejecución anterior murió
+    // a mitad (la plataforma mata la función al exceder límites de CPU/tiempo),
+    // su fila 'running' queda clavada y el índice único
+    // uq_reconcile_single_running hace que TODAS las ejecuciones futuras se
+    // salten con already_running. Pasó en producción el 2026-04-24: el cron
+    // siguió disparando cada minuto pero nadie reconcilió nada durante
+    // semanas. Cualquier 'running' de hace más de 10 minutos es un cadáver.
+    const staleLockCutoff = new Date(Date.now() - 10 * 60_000).toISOString();
+    const staleClear = await supabase
+      .from("reconcile_runs")
+      .update({
+        status: "error",
+        finished_at: new Date().toISOString(),
+        error_text: "stale running lock cleared by a later run (previous run was killed mid-flight)",
+      })
+      .eq("status", "running")
+      .lt("started_at", staleLockCutoff)
+      .select("id");
+
+    const clearedIds = (staleClear.data ?? []).map((row) => (row as { id: number }).id);
+    if (clearedIds.length > 0) {
+      console.warn(`[reconcile-calls] stale running lock(s) cleared: ${clearedIds.join(",")}`);
+    }
+
     const runIns = await supabase
       .from("reconcile_runs")
       .insert({ status: "running" })
