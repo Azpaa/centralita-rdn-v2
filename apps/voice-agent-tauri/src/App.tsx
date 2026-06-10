@@ -7,6 +7,7 @@ import {
   fetchAgentState,
   fetchBootstrap,
   normalizeBaseUrl,
+  sendClientLog,
   updateUserAvailability,
 } from './lib/backend';
 import type {
@@ -17,7 +18,7 @@ import type {
   VoiceCallView,
   VoiceDeviceStatus,
 } from './lib/types';
-import { useVoiceEngine } from './lib/voice-engine';
+import { useVoiceEngine, type CallEndedInfo } from './lib/voice-engine';
 import incomingRingUrl from './assets/incoming-ring.wav';
 
 const DEFAULT_BACKEND_URL = 'https://centralita.reparacionesdelnorte.es';
@@ -45,6 +46,14 @@ const REMOTE_COMMAND_MAX_TRACKED = 200;
 // re-receive an event that was already applied before the disconnect.
 const PROCESSED_EVENT_ID_TTL_MS = 10 * 60_000;
 const PROCESSED_EVENT_ID_MAX_TRACKED = 500;
+// F1.4 — rejoin automático: si una llamada entrante ACEPTADA termina sin que
+// el operador pidiera colgar (blip de red, SDK rindiéndose tras la ventana de
+// reconexión), reintentamos unirnos a la misma conferencia. El backend deja
+// la sala viva (endConferenceOnExit:false) y su room-watchdog da ~45s de
+// gracia antes de re-encolar, así que hay margen de sobra.
+const REJOIN_MAX_ATTEMPTS = 2;
+const REJOIN_DELAY_MS = 1_500;
+const REJOIN_ATTEMPT_WINDOW_MS = 10 * 60_000;
 const FALLBACK_RING_BEEP_INTERVAL_MS = 3000;
 const FALLBACK_RING_BEEP_DURATION_MS = 1200;
 const FALLBACK_RING_BEEP_FREQ_A_HZ = 440;
@@ -182,6 +191,11 @@ export default function App() {
   const [lastEvent, setLastEvent] = useState('none');
   const [message, setMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  // Oferta de rellamada (F2): se rellena cuando una saliente ACEPTADA
+  // termina sin que el operador pidiera colgar (el remoto colgó — p. ej.
+  // tras dejarnos en una espera eterna). Un clic re-origina con los mismos
+  // parámetros.
+  const [redialOffer, setRedialOffer] = useState<{ destination: string; callerId: string } | null>(null);
 
   const supabaseRef = useRef<SupabaseClient | null>(null);
   const authSubscriptionRef = useRef<{ unsubscribe: () => void } | null>(null);
@@ -202,6 +216,24 @@ export default function App() {
   const lastSyncedAvailabilityRef = useRef<boolean | null>(null);
   const reconnectVoiceRef = useRef<() => Promise<void>>(async () => {});
   const lastRecoveryTriggerAtRef = useRef<number>(0);
+  // Rejoin automático (F1.4): contador de intentos por llamada y un ref a la
+  // función real, que se define más abajo (depende del voice engine) pero se
+  // invoca desde handleVoiceEnded, definido antes — mismo patrón que
+  // reconnectVoiceRef.
+  const rejoinAttemptsRef = useRef<Map<string, { count: number; firstAt: number }>>(new Map());
+  const attemptRejoinRef = useRef<(parentSid: string) => void>(() => {});
+  // Cierre VERIFICADO de huérfanas aceptadas (ver applySnapshot). Ref al
+  // verifyCallEndedThenDisconnect definido más abajo + cooldown por sid para
+  // no martillear el backend si el estado oscila.
+  const verifyCallEndedRef = useRef<(
+    callSid: string,
+    finalStatus: string | null,
+    terminalSource: string | null,
+  ) => void>(() => {});
+  const acceptedOrphanVerifyAtRef = useRef<Map<string, number>>(new Map());
+  // Re-render periódico mientras hay media enlazada, para refrescar la
+  // pista de "sin audio del interlocutor" (se calcula en render).
+  const [, setSilenceTick] = useState(0);
   // Per-call in-flight action tracking. Phase 2: instead of maintaining a
   // separate `localCallSidByParentSidRef` plus two redundant sets of
   // booleans, these two refs model "we kicked off accept/hangup and are
@@ -253,6 +285,26 @@ export default function App() {
 
     const voice = voiceRef.current;
     if (voice) {
+      // Huérfanas ACEPTADAS: media viva cuyo registro ya no aparece como
+      // activo. El reaper inmediato de abajo jamás las toca (el snapshot
+      // puede ir por detrás), pero si el backend deja de listarlas hay que
+      // resolverlo o el agente se queda con audio muerto y "ocupado" para
+      // siempre (p. ej. si el call_ended del SSE se perdió). El cierre va
+      // por verifyCallEndedThenDisconnect: re-consulta el backend y solo
+      // desconecta si confirma que la llamada ya no está in_progress.
+      const ACCEPTED_ORPHAN_VERIFY_COOLDOWN_MS = 45_000;
+      for (const sid of voice.attachedCallSids) {
+        if (activeParentSids.has(sid)) continue;
+        if (!voice.isCallAccepted(sid)) continue;
+        const lastVerifyAt = acceptedOrphanVerifyAtRef.current.get(sid) ?? 0;
+        if (Date.now() - lastVerifyAt < ACCEPTED_ORPHAN_VERIFY_COOLDOWN_MS) continue;
+        acceptedOrphanVerifyAtRef.current.set(sid, Date.now());
+        console.warn(
+          `[applySnapshot] llamada aceptada ${sid} ausente del snapshot — verificación de cierre programada.`,
+        );
+        verifyCallEndedRef.current(sid, null, 'snapshot_orphan');
+      }
+
       // Only consider a locally-attached call "orphaned" if the backend
       // hasn't seen it AND it was attached long enough ago that backend
       // must have had a chance to catch up.
@@ -451,6 +503,32 @@ export default function App() {
     return result;
   }, [ensureFreshSession]);
 
+  // Telemetría hacia el backend (audit_logs vía /client-logs). Best-effort:
+  // los eventos del SDK y las decisiones locales de teardown morían en la
+  // consola del agente, inaccesible cuando alguien reporta "se me cortó la
+  // llamada estando en espera". Nunca bloquea ni lanza.
+  const logClientEvent = useCallback((
+    kind: string,
+    callSid: string | null,
+    detail: string,
+  ) => {
+    console.log(`[client-log] kind=${kind} sid=${callSid ?? '-'} ${detail}`);
+    if (!backendUrl || !accessTokenRef.current) return;
+    void withJwtRetry(
+      `client_log:${kind}`,
+      (jwt) => sendClientLog(backendUrl, jwt, [{
+        kind,
+        call_sid: callSid ?? undefined,
+        detail: detail.slice(0, 1000),
+        at: new Date().toISOString(),
+      }]),
+    ).then((result) => {
+      if (!result.ok) {
+        console.warn(`[client-log] no se pudo reportar ${kind}: ${result.error}`);
+      }
+    });
+  }, [backendUrl, withJwtRetry]);
+
   const syncAvailability = useCallback(async (
     nextAvailable: boolean,
     reason: string,
@@ -495,6 +573,9 @@ export default function App() {
   }, [applySnapshot, backendUrl, withJwtRetry]);
 
   const handleVoiceCallStarted = useCallback((parentSid: string, direction: 'inbound' | 'outbound', destination: string | null) => {
+    // Una llamada nueva en el motor invalida cualquier oferta de rellamada
+    // pendiente (el operador ya está ocupándose de algo).
+    setRedialOffer(null);
     // Engine has a Call object wired up. Media is NOT necessarily flowing
     // yet — we're in the 'accepting' phase until the Twilio Call fires its
     // 'accept' event (handleVoiceAccepted promotes to 'connected').
@@ -576,17 +657,49 @@ export default function App() {
     }
   }, [backendUrl, bumpInFlightVersion, withJwtRetry]);
 
-  const handleVoiceEnded = useCallback((parentSid: string) => {
+  const handleVoiceEnded = useCallback((
+    parentSid: string,
+    info?: CallEndedInfo,
+  ) => {
     // Engine no longer holds a local leg for this SID. Clear any in-flight
     // flags and drop the call from UI (unless a backend snapshot revives it,
     // which would indicate a rare race where the server still thinks we're
     // active after local media closed).
+    const hangupRequested = hangupInFlightRef.current.has(parentSid);
     let bumped = false;
     if (acceptInFlightRef.current.delete(parentSid)) bumped = true;
     if (hangupInFlightRef.current.delete(parentSid)) bumped = true;
     pendingAcceptCommandIdRef.current.delete(parentSid);
     if (bumped) bumpInFlightVersion();
     setCalls((prev) => prev.filter((call) => call.callSid !== parentSid));
+
+    // F1.4 — rejoin automático: la media de una entrante aceptada se cerró
+    // sin que el operador pidiera colgar. Puede ser un teardown legítimo
+    // (call_ended verificado, caller colgó) o una caída; attemptRejoin
+    // consulta el backend y solo se re-une si la llamada sigue in_progress.
+    if (
+      !hangupRequested
+      && info?.direction === 'inbound'
+      && info.accepted
+      && accessTokenRef.current
+    ) {
+      attemptRejoinRef.current(parentSid);
+    }
+
+    // F2 — saliente aceptada que termina sin hangup local: el remoto colgó
+    // (o la red tiró la leg). Ofrecer rellamada de un clic.
+    if (
+      !hangupRequested
+      && info?.direction === 'outbound'
+      && info.accepted
+      && info.destination
+    ) {
+      setRedialOffer({
+        destination: info.destination,
+        callerId: info.callerId ?? '',
+      });
+      setMessage(`La otra parte colgó la llamada con ${info.destination}.`);
+    }
   }, [bumpInFlightVersion]);
 
   const handleVoiceMutedChanged = useCallback((parentSid: string, muted: boolean) => {
@@ -600,6 +713,23 @@ export default function App() {
   const handleVoiceInfo = useCallback((info: string) => {
     setMessage(info);
   }, []);
+
+  // Salud de la llamada (reconnecting/reconnected/warnings/errores). Lo
+  // importante aquí es la TELEMETRÍA: cada evento va al backend para poder
+  // reconstruir incidentes de cortes; reconnecting/reconnected además se
+  // muestran al operador para que no cuelgue pensando que la línea murió.
+  const handleVoiceQualityEvent = useCallback((
+    parentSid: string,
+    kind: string,
+    detail: string,
+  ) => {
+    if (kind === 'reconnecting') {
+      setMessage(`Conexión de audio inestable (${parentSid}): reintentando, no cuelgues...`);
+    } else if (kind === 'reconnected') {
+      setMessage(`Audio recuperado (${parentSid}).`);
+    }
+    logClientEvent(`sdk_${kind}`, parentSid || null, detail);
+  }, [logClientEvent]);
 
   useEffect(() => {
     const audio = new Audio(incomingRingUrl);
@@ -730,6 +860,7 @@ export default function App() {
     onCallEnded: handleVoiceEnded,
     onCallMutedChanged: handleVoiceMutedChanged,
     onInfo: handleVoiceInfo,
+    onCallQualityEvent: handleVoiceQualityEvent,
   });
 
   useEffect(() => {
@@ -751,6 +882,88 @@ export default function App() {
       await voice.disconnectCall(parentSid);
     }
   }, [calls, voice]);
+
+  // Teardown VERIFICADO para call_ended sobre una llamada con media viva.
+  //
+  // Antes, cualquier call_ended desconectaba la leg local incondicionalmente.
+  // Como la leg del agente entra en conferencia con endConferenceOnExit:true,
+  // UN solo evento terminal equivocado (reconcile erróneo, webhook duplicado,
+  // carrera de self-heal) tiraba la sala entera con la conversación en curso
+  // — exactamente la familia de cortes reportada durante esperas remotas.
+  //
+  // Regla (espejo del guard del orphan-reaper en applySnapshot): para una
+  // Call ACEPTADA, el snapshot del backend es la autoridad, no un evento
+  // suelto. Consultamos /agent/me/state (que además dispara el self-heal
+  // server-side, verificando contra la API de Twilio):
+  //   - Backend dice in_progress  → evento falso: conservar audio y avisar.
+  //   - Backend dice terminal     → teardown normal.
+  //   - Backend inaccesible       → reintentar; si sigue fallando, teardown
+  //     (el evento vino del propio backend hace un instante, así que la
+  //     inaccesibilidad sostenida es rarísima y preferimos no dejar al
+  //     agente atrapado en una sala muerta).
+  const verifyCallEndedThenDisconnect = useCallback(async (
+    callSid: string,
+    finalStatus: string | null,
+    terminalSource: string | null,
+  ) => {
+    const retryDelaysMs = [0, 2_000, 6_000];
+    let snapshot: AgentStateSnapshot | null = null;
+    let lastError = 'sin_intentos';
+
+    for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
+      if (retryDelaysMs[attempt] > 0) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
+      }
+      const result = await withJwtRetry(
+        `call_ended_verify:${callSid}:attempt=${attempt + 1}`,
+        (jwt) => fetchAgentState(backendUrl, jwt),
+      );
+      if (result.ok) {
+        snapshot = result.data;
+        break;
+      }
+      lastError = result.error;
+    }
+
+    if (snapshot) {
+      const stillActive = (snapshot.active_calls ?? []).some(
+        (call) => call.call_sid === callSid && call.status === 'in_progress',
+      );
+
+      if (stillActive) {
+        logClientEvent(
+          'call_ended_ignored_alive',
+          callSid,
+          `terminal_source=${terminalSource ?? '-'} final_status=${finalStatus ?? '-'} — backend confirma in_progress; se conserva el audio`,
+        );
+        setMessage(
+          `Aviso: llegó un cierre para ${callSid} pero la llamada sigue activa; se conserva el audio.`,
+        );
+        applySnapshot(snapshot);
+        return;
+      }
+
+      applySnapshot(snapshot);
+    } else {
+      logClientEvent(
+        'call_ended_verify_unreachable',
+        callSid,
+        `terminal_source=${terminalSource ?? '-'} error=${lastError} — teardown sin verificar`,
+      );
+    }
+
+    logClientEvent(
+      'call_ended_disconnect',
+      callSid,
+      `terminal_source=${terminalSource ?? '-'} final_status=${finalStatus ?? '-'}`,
+    );
+    await voice.disconnectCall(callSid);
+    let bumped = false;
+    if (acceptInFlightRef.current.delete(callSid)) bumped = true;
+    if (hangupInFlightRef.current.delete(callSid)) bumped = true;
+    if (bumped) bumpInFlightVersion();
+    setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
+  }, [applySnapshot, backendUrl, bumpInFlightVersion, logClientEvent, voice, withJwtRetry]);
 
   useEffect(() => {
     reconnectVoiceRef.current = voice.reconnectNow;
@@ -834,6 +1047,105 @@ export default function App() {
     if (existing && existing.conferenceName) return existing.conferenceName;
     return `call-${parentSid}`;
   }, [calls]);
+
+  // F1.4 — rejoin automático tras una caída de media. Verifica contra el
+  // backend ANTES de re-unirse: si la llamada ya no está in_progress era un
+  // teardown legítimo y no hay nada que recuperar. El guard server-side de
+  // legs duplicadas tolera este flujo (la leg antigua está muerta, así que
+  // permite la nueva), y el room-watchdog limpia su marcador al vernos
+  // entrar de nuevo en la sala.
+  const attemptConferenceRejoin = useCallback(async (parentSid: string) => {
+    const now = Date.now();
+    const existing = rejoinAttemptsRef.current.get(parentSid);
+    const entry = existing && now - existing.firstAt < REJOIN_ATTEMPT_WINDOW_MS
+      ? existing
+      : { count: 0, firstAt: now };
+    if (entry.count >= REJOIN_MAX_ATTEMPTS) {
+      logClientEvent('rejoin_exhausted', parentSid, `attempts=${entry.count}`);
+      return;
+    }
+    entry.count += 1;
+    rejoinAttemptsRef.current.set(parentSid, entry);
+
+    await new Promise((resolve) => setTimeout(resolve, REJOIN_DELAY_MS));
+
+    const voiceEngine = voiceRef.current;
+    if (!voiceEngine) return;
+    if (voiceEngine.isCallAttached(parentSid)) return;
+    if (!accessTokenRef.current) return;
+
+    const state = await withJwtRetry(
+      `rejoin_state:${parentSid}`,
+      (jwt) => fetchAgentState(backendUrl, jwt),
+    );
+    if (!state.ok) {
+      logClientEvent('rejoin_state_unreachable', parentSid, state.error);
+      return;
+    }
+
+    const active = (state.data.active_calls ?? []).find(
+      (call) => call.call_sid === parentSid && call.status === 'in_progress',
+    );
+    if (!active) {
+      // Fin legítimo (el llamante colgó / reconcile cerró): nada que
+      // recuperar. Aplicar el snapshot deja la UI coherente.
+      applySnapshot(state.data);
+      return;
+    }
+
+    const conferenceNameForRejoin = (
+      typeof active.conference_name === 'string' && active.conference_name.length > 0
+    )
+      ? active.conference_name
+      : resolveConferenceNameForParent(parentSid);
+
+    logClientEvent(
+      'rejoin_attempt',
+      parentSid,
+      `conference=${conferenceNameForRejoin} attempt=${entry.count}`,
+    );
+    setMessage(`Recuperando la llamada ${parentSid}...`);
+
+    const result = await voiceEngine.joinConference({
+      conferenceName: conferenceNameForRejoin,
+      parentCallSid: parentSid,
+    });
+
+    if (result.ok) {
+      await voiceEngine.setMuted(parentSid, false);
+      logClientEvent('rejoin_success', parentSid, `conference=${conferenceNameForRejoin}`);
+      setMessage(`Llamada ${parentSid} recuperada.`);
+    } else {
+      logClientEvent('rejoin_failed', parentSid, result.error);
+      setMessage(`No se pudo recuperar la llamada ${parentSid}: ${result.error}`);
+    }
+  }, [applySnapshot, backendUrl, logClientEvent, resolveConferenceNameForParent, withJwtRetry]);
+
+  useEffect(() => {
+    attemptRejoinRef.current = (parentSid: string) => {
+      void attemptConferenceRejoin(parentSid).catch((err) => {
+        console.error(`[rejoin] attemptConferenceRejoin(${parentSid}) falló:`, err);
+      });
+    };
+  }, [attemptConferenceRejoin]);
+
+  useEffect(() => {
+    verifyCallEndedRef.current = (callSid, finalStatus, terminalSource) => {
+      void verifyCallEndedThenDisconnect(callSid, finalStatus, terminalSource).catch((err) => {
+        console.error(`[verify-disconnect] verificación de ${callSid} falló:`, err);
+      });
+    };
+  }, [verifyCallEndedThenDisconnect]);
+
+  // Tick de 5s mientras hay media enlazada: refresca la pista de silencio
+  // remoto, que se lee del engine en tiempo de render.
+  useEffect(() => {
+    if (voice.attachedCallSids.length === 0) return;
+    const interval = setInterval(() => {
+      setSilenceTick((tick) => (tick + 1) % 1024);
+    }, 5_000);
+    return () => clearInterval(interval);
+  }, [voice.attachedCallSids.length]);
 
   // Orders from the RDN web UI land here via SSE. This path is the SAME
   // primitive the local Accept button uses (voice.joinConference), but it
@@ -1037,6 +1349,23 @@ export default function App() {
         // Backend picked the browser dashboard — stay out of the way.
         return;
       }
+      // F3: nunca auto-conectar una saliente mientras hay una llamada con
+      // media ACEPTADA. device.connect() admite varias Calls simultáneas y
+      // ambas compartirían el micrófono del agente (hablaría a la vez con el
+      // cliente retenido y con el nuevo destino). No se marca el request
+      // como procesado: un reintento de RDN tras colgar sí se ejecutará.
+      const busyWithAcceptedCall = voice.attachedCallSids.some((sid) => voice.isCallAccepted(sid));
+      if (busyWithAcceptedCall) {
+        logClientEvent(
+          'outbound_request_ignored_busy',
+          callRecordId,
+          `destination=${destinationNumber}`,
+        );
+        setMessage(
+          `Llamada saliente a ${destinationNumber} ignorada: ya tienes una llamada activa. Reintenta al colgar.`,
+        );
+        return;
+      }
       const requestKey = callRecordId || event.id;
       if (!processedOutboundRequestsRef.current.has(requestKey)) {
         processedOutboundRequestsRef.current.add(requestKey);
@@ -1133,15 +1462,27 @@ export default function App() {
         ? event.payload.status
         : (typeof event.payload?.final_status === 'string' ? event.payload.final_status : null);
       const domainEvent = event.domain_event ?? null;
+      const accepted = voice.isCallAccepted(callSid);
+      const attached = voice.isCallAttached(callSid);
+      const hangupRequested = hangupInFlightRef.current.has(callSid);
       console.warn(
-        `[call_ended] sid=${callSid} domain_event=${domainEvent} final_status=${finalStatus ?? '-'} terminal_source=${terminalSource ?? '-'} accepted=${voice.isCallAccepted(callSid)}`,
+        `[call_ended] sid=${callSid} domain_event=${domainEvent} final_status=${finalStatus ?? '-'} terminal_source=${terminalSource ?? '-'} accepted=${accepted} attached=${attached} hangup_in_flight=${hangupRequested}`,
       );
 
-      // Engine is keyed by parent SID — one disconnect covers the local leg.
-      void voice.disconnectCall(callSid);
-      if (acceptInFlightRef.current.delete(callSid)) bumpInFlightVersion();
-      if (hangupInFlightRef.current.delete(callSid)) bumpInFlightVersion();
-      setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
+      if (accepted && attached && !hangupRequested) {
+        // Llamada con audio fluyendo y sin hangup local en curso: verificar
+        // contra el backend antes de tirar la media. Un disconnect en falso
+        // aquí mata la sala entera (endConferenceOnExit en la leg del
+        // agente) — es la cadena de muerte de los cortes "fantasma".
+        void verifyCallEndedThenDisconnect(callSid, finalStatus, terminalSource);
+      } else {
+        // Sin media viva (ringing, ya colgada, o el propio agente pidió
+        // colgar): teardown inmediato como siempre.
+        void voice.disconnectCall(callSid);
+        if (acceptInFlightRef.current.delete(callSid)) bumpInFlightVersion();
+        if (hangupInFlightRef.current.delete(callSid)) bumpInFlightVersion();
+        setCalls((prev) => prev.filter((call) => call.callSid !== callSid));
+      }
     }
 
     const refreshEvents = new Set([
@@ -1162,8 +1503,10 @@ export default function App() {
     applySnapshot,
     bumpInFlightVersion,
     executeRemoteAccept,
+    logClientEvent,
     refreshAgentSnapshot,
     stopIncomingRingtone,
+    verifyCallEndedThenDisconnect,
     voice,
   ]);
 
@@ -1648,6 +1991,24 @@ export default function App() {
     withJwtRetry,
   ]);
 
+  // Rellamada de un clic (F2). Si falla, se restaura la oferta para poder
+  // reintentar; si abre llamada, handleVoiceCallStarted ya la limpia.
+  const executeRedial = useCallback(async () => {
+    const offer = redialOffer;
+    if (!offer) return;
+    setRedialOffer(null);
+    setMessage(`Rellamando a ${offer.destination}...`);
+    logClientEvent('redial_attempt', null, `destination=${offer.destination}`);
+    const result = await voice.connectOutbound({
+      destination: offer.destination,
+      callerId: offer.callerId,
+    });
+    if (!result.ok) {
+      setMessage(`No se pudo rellamar a ${offer.destination}: ${result.error}`);
+      setRedialOffer(offer);
+    }
+  }, [logClientEvent, redialOffer, voice]);
+
   useEffect(() => () => {
     authSubscriptionRef.current?.unsubscribe();
     authSubscriptionRef.current = null;
@@ -1870,6 +2231,17 @@ export default function App() {
                       <p className="muted">
                         Motor local: {attached ? 'media enlazada' : 'sin media local enlazada'}
                       </p>
+                      {(() => {
+                        if (call.phase !== 'connected') return null;
+                        const remoteSilenceMs = voice.getRemoteSilenceMsAgo(call.callSid);
+                        if (remoteSilenceMs === null || remoteSilenceMs < 15_000) return null;
+                        return (
+                          <p className="muted">
+                            Sin audio del interlocutor desde hace {Math.round(remoteSilenceMs / 1000)}s
+                            {' '}(posible espera remota o línea muda).
+                          </p>
+                        );
+                      })()}
                       {!attached && call.phase === 'ringing' && (
                         <p className="muted">
                           Aceptar abrira la conferencia y enlazara la media local.
@@ -1912,6 +2284,21 @@ export default function App() {
                 );
               })}
             </section>
+
+            {redialOffer && (
+              <section className="card grid">
+                <h2>Rellamada</h2>
+                <p className="muted">
+                  La otra parte colgó la llamada con {redialOffer.destination}.
+                </p>
+                <div className="actions">
+                  <button onClick={() => void executeRedial()}>
+                    Rellamar a {redialOffer.destination}
+                  </button>
+                  <button onClick={() => setRedialOffer(null)}>Descartar</button>
+                </div>
+              </section>
+            )}
           </>
         )}
 

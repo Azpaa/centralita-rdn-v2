@@ -21,12 +21,26 @@ import type { VoiceDeviceStatus } from './types';
 const TOKEN_REFRESH_INTERVAL_MS = 5 * 60_000; // 5 minutes
 const HEALTH_CHECK_INTERVAL_MS = 20_000;
 const DEVICE_ERROR_RETRY_DELAY_MS = 1_500;
+// Tolerancia a cortes de SEÑALIZACIÓN durante una llamada activa. Sin esto,
+// cualquier blip del websocket de Twilio (WiFi roaming, suspensión breve,
+// WebView2 throttled en segundo plano — frecuente durante esperas largas)
+// mata la Call al instante; con endConferenceOnExit:true en la leg del
+// agente eso tira la sala entera y el interlocutor queda colgado. Con la
+// ventana activa, el SDK reintenta y emite 'reconnecting'/'reconnected'.
+const MAX_CALL_SIGNALING_TIMEOUT_MS = 30_000;
 // How long we wait for Twilio to assign a CallSid to a freshly connected
 // outbound Call. If it still isn't available after this window we tear the
 // call down instead of falling back to a synthetic SID (the synthetic SID
 // masked real failures and left orphaned media legs alive).
 const CALL_SID_RESOLUTION_TIMEOUT_MS = 3_500;
 const CALL_SID_POLL_INTERVAL_MS = 50;
+// Detección de silencio remoto (F4): el SDK emite un 'sample' por segundo
+// con audioOutputLevel (0-32767 ≈ -100..-30 dB). Por debajo del umbral lo
+// tratamos como "el interlocutor no envía audio" — típico de holds remotos
+// sin música (sendonly) o líneas muertas. Es una PISTA para el operador,
+// nunca un disparador de cuelgues.
+const REMOTE_AUDIO_LEVEL_THRESHOLD = 500;
+const REMOTE_SILENCE_NOTIFY_MS = 60_000;
 
 type VoiceActionResult = ApiResult<{
   call_sid: string;
@@ -46,15 +60,47 @@ type ManagedCall = {
   muted: boolean;
   direction: 'inbound' | 'outbound';
   destination: string | null;
+  // CallerId usado al originar (solo salientes). Lo conservamos para poder
+  // ofrecer "rellamar" con los mismos parámetros cuando el remoto cuelga.
+  callerId: string | null;
   // True once the Twilio Call fired its 'accept' event (i.e. media is flowing).
   // Lets the UI show an accurate 'accepting' → 'connected' transition.
   accepted: boolean;
+  // True while the SDK is trying to recover media/signaling for this Call
+  // ('reconnecting' fired, 'reconnected' pending). The UI can surface it and
+  // watchdogs must NOT treat the call as dead during this window.
+  reconnecting: boolean;
+  // Última vez (wall clock) que el sample del SDK mostró audio remoto por
+  // encima del umbral. Inicializado al attach para no marcar silencio antes
+  // de que llegue el primer sample.
+  lastRemoteAudioAt: number;
+  // Para emitir el aviso de silencio prolongado UNA vez por episodio.
+  remoteSilenceNotified: boolean;
   // Wall-clock of when we wired the Call into the engine. Used by the App
   // to suppress the snapshot-orphan reaper during the window where backend
   // hasn't yet stamped `answered_by_user_id` on the call_record (Tauri's
   // device.connect path bypasses /agent-connect, so the stamp happens via
   // /accept/confirm which is a separate roundtrip).
   attachedAt: number;
+};
+
+export type CallQualityEventKind =
+  | 'reconnecting'
+  | 'reconnected'
+  | 'warning'
+  | 'warning-cleared'
+  | 'call_error'
+  | 'call_disconnect'
+  | 'device_error';
+
+// Contexto que acompaña a onCallEnded: el App decide si intentar el rejoin
+// automático (entrantes aceptadas que terminan sin petición local) o si
+// ofrecer rellamada (salientes cuyo remoto colgó).
+export type CallEndedInfo = {
+  direction: 'inbound' | 'outbound';
+  accepted: boolean;
+  destination: string | null;
+  callerId: string | null;
 };
 
 type UseVoiceEngineParams = {
@@ -64,9 +110,13 @@ type UseVoiceEngineParams = {
   // The engine hides the local media-leg SID as an internal detail.
   onCallStarted?: (parentSid: string, direction: 'inbound' | 'outbound', destination: string | null) => void;
   onCallAccepted?: (parentSid: string) => void;
-  onCallEnded?: (parentSid: string) => void;
+  onCallEnded?: (parentSid: string, info?: CallEndedInfo) => void;
   onCallMutedChanged?: (parentSid: string, muted: boolean) => void;
   onInfo?: (message: string) => void;
+  // Telemetría de salud de la llamada/device (reconexiones, warnings de red,
+  // errores). parentSid puede ser '' para eventos a nivel de Device. El App
+  // los reenvía al backend (client-logs) para diagnóstico de cortes.
+  onCallQualityEvent?: (parentSid: string, kind: CallQualityEventKind, detail: string) => void;
 };
 
 type UseVoiceEngineResult = {
@@ -94,6 +144,14 @@ type UseVoiceEngineResult = {
   setMuted: (parentSid: string, muted: boolean) => Promise<VoiceActionResult>;
   isCallAttached: (parentSid: string) => boolean;
   isCallAccepted: (parentSid: string) => boolean;
+  // True mientras el SDK intenta recuperar la conexión de esta Call
+  // (ventana maxCallSignalingTimeoutMs). Los watchdogs no deben matar
+  // llamadas en este estado.
+  isCallReconnecting: (parentSid: string) => boolean;
+  // Milisegundos desde el último audio remoto audible, o null si la llamada
+  // no está enlazada/aceptada. Pista de "espera remota / línea muda" para
+  // la UI; nunca debe usarse para colgar automáticamente.
+  getRemoteSilenceMsAgo: (parentSid: string) => number | null;
   // Returns how many milliseconds ago the call was wired into the engine,
   // or null if the call isn't attached. Used to guard the orphan-cleanup
   // pass in applySnapshot from killing calls that backend hasn't yet
@@ -141,6 +199,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     onCallEnded,
     onCallMutedChanged,
     onInfo,
+    onCallQualityEvent,
   } = params;
 
   const [deviceStatus, setDeviceStatus] = useState<VoiceDeviceStatus>('disconnected');
@@ -165,6 +224,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
   const onCallEndedRef = useRef(onCallEnded);
   const onCallMutedChangedRef = useRef(onCallMutedChanged);
   const onInfoRef = useRef(onInfo);
+  const onCallQualityEventRef = useRef(onCallQualityEvent);
   const deviceStatusRef = useRef<VoiceDeviceStatus>('disconnected');
 
   useEffect(() => {
@@ -178,7 +238,8 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     onCallEndedRef.current = onCallEnded;
     onCallMutedChangedRef.current = onCallMutedChanged;
     onInfoRef.current = onInfo;
-  }, [onCallStarted, onCallAccepted, onCallEnded, onCallMutedChanged, onInfo]);
+    onCallQualityEventRef.current = onCallQualityEvent;
+  }, [onCallStarted, onCallAccepted, onCallEnded, onCallMutedChanged, onInfo, onCallQualityEvent]);
 
   useEffect(() => {
     deviceStatusRef.current = deviceStatus;
@@ -201,10 +262,16 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
   }, []);
 
   const removeManagedCall = useCallback((parentSid: string) => {
-    if (!callsRef.current.has(parentSid)) return;
+    const managed = callsRef.current.get(parentSid);
+    if (!managed) return;
     callsRef.current.delete(parentSid);
     syncAttachedCallSids();
-    onCallEndedRef.current?.(parentSid);
+    onCallEndedRef.current?.(parentSid, {
+      direction: managed.direction,
+      accepted: managed.accepted,
+      destination: managed.destination,
+      callerId: managed.callerId,
+    });
   }, [syncAttachedCallSids]);
 
   const wireCallLifecycle = useCallback((
@@ -213,6 +280,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     localSid: string,
     direction: 'inbound' | 'outbound',
     destination: string | null,
+    callerId: string | null = null,
   ) => {
     callsRef.current.set(parentSid, {
       call,
@@ -221,7 +289,11 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       muted: false,
       direction,
       destination,
+      callerId,
       accepted: false,
+      reconnecting: false,
+      lastRemoteAudioAt: Date.now(),
+      remoteSilenceNotified: false,
       attachedAt: Date.now(),
     });
     syncAttachedCallSids();
@@ -233,6 +305,10 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     });
 
     call.on('disconnect', () => {
+      // Telemetría: distinguir un disconnect del SDK (red/Twilio cerró la
+      // media) de un teardown ordenado por la app es clave para diagnosticar
+      // "se cortó sola durante la espera".
+      onCallQualityEventRef.current?.(parentSid, 'call_disconnect', 'sdk_disconnect');
       removeManagedCall(parentSid);
     });
 
@@ -244,11 +320,77 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       removeManagedCall(parentSid);
     });
 
-    call.on('error', (err: { message?: string }) => {
+    call.on('error', (err: { code?: number; message?: string }) => {
       const message = err.message || 'Error en llamada de voz';
       setLastError(message);
       onInfoRef.current?.(`Error de llamada ${parentSid}: ${message}`);
+      onCallQualityEventRef.current?.(
+        parentSid,
+        'call_error',
+        `${err.code ?? 'sin_codigo'}: ${message}`,
+      );
       removeManagedCall(parentSid);
+    });
+
+    // Eventos de reconexión: con maxCallSignalingTimeoutMs activo, el SDK
+    // intenta recuperar la llamada tras un corte de señalización en vez de
+    // matarla. Mientras dura la ventana NO se debe tratar la Call como
+    // muerta. Algunos nombres de evento no están en la unión pública de
+    // tipos del SDK (varía entre versiones), de ahí el cast.
+    const dynamicCall = call as unknown as {
+      on: (event: string, handler: (...args: unknown[]) => void) => void;
+    };
+
+    dynamicCall.on('reconnecting', (twilioError) => {
+      const managed = callsRef.current.get(parentSid);
+      if (managed) managed.reconnecting = true;
+      const detail = (twilioError as { message?: string } | undefined)?.message || 'media_o_señalizacion_perdida';
+      onInfoRef.current?.(`Reconectando llamada ${parentSid}: ${detail}`);
+      onCallQualityEventRef.current?.(parentSid, 'reconnecting', detail);
+    });
+
+    dynamicCall.on('reconnected', () => {
+      const managed = callsRef.current.get(parentSid);
+      if (managed) managed.reconnecting = false;
+      onInfoRef.current?.(`Llamada ${parentSid} reconectada.`);
+      onCallQualityEventRef.current?.(parentSid, 'reconnected', 'recovered');
+    });
+
+    dynamicCall.on('warning', (warningName) => {
+      onCallQualityEventRef.current?.(parentSid, 'warning', String(warningName));
+    });
+
+    dynamicCall.on('warning-cleared', (warningName) => {
+      onCallQualityEventRef.current?.(parentSid, 'warning-cleared', String(warningName));
+    });
+
+    // Muestras de calidad (1/s): seguimos el nivel de audio REMOTO para
+    // poder mostrar al operador "el interlocutor no envía audio" (pista de
+    // espera remota sin música o línea muerta). Solo telemetría/UI.
+    dynamicCall.on('sample', (sample) => {
+      const managed = callsRef.current.get(parentSid);
+      if (!managed) return;
+      const level = (sample as { audioOutputLevel?: unknown } | undefined)?.audioOutputLevel;
+      if (typeof level !== 'number') return;
+
+      if (level >= REMOTE_AUDIO_LEVEL_THRESHOLD) {
+        managed.lastRemoteAudioAt = Date.now();
+        if (managed.remoteSilenceNotified) {
+          managed.remoteSilenceNotified = false;
+          onCallQualityEventRef.current?.(parentSid, 'warning-cleared', 'remote_audio_resumed');
+        }
+        return;
+      }
+
+      const silentForMs = Date.now() - managed.lastRemoteAudioAt;
+      if (!managed.remoteSilenceNotified && silentForMs >= REMOTE_SILENCE_NOTIFY_MS) {
+        managed.remoteSilenceNotified = true;
+        onCallQualityEventRef.current?.(
+          parentSid,
+          'warning',
+          `remote_audio_silent_${Math.round(silentForMs / 1000)}s`,
+        );
+      }
     });
   }, [removeManagedCall, syncAttachedCallSids]);
 
@@ -372,6 +514,10 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         logLevel: 1,
         codecPreferences: [Call.Codec.Opus, Call.Codec.PCMU],
         closeProtection: true,
+        // Ventana de gracia para reconectar la señalización de Calls activas
+        // tras un corte (ver comentario en la constante). Sin esto el SDK
+        // mata la Call al primer blip y la sala entera cae con ella.
+        maxCallSignalingTimeoutMs: MAX_CALL_SIGNALING_TIMEOUT_MS,
       });
 
       device.on('error', (err: { code?: number; message?: string }) => {
@@ -380,6 +526,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         setLastError(message);
         setProblem('degraded', `Error de softphone ${code}: ${message}`);
         onInfoRef.current?.(`Error de softphone ${code}: ${message}`);
+        onCallQualityEventRef.current?.('', 'device_error', `${code}: ${message}`);
         setTimeout(() => {
           if (!enabledRef.current || initInFlightRef.current) return;
           void ensureDevice('device_error_retry');
@@ -543,7 +690,7 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
         return { ok: false, error: message };
       }
 
-      wireCallLifecycle(call, realSid, realSid, 'outbound', connectParams.destination);
+      wireCallLifecycle(call, realSid, realSid, 'outbound', connectParams.destination, connectParams.callerId);
       onCallStartedRef.current?.(realSid, 'outbound', connectParams.destination);
 
       return { ok: true, data: { call_sid: realSid } };
@@ -645,6 +792,16 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     return callsRef.current.get(parentSid)?.accepted === true;
   }, []);
 
+  const isCallReconnecting = useCallback((parentSid: string) => {
+    return callsRef.current.get(parentSid)?.reconnecting === true;
+  }, []);
+
+  const getRemoteSilenceMsAgo = useCallback((parentSid: string) => {
+    const managed = callsRef.current.get(parentSid);
+    if (!managed || !managed.accepted) return null;
+    return Date.now() - managed.lastRemoteAudioAt;
+  }, []);
+
   const getCallAttachedMsAgo = useCallback((parentSid: string) => {
     const managed = callsRef.current.get(parentSid);
     if (!managed) return null;
@@ -698,6 +855,8 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     setMuted,
     isCallAttached,
     isCallAccepted,
+    isCallReconnecting,
+    getRemoteSilenceMsAgo,
     getCallAttachedMsAgo,
     reconnectNow,
   }), [
@@ -707,9 +866,11 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
     deviceStatus,
     disconnectCall,
     getCallAttachedMsAgo,
+    getRemoteSilenceMsAgo,
     identity,
     isCallAccepted,
     isCallAttached,
+    isCallReconnecting,
     joinConference,
     lastError,
     reconnectNow,

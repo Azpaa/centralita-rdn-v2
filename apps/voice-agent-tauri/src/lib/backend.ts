@@ -105,6 +105,32 @@ export async function callCommand(
   });
 }
 
+export type ClientLogEvent = {
+  kind: string;
+  call_sid?: string;
+  detail?: string;
+  at?: string;
+};
+
+/**
+ * Telemetría del softphone hacia el backend (audit_logs). Best-effort:
+ * el caller decide si ignora el resultado. Sirve para reconstruir
+ * incidentes ("se cortó en espera") sin acceso a la consola del agente.
+ */
+export async function sendClientLog(
+  baseUrl: string,
+  jwt: string,
+  events: ClientLogEvent[],
+): Promise<ApiResult<Record<string, unknown>>> {
+  return requestJson<Record<string, unknown>>(`${baseUrl}/api/v1/client-logs`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+    },
+    body: JSON.stringify({ events }),
+  });
+}
+
 export async function updateUserAvailability(
   baseUrl: string,
   jwt: string,
