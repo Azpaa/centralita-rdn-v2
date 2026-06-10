@@ -1,14 +1,14 @@
 {
   "app_id": "com.rdn.voiceagent",
-  "version": "0.1.20",
-  "released_at": "2026-04-23T22:12:05.802Z",
-  "notes": "Release 0.1.20",
+  "version": "0.1.22",
+  "released_at": "2026-06-10T09:40:33.527Z",
+  "notes": "Robustez ante hold remoto: rejoin automatico tras cortes, verify-before-disconnect, rellamada de un clic, telemetria del SDK y aviso de silencio remoto.",
   "assets": [
     {
       "platform": "windows",
       "arch": "x64",
-      "file_name": "RDN Voice Agent_0.1.20_x64-setup.exe",
-      "url": "/downloads/voice-agent/v0.1.20/RDN Voice Agent_0.1.20_x64-setup.exe"
+      "file_name": "RDN Voice Agent_0.1.22_x64-setup.exe",
+      "url": "/downloads/voice-agent/v0.1.22/RDN Voice Agent_0.1.22_x64-setup.exe"
     }
   ]
 }
