@@ -11,6 +11,7 @@ import {
   handleAgentLegLeftRoom,
   sweepRoomWatchdog,
 } from '@/lib/calls/room-watchdog';
+import { scheduleRingWave } from '@/lib/calls/ring-wave';
 import type { CallRecord, CallStatus } from '@/lib/types/database';
 
 // Terminal states: once dial-action sets one of these, do not overwrite.
@@ -487,6 +488,15 @@ export async function POST(req: NextRequest) {
             `[STATUS] ring_all attempt ${attemptIdHint} aún tiene legs vivas para parent=${routedParentCallSid}; sin avance.`
           );
         } else {
+          // HOTFIX PRO: el avance original redirigía al llamante a
+          // queue-retry. Como las legs REST a client: fallan en ~2s (el
+          // Tauri no registra Device; acepta por SSE), eso expulsaba al
+          // llamante de la sala cada ~5s en bucle ("le estamos
+          // transfiriendo" sin parar, accepts a salas vacías, RDN
+          // enloquecido). Ahora el llamante NO SE MUEVE: se consume el
+          // intento y se programa una ola de ring en sitio con cadencia
+          // mínima (ring-wave.ts). El único redirect legítimo lo hace la
+          // propia ola al superar max_wait con acción terminal.
           const consumedTwilioData = {
             ...parentTwilioData,
             current_round_robin_attempt_id: null,
@@ -504,27 +514,24 @@ export async function POST(req: NextRequest) {
             })
             .eq('twilio_call_sid', routedParentCallSid)
             .is('answered_by_user_id', null)
+            .is('ended_at', null)
+            .in('status', ['ringing', 'in_queue'] as CallStatus[])
             .filter('twilio_data->>current_round_robin_attempt_id', 'eq', attemptIdHint)
             .select('twilio_call_sid')
             .maybeSingle();
 
           if (consumeResult?.twilio_call_sid) {
-            try {
-              await getTwilioClient().calls(routedParentCallSid).update({
-                url: `${baseUrl}/api/webhooks/twilio/voice/queue-retry`,
-                method: 'POST',
-              });
-              console.log(
-                `[STATUS] ring_all advance: todas las legs del intento ${attemptIdHint} terminaron sin respuesta — parent=${routedParentCallSid} → queue-retry`
-              );
-              return new NextResponse('OK', { status: 200 });
-            } catch (advanceErr) {
-              console.error(
-                `[STATUS] ring_all advance falló para ${routedParentCallSid}: ${
-                  advanceErr instanceof Error ? advanceErr.message : 'unknown_error'
-                }`
-              );
-            }
+            const attemptStartedAt = typeof parentTwilioData.current_round_robin_attempt_started_at === 'string'
+              ? parentTwilioData.current_round_robin_attempt_started_at
+              : null;
+            // 25s ≈ ring_timeout típico; scheduleRingWave aplica además un
+            // suelo de 15s, así que una desviación aquí solo afecta a la
+            // cadencia, nunca produce bucles rápidos.
+            scheduleRingWave(routedParentCallSid, attemptStartedAt, 25);
+            console.log(
+              `[STATUS] ring_all advance: intento ${attemptIdHint} agotado sin respuesta — ola en sitio programada para ${routedParentCallSid} (el llamante no sale de la sala).`
+            );
+            return new NextResponse('OK', { status: 200 });
           }
         }
       }

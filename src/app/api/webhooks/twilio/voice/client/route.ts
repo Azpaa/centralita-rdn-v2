@@ -166,17 +166,49 @@ export async function POST(req: NextRequest) {
             if (existingAgentLeg && callSid && existingAgentLeg !== callSid) {
               try {
                 const { getTwilioClient } = await import('@/lib/twilio/client');
-                const liveLeg = await getTwilioClient().calls(existingAgentLeg).fetch();
+                const guardClient = getTwilioClient();
+                const liveLeg = await guardClient.calls(existingAgentLeg).fetch();
                 if ((liveLeg.status || '').toLowerCase() === 'in-progress') {
+                  // Solo es un duplicado real si la leg previa está EN la
+                  // sala de esta llamada. Si está viva pero fuera (zombi de
+                  // un intento anterior), se cuelga el zombi y se permite
+                  // el join — rechazar convertía el "Aceptar" en un cuelgue
+                  // instantáneo mientras el zombi seguía sonando en Tauri.
+                  let previousLegInRoom = false;
+                  try {
+                    const confs = await guardClient.conferences.list({
+                      friendlyName: conferenceRoom,
+                      status: 'in-progress',
+                      limit: 1,
+                    });
+                    if (confs.length > 0) {
+                      const participants = await guardClient.conferences(confs[0].sid).participants.list();
+                      previousLegInRoom = participants.some((p) => p.callSid === existingAgentLeg);
+                    }
+                  } catch {
+                    // Sala no inspeccionable → tratar como zombi y permitir.
+                  }
+
+                  if (previousLegInRoom) {
+                    console.warn(
+                      `[CLIENT-VOICE][GUARD] Leg duplicada ${callSid} — la llamada ya está atendida en sala por ${existingAgentLeg}. Rechazando segundo join.`
+                    );
+                    twiml.say(
+                      { language: 'es-ES', voice: 'Polly.Conchita' },
+                      'Esta llamada ya está siendo atendida.'
+                    );
+                    twiml.hangup();
+                    return twimlResponse(twiml);
+                  }
+
                   console.warn(
-                    `[CLIENT-VOICE][GUARD] Leg duplicada ${callSid} — la llamada ya está atendida por ${existingAgentLeg} (viva). Rechazando segundo join.`
+                    `[CLIENT-VOICE][GUARD] Leg previa ${existingAgentLeg} viva pero FUERA de ${conferenceRoom} — zombi: se cuelga y se permite el join ${callSid}.`
                   );
-                  twiml.say(
-                    { language: 'es-ES', voice: 'Polly.Conchita' },
-                    'Esta llamada ya está siendo atendida.'
-                  );
-                  twiml.hangup();
-                  return twimlResponse(twiml);
+                  try {
+                    await guardClient.calls(existingAgentLeg).update({ status: 'completed' });
+                  } catch {
+                    // best-effort
+                  }
                 }
               } catch {
                 // Leg anterior muerta o API inaccesible → permitir el join

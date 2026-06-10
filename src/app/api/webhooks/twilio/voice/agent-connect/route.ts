@@ -84,19 +84,57 @@ export async function POST(req: NextRequest) {
           // rechazamos esta segunda leg si la primera sigue VIVA — si murió
           // (blip de red, leg colgada), dejar pasar permite re-contestar.
           try {
-            const liveLeg = await getTwilioClient().calls(existingAgentLeg).fetch();
+            const twilioGuardClient = getTwilioClient();
+            const liveLeg = await twilioGuardClient.calls(existingAgentLeg).fetch();
             const liveLegStatus = (liveLeg.status || '').toLowerCase();
             if (liveLegStatus === 'in-progress') {
+              // ¿Esa leg está DE VERDAD atendiendo esta llamada (presente
+              // en la sala)? Si sí → duplicado real (buzón de voz, segunda
+              // contestación): rechazar. Si no → es una leg ZOMBI de un
+              // intento anterior (agente solo en una sala vieja): se cuelga
+              // el zombi y se permite la contestación nueva. Rechazar en
+              // ese caso era lo que convertía "aceptar la llamada" en un
+              // cuelgue inmediato en producción.
+              const guardConfName = typeof guardData.conference_name === 'string' && guardData.conference_name.length > 0
+                ? guardData.conference_name
+                : `call-${parentCallSid}`;
+              let previousLegInRoom = false;
+              try {
+                const confs = await twilioGuardClient.conferences.list({
+                  friendlyName: guardConfName,
+                  status: 'in-progress',
+                  limit: 1,
+                });
+                if (confs.length > 0) {
+                  const participants = await twilioGuardClient.conferences(confs[0].sid).participants.list();
+                  previousLegInRoom = participants.some((p) => p.callSid === existingAgentLeg);
+                }
+              } catch {
+                // Si no podemos inspeccionar la sala, tratamos la leg previa
+                // como zombi: mejor dejar pasar una contestación legítima.
+              }
+
+              if (previousLegInRoom) {
+                console.warn(
+                  `[AGENT-CONNECT][GUARD] Leg duplicada ${agentCallSid} (operator=${operatorId || '-'}) — la llamada ya está atendida en sala por ${existingAgentLeg}. Probable buzón de voz o segunda contestación.`
+                );
+                const guardTwiml = new twilio.twiml.VoiceResponse();
+                guardTwiml.say(
+                  { language: 'es-ES', voice: 'Polly.Conchita' },
+                  'Esta llamada ya está siendo atendida.'
+                );
+                guardTwiml.hangup();
+                return twimlResponse(guardTwiml);
+              }
+
               console.warn(
-                `[AGENT-CONNECT][GUARD] Leg duplicada ${agentCallSid} (operator=${operatorId || '-'}) — la llamada ya está atendida por la leg ${existingAgentLeg} (viva). Probable buzón de voz o segunda contestación.`
+                `[AGENT-CONNECT][GUARD] Leg previa ${existingAgentLeg} viva pero FUERA de la sala ${guardConfName} — zombi de un intento anterior: se cuelga y se permite la nueva contestación ${agentCallSid}.`
               );
-              const guardTwiml = new twilio.twiml.VoiceResponse();
-              guardTwiml.say(
-                { language: 'es-ES', voice: 'Polly.Conchita' },
-                'Esta llamada ya está siendo atendida.'
-              );
-              guardTwiml.hangup();
-              return twimlResponse(guardTwiml);
+              try {
+                await twilioGuardClient.calls(existingAgentLeg).update({ status: 'completed' });
+              } catch {
+                // best-effort
+              }
             }
           } catch {
             // Leg anterior desaparecida o API inaccesible: preferimos conectar
