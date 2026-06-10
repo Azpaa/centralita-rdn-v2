@@ -200,6 +200,11 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
               status: mapTerminalStatus(liveStatus),
               ended_at: endedAt,
               duration: safeDuration,
+              twilio_data: {
+                ...(call.twilio_data ?? {}),
+                terminal_source: (call.twilio_data?.terminal_source as string | undefined) ?? 'busy_check_reconcile',
+                terminal_source_at: new Date().toISOString(),
+              },
             })
             .eq('twilio_call_sid', callSid)
             .eq('status', 'in_progress')
@@ -224,6 +229,11 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
             .update({
               status: 'canceled',
               ended_at: endedAt,
+              twilio_data: {
+                ...(call.twilio_data ?? {}),
+                terminal_source: (call.twilio_data?.terminal_source as string | undefined) ?? 'busy_check_reconcile_404',
+                terminal_source_at: new Date().toISOString(),
+              },
             })
             .eq('twilio_call_sid', callSid)
             .eq('status', 'in_progress')
@@ -526,6 +536,11 @@ export async function updateCallStatus(
     duration?: number;
     waitTime?: number;
     answeredByUserId?: string;
+    // Origen del cierre cuando `status` es terminal. Se persiste en
+    // twilio_data.terminal_source (solo el PRIMER escritor gana) para poder
+    // responder "¿quién/por qué cerró esta llamada?" en producción — clave
+    // para diagnosticar cortes durante hold remoto y falsos terminales.
+    terminalSource?: string;
   }
 ): Promise<void> {
   const supabase = createAdminClient();
@@ -589,20 +604,37 @@ export async function updateCallStatus(
     ? (existing.twilio_data as Record<string, unknown>)
     : null;
 
-  if (incomingIsTerminal && existingTwilioData) {
-    const currentRingTargets = Array.isArray(existingTwilioData.current_ring_target_user_ids)
-      ? (existingTwilioData.current_ring_target_user_ids as unknown[])
+  if (incomingIsTerminal) {
+    const baseData = existingTwilioData ?? {};
+    let nextData: Record<string, unknown> | null = null;
+
+    const currentRingTargets = Array.isArray(baseData.current_ring_target_user_ids)
+      ? (baseData.current_ring_target_user_ids as unknown[])
       : null;
 
     if (currentRingTargets && currentRingTargets.length > 0) {
-      updateData.twilio_data = {
-        ...existingTwilioData,
+      nextData = {
+        ...baseData,
         current_ring_target_user_ids: [],
         current_round_robin_attempt_id: null,
         ring_cleared_at: new Date().toISOString(),
         ring_cleared_reason: `terminal_status_${updates.status}`,
       };
     }
+
+    // Firma del primer escritor terminal. Los refinamientos
+    // terminal→terminal posteriores (p. ej. status webhook después de
+    // dial-action) NO la sobrescriben: para diagnosticar importa quién
+    // mató la llamada primero.
+    if (updates.terminalSource && typeof baseData.terminal_source !== 'string') {
+      nextData = {
+        ...(nextData ?? baseData),
+        terminal_source: updates.terminalSource,
+        terminal_source_at: new Date().toISOString(),
+      };
+    }
+
+    if (nextData) updateData.twilio_data = nextData;
   }
 
   const { error } = await supabase

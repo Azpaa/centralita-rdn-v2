@@ -60,6 +60,9 @@ async function closePreDialRow(
     superseded_by_new_dial_at: endedAt,
     superseded_by_new_dial_destination: destination,
     pre_dial_reconcile_reason: options.reason,
+    ...(typeof row.twilio_data?.terminal_source === 'string'
+      ? {}
+      : { terminal_source: options.reason, terminal_source_at: endedAt }),
   };
 
   type UpdatePayload = {
@@ -401,6 +404,17 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      // preserved > 0 ⇒ el agente tiene llamada(s) VIVAS verificadas contra
+      // Twilio. Emitimos igualmente (compatibilidad con RDN), pero avisamos:
+      // el softphone ignorará el outbound_connect_request mientras tenga
+      // media aceptada, así que este dial probablemente quede pendiente.
+      const agentBusy = preserved > 0;
+      if (agentBusy) {
+        console.warn(
+          `[DIAL] Agente ${resolvedAgent.id} ocupado (${preserved} llamada(s) viva(s)) — el softphone ignorará la auto-conexión hasta colgar.`
+        );
+      }
+
       let metadataJson = '';
       if (metadata) {
         try {
@@ -478,6 +492,7 @@ export async function POST(req: NextRequest) {
         attach_mode: 'device_connect',
         source: commandSource,
         preferred_executor: preferredExecutor,
+        agent_busy: agentBusy,
         agent: {
           id: resolvedAgent.id,
           rdn_user_id: resolvedAgent.rdn_user_id,

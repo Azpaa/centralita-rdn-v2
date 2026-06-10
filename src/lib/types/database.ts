@@ -224,6 +224,21 @@ export type AuditLog = {
   created_at: string;
 };
 
+export type ConferenceEventRow = {
+  id: string;
+  conference_sid: string | null;
+  friendly_name: string | null;
+  event: string;
+  participant_call_sid: string | null;
+  parent_call_sid: string | null;
+  is_agent_leg: boolean | null;
+  parent_status_at_event: string | null;
+  reason: string | null;
+  payload: Record<string, unknown>;
+  created_at: string;
+  expires_at: string;
+};
+
 // --- Database type para Supabase client ---
 
 export interface Database {
@@ -420,6 +435,23 @@ export interface Database {
           delivered_at?: string | null;
         };
         Update: Partial<Omit<ReconcileEventOutboxRow, 'id'>>;
+        Relationships: [];
+      };
+      conference_events: {
+        Row: ConferenceEventRow;
+        Insert: Omit<ConferenceEventRow, 'id' | 'created_at' | 'expires_at' | 'conference_sid' | 'friendly_name' | 'participant_call_sid' | 'parent_call_sid' | 'is_agent_leg' | 'parent_status_at_event' | 'reason'> & {
+          id?: string;
+          created_at?: string;
+          expires_at?: string;
+          conference_sid?: string | null;
+          friendly_name?: string | null;
+          participant_call_sid?: string | null;
+          parent_call_sid?: string | null;
+          is_agent_leg?: boolean | null;
+          parent_status_at_event?: string | null;
+          reason?: string | null;
+        };
+        Update: Partial<Omit<ConferenceEventRow, 'id'>>;
         Relationships: [];
       };
     };

@@ -31,6 +31,7 @@ export type AuditAction =
   | 'call.mute'
   | 'call.unmute'
   | 'call.conference'
+  | 'client.voice_event'
   | 'api_key.created'
   | 'api_key.deleted';
 

@@ -67,7 +67,12 @@ export async function POST(req: NextRequest) {
       console.log(
         `[DIAL-ACTION] Hold en curso para ${callSid} — aparcando la leg del agente en vez de colgar`
       );
-      twiml.pause({ length: 3600 });
+      // Aparcamiento renovable (antes: un único Pause de 3600s que al
+      // agotarse colgaba al agente y dejaba al cliente en bucle de música).
+      // hold-park re-verifica el estado del hold en cada vuelta y aplica el
+      // tope máximo de espera.
+      twiml.pause({ length: 240 });
+      twiml.redirect({ method: 'POST' }, `${baseUrl}/api/webhooks/twilio/voice/hold-park`);
       return twimlResponse(twiml);
     }
   }
@@ -94,6 +99,7 @@ export async function POST(req: NextRequest) {
       endedAt: endedAt.toISOString(),
       duration: dialDuration, // Duración REAL de conversación
       waitTime,
+      terminalSource: 'dial_action_completed',
     });
 
     // Emitir evento call.completed para RDN
@@ -109,6 +115,7 @@ export async function POST(req: NextRequest) {
       wait_time: waitTime ?? null,
       answered_at: answeredAt.toISOString(),
       ended_at: endedAt.toISOString(),
+      terminal_source: 'dial_action_completed',
     });
 
     twiml.hangup();
@@ -220,6 +227,7 @@ export async function POST(req: NextRequest) {
     status: statusMap[dialStatus] || 'no_answer',
     endedAt: new Date().toISOString(),
     duration: 0,
+    terminalSource: `dial_action_${dialStatus || 'unanswered'}`,
   });
 
   // Emitir evento call.missed para RDN (llamada no contestada)
@@ -231,6 +239,7 @@ export async function POST(req: NextRequest) {
       to: toNumber,
       final_status: statusMap[dialStatus] || 'no_answer',
       queue_id: queueId ?? null,
+      terminal_source: `dial_action_${dialStatus || 'unanswered'}`,
     });
   }
 

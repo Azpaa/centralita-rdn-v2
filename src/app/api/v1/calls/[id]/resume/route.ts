@@ -162,8 +162,17 @@ async function bridgeIntoConference(
     .conference(
       {
         startConferenceOnEnter: true,
+        // NOTA F1.4: aquí se CONSERVA endConferenceOnExit:true a propósito.
+        // En salientes el registro está clavado en la leg del agente
+        // (twilio_call_sid = leg del agente), así que el room-watchdog —
+        // que razona con "parent = llamante" — actuaría sobre la leg
+        // equivocada. Sin watchdog aplicable, quitar el flag dejaría al
+        // cliente en limbo si el softphone muere. Pendiente para la fase
+        // de robustez de salientes.
         endConferenceOnExit: true,
         beep: 'false',
+        statusCallbackEvent: ['join', 'leave', 'end'],
+        statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
       },
       confName,
     );
@@ -175,17 +184,34 @@ async function bridgeIntoConference(
       endConferenceOnExit: false,
       beep: 'false',
       waitUrl: holdUrl,
+      statusCallbackEvent: ['join', 'leave', 'end'],
+      statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
     },
     confName,
   );
 
-  // Movemos primero al agente (estaba aparcado/inactivo) y luego al cliente, de
-  // forma que la sala ya esté iniciada cuando el cliente entra.
-  await client.calls(agentSid).update({ twiml: agentTwiml.toString() });
+  // Orden de COMPENSACIÓN: primero el cliente (entra con
+  // startConferenceOnEnter:false, así que queda esperando con música — la
+  // misma experiencia que el hold), después el agente, que inicia la sala y
+  // abre el puente. Si la redirección del agente falla, el cliente sigue en
+  // espera y el estado de hold queda INTACTO, de modo que /resume puede
+  // reintentarse. (El orden antiguo movía primero al agente: si la segunda
+  // redirección fallaba, el agente quedaba solo en una sala vacía y el
+  // cliente atrapado en el bucle de música sin ningún estado que permitiera
+  // recuperarlo.)
   await client.calls(remoteSid).update({ twiml: remoteTwiml.toString() });
+  try {
+    await client.calls(agentSid).update({ twiml: agentTwiml.toString() });
+  } catch (agentErr) {
+    console.error(
+      `[RESUME] No se pudo mover la leg del agente ${agentSid} al puente ${confName} — el cliente sigue en espera y el hold queda intacto para reintentar:`,
+      agentErr,
+    );
+    throw agentErr;
+  }
 
   // Guardamos el nombre de la conferencia para que un futuro /hold la encuentre
-  // y use el hold nativo.
+  // y use el hold nativo. Solo tras puentear AMBAS legs con éxito.
   await mergeTwilioData(recSid, {
     hold: { held: false, at: new Date().toISOString() },
     hold_restructure: null,

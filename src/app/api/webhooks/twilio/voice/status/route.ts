@@ -6,6 +6,11 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { emitEvent } from '@/lib/events/emitter';
 import { claimTwilioWebhookEvent } from '@/lib/events/twilio-idempotency';
+import {
+  clearAgentLossMarker,
+  handleAgentLegLeftRoom,
+  sweepRoomWatchdog,
+} from '@/lib/calls/room-watchdog';
 import type { CallRecord, CallStatus } from '@/lib/types/database';
 
 // Terminal states: once dial-action sets one of these, do not overwrite.
@@ -174,12 +179,139 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // Conference status callbacks (join/leave/end) may hit this endpoint without CallStatus.
-  // They are informative for observability, but must not overwrite call_records status.
+  // Conference status callbacks (join/leave/end) hit this endpoint without
+  // CallStatus. They must never overwrite call_records status, but son la
+  // ÚNICA señal que tenemos sobre la membresía de la sala. Antes se
+  // descartaban, lo que nos dejaba ciegos ante (a) la leg del agente
+  // cayéndose sin hangup y (b) PBXs externas que aparcan la leg del
+  // llamante durante un hold remoto. Ahora se persisten en
+  // conference_events para diagnóstico y para el futuro watchdog de sala.
   if (!callStatus) {
-    console.log(
-      `[STATUS] Ignoring callback without CallStatus raw_call_sid=${rawCallSid || '-'} tracked_call_sid=${trackedCallSid || '-'}`
-    );
+    const conferenceEvent = (params.StatusCallbackEvent || '').trim();
+    if (!conferenceEvent) {
+      console.log(
+        `[STATUS] Ignoring callback without CallStatus raw_call_sid=${rawCallSid || '-'} tracked_call_sid=${trackedCallSid || '-'}`
+      );
+      return new NextResponse('OK', { status: 200 });
+    }
+
+    try {
+      const supabase = createAdminClient();
+      const friendlyName = (params.FriendlyName || '').trim() || null;
+
+      // call-<sid> (entrantes) y resume-<sid>-<ts> (re-puenteos tras hold)
+      // codifican el twilio_call_sid canónico en el nombre de la sala.
+      let parentFromName: string | null = null;
+      if (friendlyName?.startsWith('call-')) {
+        parentFromName = friendlyName.slice('call-'.length);
+      } else if (friendlyName?.startsWith('resume-')) {
+        const match = friendlyName.match(/^resume-(.+)-\d+$/);
+        parentFromName = match ? match[1] : null;
+      }
+
+      let isAgentLeg: boolean | null = null;
+      let parentStatus: string | null = null;
+      let parentEnded = false;
+      let parentHasAgentLossMarker = false;
+      if (parentFromName) {
+        const { data: parentRow } = await supabase
+          .from('call_records')
+          .select('status, ended_at, twilio_data')
+          .eq('twilio_call_sid', parentFromName)
+          .maybeSingle();
+
+        if (parentRow) {
+          parentStatus = (parentRow.status as string | null) ?? null;
+          parentEnded = Boolean(parentRow.ended_at);
+          const parentData = (
+            parentRow.twilio_data
+            && typeof parentRow.twilio_data === 'object'
+            && !Array.isArray(parentRow.twilio_data)
+          ) ? (parentRow.twilio_data as Record<string, unknown>) : {};
+          const agentLegSid = typeof parentData.agent_call_sid === 'string'
+            ? parentData.agent_call_sid
+            : null;
+          parentHasAgentLossMarker = typeof parentData.agent_left_room_at === 'string'
+            && parentData.agent_left_room_at.length > 0;
+
+          if (rawCallSid && agentLegSid && rawCallSid === agentLegSid) {
+            isAgentLeg = true;
+          } else if (rawCallSid && rawCallSid === parentFromName) {
+            isAgentLeg = false;
+          }
+        }
+      }
+
+      await supabase.from('conference_events').insert({
+        conference_sid: params.ConferenceSid || null,
+        friendly_name: friendlyName,
+        event: conferenceEvent,
+        participant_call_sid: rawCallSid || null,
+        parent_call_sid: parentFromName,
+        is_agent_leg: isAgentLeg,
+        parent_status_at_event: parentStatus,
+        reason: params.ReasonConferenceEnded || params.Reason || null,
+        payload: params,
+      });
+
+      // Señal precursora del bug "se corta en espera": una leg sale de la
+      // sala mientras el record sigue in_progress. Puede ser una carrera
+      // benigna con el teardown (el terminal llega segundos después), pero
+      // si aparece SIN terminal posterior es la pistola humeante: o la leg
+      // del agente murió (red/WebView2) o la PBX remota aparcó al llamante.
+      if (
+        conferenceEvent === 'participant-leave'
+        && parentStatus === 'in_progress'
+        && !parentEnded
+      ) {
+        const who = isAgentLeg === true ? 'agent' : isAgentLeg === false ? 'caller' : 'unknown';
+        console.warn(
+          `[CONFERENCE][ANOMALY] participant-leave con llamada in_progress conference=${friendlyName ?? '-'} leg=${who} participant=${rawCallSid || '-'} parent=${parentFromName ?? '-'} reason=${params.ReasonConferenceEnded || params.Reason || '-'}`
+        );
+
+        // La leg del AGENTE se fue con la llamada en curso → room-watchdog:
+        // gracia para el rejoin del softphone y, si no vuelve, re-encolar o
+        // cerrar ordenadamente. (Las legs de agente ya no llevan
+        // endConferenceOnExit, así que la sala sobrevive y alguien tiene
+        // que ocuparse del llamante.)
+        if (isAgentLeg === true && parentFromName && rawCallSid) {
+          void handleAgentLegLeftRoom({
+            parentCallSid: parentFromName,
+            agentLegSid: rawCallSid,
+            conferenceSid: params.ConferenceSid || null,
+            friendlyName,
+          }).catch((err) => {
+            console.error('[STATUS] handleAgentLegLeftRoom falló:', err);
+          });
+        }
+      }
+
+      // Reincorporación: cualquier participante no-llamante que entra a la
+      // sala con un marcador de pérdida pendiente lo desactiva (el caso
+      // típico es el rejoin automático del Tauri con una leg nueva).
+      if (
+        conferenceEvent === 'participant-join'
+        && parentFromName
+        && parentHasAgentLossMarker
+        && rawCallSid
+        && rawCallSid !== parentFromName
+      ) {
+        void clearAgentLossMarker(parentFromName, 'participant_join').catch(() => {});
+        console.log(
+          `[ROOM-WATCHDOG] Marcador de pérdida limpiado: ${rawCallSid} se unió a ${friendlyName ?? '-'} (parent=${parentFromName}).`
+        );
+      }
+
+      // Barrido oportunista (con debounce interno): red de seguridad para
+      // timers perdidos en un reinicio del proceso.
+      void sweepRoomWatchdog().catch(() => {});
+    } catch (confErr) {
+      console.warn(
+        `[STATUS] Failed persisting conference event raw_call_sid=${rawCallSid || '-'}:`,
+        confErr,
+      );
+    }
+
     return new NextResponse('OK', { status: 200 });
   }
 
@@ -285,6 +417,119 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Avance de ring_all: a diferencia de round_robin (una sola leg por
+    // intento, avance inmediato al fallar), ring_all debe esperar a que
+    // TODAS las legs del intento terminen sin respuesta. Antes no existía
+    // ningún avance para ring_all: si nadie contestaba la primera oleada,
+    // el llamante quedaba en la conferencia escuchando música para siempre
+    // (max_wait_time/timeout_action nunca llegaban a aplicarse).
+    const shouldTryRingAllAdvance = (
+      queueStrategyHint === 'ring_all'
+      && !!routedParentCallSid
+      && !!attemptIdHint
+      && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)
+      && (callStatus !== 'completed' || normalizedDuration === 0)
+    );
+
+    if (shouldTryRingAllAdvance) {
+      const { data: parentRecord } = await supabase
+        .from('call_records')
+        .select('status, answered_by_user_id, twilio_data')
+        .eq('twilio_call_sid', routedParentCallSid)
+        .maybeSingle();
+
+      const parentStatus = (parentRecord as { status?: CallStatus } | null)?.status;
+      const parentAnsweredByUserId = (parentRecord as { answered_by_user_id?: string | null } | null)?.answered_by_user_id ?? null;
+      const parentTwilioDataRaw = (parentRecord as { twilio_data?: unknown } | null)?.twilio_data;
+      const parentTwilioData = (
+        parentTwilioDataRaw
+        && typeof parentTwilioDataRaw === 'object'
+        && !Array.isArray(parentTwilioDataRaw)
+      )
+        ? (parentTwilioDataRaw as Record<string, unknown>)
+        : {};
+      const currentAttemptId = typeof parentTwilioData.current_round_robin_attempt_id === 'string'
+        ? parentTwilioData.current_round_robin_attempt_id
+        : null;
+
+      if (
+        currentAttemptId === attemptIdHint
+        && !parentAnsweredByUserId
+        && parentStatus !== 'in_progress'
+        && parentStatus !== 'completed'
+      ) {
+        const attemptLegSids = Array.isArray(parentTwilioData.current_ring_attempt_leg_sids)
+          ? (parentTwilioData.current_ring_attempt_leg_sids as unknown[])
+            .filter((sid): sid is string => typeof sid === 'string' && sid.length > 0)
+          : [];
+        const siblingLegSids = attemptLegSids.filter((sid) => sid !== rawCallSid);
+
+        // ¿Queda alguna leg hermana viva? Verificación en vivo contra la
+        // API (tolerante a carreras: si dos legs terminan a la vez, ambas
+        // pasan por aquí y solo una gana el consume guard de abajo).
+        let anySiblingAlive = false;
+        const twilioClientForAdvance = getTwilioClient();
+        for (const siblingSid of siblingLegSids) {
+          try {
+            const sibling = await twilioClientForAdvance.calls(siblingSid).fetch();
+            const siblingStatus = (sibling.status || '').toLowerCase();
+            if (['queued', 'initiated', 'ringing', 'in-progress'].includes(siblingStatus)) {
+              anySiblingAlive = true;
+              break;
+            }
+          } catch {
+            // 404/errores → tratar como leg muerta.
+          }
+        }
+
+        if (anySiblingAlive) {
+          console.log(
+            `[STATUS] ring_all attempt ${attemptIdHint} aún tiene legs vivas para parent=${routedParentCallSid}; sin avance.`
+          );
+        } else {
+          const consumedTwilioData = {
+            ...parentTwilioData,
+            current_round_robin_attempt_id: null,
+            current_ring_attempt_leg_sids: [],
+            last_ring_all_attempt_id: attemptIdHint,
+            last_ring_all_attempt_result: callStatus,
+            last_ring_all_attempt_finished_at: new Date().toISOString(),
+          };
+
+          const { data: consumeResult } = await supabase
+            .from('call_records')
+            .update({
+              status: 'in_queue',
+              twilio_data: consumedTwilioData,
+            })
+            .eq('twilio_call_sid', routedParentCallSid)
+            .is('answered_by_user_id', null)
+            .filter('twilio_data->>current_round_robin_attempt_id', 'eq', attemptIdHint)
+            .select('twilio_call_sid')
+            .maybeSingle();
+
+          if (consumeResult?.twilio_call_sid) {
+            try {
+              await getTwilioClient().calls(routedParentCallSid).update({
+                url: `${baseUrl}/api/webhooks/twilio/voice/queue-retry`,
+                method: 'POST',
+              });
+              console.log(
+                `[STATUS] ring_all advance: todas las legs del intento ${attemptIdHint} terminaron sin respuesta — parent=${routedParentCallSid} → queue-retry`
+              );
+              return new NextResponse('OK', { status: 200 });
+            } catch (advanceErr) {
+              console.error(
+                `[STATUS] ring_all advance falló para ${routedParentCallSid}: ${
+                  advanceErr instanceof Error ? advanceErr.message : 'unknown_error'
+                }`
+              );
+            }
+          }
+        }
+      }
+    }
+
     if (currentStatus && TERMINAL_STATUSES.includes(currentStatus)) {
       if (!currentRecord?.ended_at && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)) {
         await updateCallStatus(trackedCallSid, { endedAt: timestamp });
@@ -322,6 +567,7 @@ export async function POST(req: NextRequest) {
               status: terminalStatus,
               endedAt,
               duration: safeDuration,
+              terminalSource: 'status_agent_leg_reconcile',
             });
 
             if (currentRecord?.direction === 'inbound' && terminalStatus !== 'completed') {
@@ -405,6 +651,7 @@ export async function POST(req: NextRequest) {
 
     const updates: Parameters<typeof updateCallStatus>[1] = {
       status: mappedStatus,
+      terminalSource: 'status_webhook',
     };
 
     // Outbound answered transition used by RDN/UI (ringing -> in_progress).

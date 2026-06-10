@@ -6,6 +6,7 @@ import { getTwilioClient } from '@/lib/twilio/client';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { emitEvent } from '@/lib/events/emitter';
 import { drainReconcileOutbox } from '@/lib/events/reconcile-outbox';
+import { sweepRoomWatchdog } from '@/lib/calls/room-watchdog';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -87,12 +88,21 @@ export async function POST(req: NextRequest) {
   // endpoint itself finds no stuck rows locally.
   const outboxBefore = await drainReconcileOutbox();
 
+  // Room-watchdog backstop: re-examina marcadores de "agente perdido" cuyo
+  // timer in-process se haya perdido (reinicio de pm2 entre el leave y la
+  // ventana de gracia).
+  const watchdogChecked = await sweepRoomWatchdog({ force: true }).catch((err) => {
+    console.warn('[RECONCILE] sweepRoomWatchdog falló:', err);
+    return 0;
+  });
+
   if (allStuck.length === 0) {
     return apiSuccess({
       reconciled: 0,
       checked: 0,
       message: 'No stuck calls found',
       outbox: outboxBefore,
+      room_watchdog_checked: watchdogChecked,
     });
   }
 
@@ -114,6 +124,7 @@ export async function POST(req: NextRequest) {
           status: realStatus === 'no-answer' ? 'no_answer' : realStatus,
           endedAt,
           duration,
+          terminalSource: 'reconcile_api',
         });
 
         // Emit appropriate event
@@ -168,6 +179,7 @@ export async function POST(req: NextRequest) {
     checked,
     total_stuck: allStuck.length,
     details,
+    room_watchdog_checked: watchdogChecked,
     outbox: {
       before: outboxBefore,
       after: outboxAfter,

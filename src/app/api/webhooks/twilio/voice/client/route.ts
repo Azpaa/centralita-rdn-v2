@@ -122,6 +122,73 @@ export async function POST(req: NextRequest) {
         `[CLIENT-VOICE] Conference join: room=${conferenceRoom} parentCallSid=${parentCallSid} operatorId=${operatorId}`
       );
 
+      // ── Guards de idempotencia (mismos que agent-connect) ──────────────
+      // No unir media a una llamada ya terminal (accept que llega tarde) ni
+      // duplicar la leg de agente cuando otra superficie ya tiene una viva.
+      // Una leg duplicada entra con endConferenceOnExit:true y al colgar
+      // mata la sala entera.
+      const guardRecordSid = parentCallSid
+        || (conferenceRoom.startsWith('call-') ? conferenceRoom.slice('call-'.length) : '');
+      if (guardRecordSid) {
+        try {
+          const { data: guardRecord } = await supabase
+            .from('call_records')
+            .select('status, ended_at, twilio_data')
+            .eq('twilio_call_sid', guardRecordSid)
+            .maybeSingle();
+
+          if (guardRecord) {
+            const terminalStatuses = ['completed', 'busy', 'no_answer', 'failed', 'canceled'];
+            const recordIsTerminal = terminalStatuses.includes(String(guardRecord.status))
+              || Boolean(guardRecord.ended_at);
+
+            if (recordIsTerminal) {
+              console.warn(
+                `[CLIENT-VOICE][GUARD] Join a llamada ya terminal (status=${guardRecord.status}) room=${conferenceRoom} operator=${operatorId || '-'} leg=${callSid || '-'}`
+              );
+              twiml.say(
+                { language: 'es-ES', voice: 'Polly.Conchita' },
+                'La llamada ya ha finalizado.'
+              );
+              twiml.hangup();
+              return twimlResponse(twiml);
+            }
+
+            const guardData = (
+              guardRecord.twilio_data
+              && typeof guardRecord.twilio_data === 'object'
+              && !Array.isArray(guardRecord.twilio_data)
+            ) ? (guardRecord.twilio_data as Record<string, unknown>) : {};
+            const existingAgentLeg = typeof guardData.agent_call_sid === 'string'
+              ? guardData.agent_call_sid
+              : null;
+
+            if (existingAgentLeg && callSid && existingAgentLeg !== callSid) {
+              try {
+                const { getTwilioClient } = await import('@/lib/twilio/client');
+                const liveLeg = await getTwilioClient().calls(existingAgentLeg).fetch();
+                if ((liveLeg.status || '').toLowerCase() === 'in-progress') {
+                  console.warn(
+                    `[CLIENT-VOICE][GUARD] Leg duplicada ${callSid} — la llamada ya está atendida por ${existingAgentLeg} (viva). Rechazando segundo join.`
+                  );
+                  twiml.say(
+                    { language: 'es-ES', voice: 'Polly.Conchita' },
+                    'Esta llamada ya está siendo atendida.'
+                  );
+                  twiml.hangup();
+                  return twimlResponse(twiml);
+                }
+              } catch {
+                // Leg anterior muerta o API inaccesible → permitir el join
+                // (caso legítimo: re-join tras caída de la leg original).
+              }
+            }
+          }
+        } catch (guardErr) {
+          console.warn('[CLIENT-VOICE] Guard de idempotencia falló (continuando):', guardErr);
+        }
+      }
+
       // Update call record if we have the parent call SID
       if (parentCallSid && operatorId) {
         try {
@@ -207,7 +274,10 @@ export async function POST(req: NextRequest) {
       dial.conference(
         {
           startConferenceOnEnter: true,
-          endConferenceOnExit: true,
+          // F1.4: igual que agent-connect — la caída de la leg del agente ya
+          // no mata la sala; el rejoin del Tauri y el room-watchdog se
+          // encargan de recuperar o cerrar la llamada de forma ordenada.
+          endConferenceOnExit: false,
         },
         conferenceRoom,
       );

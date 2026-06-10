@@ -35,6 +35,80 @@ export async function POST(req: NextRequest) {
     `[AGENT-CONNECT] Agent answered. conference=${conferenceName} callSid=${parentCallSid} operatorId=${operatorId} agentLeg=${agentCallSid}`
   );
 
+  // ── Guards de idempotencia ──────────────────────────────────────────────
+  // Este webhook se ejecuta para CUALQUIER leg de ring que conteste: el
+  // Device del agente, su teléfono físico... o el BUZÓN DE VOZ de su móvil.
+  // Sin estos guards, una segunda leg contestando se metía en la conferencia
+  // con endConferenceOnExit:true y al colgar (el buzón cuelga solo a los
+  // 1-3 min) tiraba la sala entera con la conversación en curso. También
+  // evita unirse a la conferencia de una llamada que ya terminó (leg que
+  // contesta un ring cancelado una décima tarde).
+  if (parentCallSid) {
+    try {
+      const supabaseGuard = createAdminClient();
+      const { data: guardRecord } = await supabaseGuard
+        .from('call_records')
+        .select('status, ended_at, answered_by_user_id, twilio_data')
+        .eq('twilio_call_sid', parentCallSid)
+        .maybeSingle();
+
+      if (guardRecord) {
+        const terminalStatuses = ['completed', 'busy', 'no_answer', 'failed', 'canceled'];
+        const recordIsTerminal = terminalStatuses.includes(String(guardRecord.status))
+          || Boolean(guardRecord.ended_at);
+
+        if (recordIsTerminal) {
+          console.warn(
+            `[AGENT-CONNECT][GUARD] Leg ${agentCallSid || '-'} (operator=${operatorId || '-'}) contestó una llamada ya terminal (status=${guardRecord.status}). No se une a la conferencia.`
+          );
+          const guardTwiml = new twilio.twiml.VoiceResponse();
+          guardTwiml.say(
+            { language: 'es-ES', voice: 'Polly.Conchita' },
+            'La llamada ya ha finalizado.'
+          );
+          guardTwiml.hangup();
+          return twimlResponse(guardTwiml);
+        }
+
+        const guardData = (
+          guardRecord.twilio_data
+          && typeof guardRecord.twilio_data === 'object'
+          && !Array.isArray(guardRecord.twilio_data)
+        ) ? (guardRecord.twilio_data as Record<string, unknown>) : {};
+        const existingAgentLeg = typeof guardData.agent_call_sid === 'string'
+          ? guardData.agent_call_sid
+          : null;
+
+        if (existingAgentLeg && agentCallSid && existingAgentLeg !== agentCallSid) {
+          // Ya hay una leg de agente registrada para esta llamada. Solo
+          // rechazamos esta segunda leg si la primera sigue VIVA — si murió
+          // (blip de red, leg colgada), dejar pasar permite re-contestar.
+          try {
+            const liveLeg = await getTwilioClient().calls(existingAgentLeg).fetch();
+            const liveLegStatus = (liveLeg.status || '').toLowerCase();
+            if (liveLegStatus === 'in-progress') {
+              console.warn(
+                `[AGENT-CONNECT][GUARD] Leg duplicada ${agentCallSid} (operator=${operatorId || '-'}) — la llamada ya está atendida por la leg ${existingAgentLeg} (viva). Probable buzón de voz o segunda contestación.`
+              );
+              const guardTwiml = new twilio.twiml.VoiceResponse();
+              guardTwiml.say(
+                { language: 'es-ES', voice: 'Polly.Conchita' },
+                'Esta llamada ya está siendo atendida.'
+              );
+              guardTwiml.hangup();
+              return twimlResponse(guardTwiml);
+            }
+          } catch {
+            // Leg anterior desaparecida o API inaccesible: preferimos conectar
+            // al agente antes que bloquear una contestación legítima.
+          }
+        }
+      }
+    } catch (guardErr) {
+      console.warn('[AGENT-CONNECT] Guard de idempotencia falló (continuando):', guardErr);
+    }
+  }
+
   // Update call record: agent answered
   if (parentCallSid && operatorId) {
     try {
@@ -124,43 +198,64 @@ export async function POST(req: NextRequest) {
         candidate_user_ids: ringTargetIds,
       });
 
-      // --- ring_all cleanup: cancel other ringing agent legs ---
+      // --- Ring cleanup: cancelar todas las legs de ring que sigan vivas ---
+      // Cubre dos casos que antes quedaban sonando:
+      //  a) Las legs de TELÉFONO FÍSICO. El código anterior decía "Cancel
+      //     phone legs too" pero ambas consultas buscaban `client:<id>`, así
+      //     que los móviles/fijos nunca se cancelaban.
+      //  b) Las legs HERMANAS del agente que contestó: si contestaba en
+      //     Tauri, su móvil seguía sonando hasta el timeout — y si saltaba el
+      //     buzón de voz, este entraba a la conferencia (guard de arriba lo
+      //     corta ahora) o, peor, contestaba un humano y se pisaban.
+      // Nunca se cancela `agentCallSid` (la leg que acaba de contestar).
       try {
-        const otherTargets = ringTargetIds.filter(id => id !== operatorId);
+        const cleanupTargetIds = [...new Set([...ringTargetIds, operatorId])]
+          .filter((id): id is string => typeof id === 'string' && id.length > 0);
 
-        if (otherTargets.length > 0) {
+        if (cleanupTargetIds.length > 0) {
           const twilioClient = getTwilioClient();
           const recentCutoff = new Date(Date.now() - 5 * 60 * 1000);
 
-          for (const otherId of otherTargets) {
-            // Cancel browser Device legs
-            twilioClient.calls.list({
-              to: `client:${otherId}`,
-              status: 'ringing',
-              startTimeAfter: recentCutoff,
-            }).then(calls => {
-              for (const c of calls) {
-                twilioClient.calls(c.sid).update({ status: 'canceled' })
-                  .then(() => console.log(`[AGENT-CONNECT] Canceled ring leg ${c.sid} → client:${otherId}`))
-                  .catch(() => {});
-              }
-            }).catch(() => {});
+          const { data: targetUsers } = await supabase
+            .from('users')
+            .select('id, phone')
+            .in('id', cleanupTargetIds);
 
-            // Cancel phone legs too
-            twilioClient.calls.list({
-              to: `client:${otherId}`,
-              status: 'queued',
-              startTimeAfter: recentCutoff,
-            }).then(calls => {
-              for (const c of calls) {
-                twilioClient.calls(c.sid).update({ status: 'canceled' }).catch(() => {});
-              }
-            }).catch(() => {});
+          const phoneByUserId = new Map<string, string>();
+          for (const row of (targetUsers ?? []) as Array<{ id: string; phone: string | null }>) {
+            if (row.phone && row.phone.trim().length > 0) {
+              phoneByUserId.set(row.id, row.phone.trim());
+            }
           }
-          console.log(`[AGENT-CONNECT] ring_all cleanup: canceling legs for ${otherTargets.length} other target(s)`);
+
+          const cancelRingLegsTo = (to: string) => {
+            for (const legStatus of ['ringing', 'queued'] as const) {
+              twilioClient.calls.list({
+                to,
+                status: legStatus,
+                startTimeAfter: recentCutoff,
+              }).then(calls => {
+                for (const c of calls) {
+                  if (c.sid === agentCallSid) continue;
+                  twilioClient.calls(c.sid).update({ status: 'canceled' })
+                    .then(() => console.log(`[AGENT-CONNECT] Canceled ring leg ${c.sid} → ${to} (${legStatus})`))
+                    .catch(() => {});
+                }
+              }).catch(() => {});
+            }
+          };
+
+          for (const targetId of cleanupTargetIds) {
+            cancelRingLegsTo(`client:${targetId}`);
+            const phone = phoneByUserId.get(targetId);
+            if (phone) cancelRingLegsTo(phone);
+          }
+          console.log(
+            `[AGENT-CONNECT] ring cleanup: client+phone legs de ${cleanupTargetIds.length} target(s), conservando ${agentCallSid || '-'}`
+          );
         }
       } catch (cleanupErr) {
-        console.warn('[AGENT-CONNECT] ring_all cleanup error (non-fatal):', cleanupErr);
+        console.warn('[AGENT-CONNECT] ring cleanup error (non-fatal):', cleanupErr);
       }
     } catch (err) {
       console.error('[AGENT-CONNECT] Error updating call record:', err);
@@ -192,7 +287,12 @@ export async function POST(req: NextRequest) {
   dial.conference(
     {
       startConferenceOnEnter: true,
-      endConferenceOnExit: true,
+      // F1.4: la leg del agente ya NO arrastra la sala al caerse. Antes,
+      // cualquier blip de su red/softphone terminaba la conferencia y
+      // dial-action colgaba al llamante. Ahora la sala sobrevive; el
+      // teardown legítimo lo hacen /hangup (cuelga ambas legs) y el
+      // room-watchdog (re-encola o cierra si el agente no vuelve).
+      endConferenceOnExit: false,
       statusCallbackEvent: ['join', 'leave', 'end'],
       statusCallback: `${baseUrl}/api/webhooks/twilio/voice/status`,
     },

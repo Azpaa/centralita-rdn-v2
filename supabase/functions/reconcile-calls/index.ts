@@ -154,11 +154,19 @@ Deno.serve(async (req) => {
       if (!TERMINAL_TWILIO.has(twilio.status)) continue;
 
       const newStatus = twilioToDbStatus(twilio.status);
+      const existingTwilioData = (call.twilio_data && typeof call.twilio_data === "object")
+        ? call.twilio_data
+        : {};
       const mergedTwilioData = {
-        ...(call.twilio_data && typeof call.twilio_data === "object" ? call.twilio_data : {}),
+        ...existingTwilioData,
         reconciled_by: "supabase_edge",
         reconciled_at: new Date().toISOString(),
         twilio_terminal_status: twilio.status,
+        // Firma unificada de "quién cerró la llamada" (primer escritor gana)
+        // — misma convención que updateCallStatus en el backend Next.
+        ...(typeof (existingTwilioData as Record<string, unknown>).terminal_source === "string"
+          ? {}
+          : { terminal_source: "reconcile_edge", terminal_source_at: new Date().toISOString() }),
       };
 
       const upd = await supabase

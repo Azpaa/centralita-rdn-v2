@@ -5,11 +5,73 @@ import { routeIncomingCall, createCallRecord } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { emitEvent } from '@/lib/events/emitter';
 import { getTwilioClient } from '@/lib/twilio/client';
+import { createAdminClient } from '@/lib/supabase/admin';
 
 function resolveQueueWaitUrl(): string {
   const fromEnv = process.env.TWILIO_QUEUE_WAIT_URL?.trim();
   if (fromEnv) return fromEnv;
   return 'https://twimlets.com/holdmusic?Bucket=com.twilio.music.guitars';
+}
+
+// Reconexión pegajosa (F2): si este número tuvo una llamada ATENDIDA hace
+// menos de esta ventana (entrante o saliente), intentamos devolverle al
+// mismo agente. Cubre el caso "la espera remota acabó cortando la llamada
+// y el cliente vuelve a llamar": antes pasaba por bienvenida + cola como
+// un desconocido y podía caer en otro agente.
+const STICKY_RECONNECT_WINDOW_MS = 10 * 60 * 1000;
+
+type StickyMatch = {
+  previousCallSid: string | null;
+  agentId: string;
+  endedAt: string | null;
+};
+
+async function findRecentAnsweredCallForNumber(callerNumber: string, excludeCallSid: string): Promise<StickyMatch | null> {
+  if (!callerNumber.startsWith('+')) return null; // anónimos/ocultos: no aplicable
+
+  const supabase = createAdminClient();
+  const cutoffIso = new Date(Date.now() - STICKY_RECONNECT_WINDOW_MS).toISOString();
+
+  const baseSelect = 'twilio_call_sid, answered_by_user_id, ended_at';
+  const [inboundPrev, outboundPrev] = await Promise.all([
+    supabase
+      .from('call_records')
+      .select(baseSelect)
+      .eq('direction', 'inbound')
+      .eq('from_number', callerNumber)
+      .not('answered_by_user_id', 'is', null)
+      .not('answered_at', 'is', null)
+      .gte('ended_at', cutoffIso)
+      .neq('twilio_call_sid', excludeCallSid)
+      .order('ended_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    supabase
+      .from('call_records')
+      .select(baseSelect)
+      .eq('direction', 'outbound')
+      .eq('to_number', callerNumber)
+      .not('answered_by_user_id', 'is', null)
+      .not('answered_at', 'is', null)
+      .gte('ended_at', cutoffIso)
+      .order('ended_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
+
+  const candidates = [inboundPrev.data, outboundPrev.data]
+    .filter((row): row is { twilio_call_sid: string | null; answered_by_user_id: string | null; ended_at: string | null } => Boolean(row))
+    .filter((row) => typeof row.answered_by_user_id === 'string' && row.answered_by_user_id.length > 0)
+    .sort((a, b) => Date.parse(b.ended_at ?? '') - Date.parse(a.ended_at ?? ''));
+
+  const best = candidates[0];
+  if (!best?.answered_by_user_id) return null;
+
+  return {
+    previousCallSid: best.twilio_call_sid,
+    agentId: best.answered_by_user_id,
+    endedAt: best.ended_at,
+  };
 }
 
 /**
@@ -165,8 +227,36 @@ export async function POST(req: NextRequest) {
 
     // --- Dentro de horario (in_hours / no_schedule) ---
 
-    // Mensaje de bienvenida
-    if (route.phoneNumber.welcome_message) {
+    // ── Reconexión pegajosa ──────────────────────────────────────────────
+    // ¿Este número tuvo una llamada atendida hace un momento? Si el agente
+    // de aquella llamada está disponible en esta cola, le devolvemos la
+    // llamada a él directamente y sin bienvenida (es una continuación, no
+    // una llamada nueva). Si no está disponible, la llamada sigue el flujo
+    // normal pero queda enlazada vía reconnect_of para trazabilidad.
+    let stickyMatch: StickyMatch | null = null;
+    try {
+      stickyMatch = await findRecentAnsweredCallForNumber(fromNumber, callSid);
+    } catch (stickyErr) {
+      console.warn(`[INCOMING] Sticky lookup falló para ${fromNumber}:`, stickyErr);
+    }
+    const stickyOperator = stickyMatch
+      ? (route.operators ?? []).find((op) => op.id === stickyMatch!.agentId) ?? null
+      : null;
+
+    if (stickyMatch) {
+      console.log(
+        `[INCOMING] Reconexión detectada from=${fromNumber} previous=${stickyMatch.previousCallSid ?? '-'} agent=${stickyMatch.agentId} eligible=${Boolean(stickyOperator)}`
+      );
+    }
+
+    // Mensaje de bienvenida (sustituido por uno breve si es una reconexión
+    // que de verdad va a sonar al mismo agente)
+    if (stickyOperator) {
+      twiml.say(
+        { language: 'es-ES', voice: 'Polly.Conchita' },
+        'Le estamos reconectando con su agente. Un momento, por favor.'
+      );
+    } else if (route.phoneNumber.welcome_message) {
       twiml.say(
         { language: 'es-ES', voice: 'Polly.Conchita' },
         route.phoneNumber.welcome_message
@@ -203,7 +293,6 @@ export async function POST(req: NextRequest) {
     const operators = route.operators ?? [];
 
     // Actualizar estado a "en cola"
-    const { createAdminClient } = await import('@/lib/supabase/admin');
     const supabase = createAdminClient();
     const { error: queueStatusErr } = await supabase
       .from('call_records')
@@ -264,12 +353,21 @@ export async function POST(req: NextRequest) {
       return twimlResponse(twiml);
     }
 
-    const ringTargets = queue.strategy === 'ring_all'
+    const defaultRingTargets = queue.strategy === 'ring_all'
       ? operators
       : (operators[queue.current_index % operators.length]
         ? [operators[queue.current_index % operators.length]]
         : []);
-    const roundRobinAttemptId = queue.strategy === 'ring_all' ? null : randomUUID();
+    // Reconexión pegajosa: el primer intento suena SOLO al agente de la
+    // llamada anterior. Si no contesta, el avance de intento (abajo) pasa
+    // por queue-retry y la llamada sigue el reparto normal de la cola.
+    const ringTargets = stickyOperator ? [stickyOperator] : defaultRingTargets;
+    // attempt id para AMBAS estrategias. round_robin avanza cuando su única
+    // leg falla (mecanismo existente). ring_all ahora también avanza cuando
+    // TODAS las legs del intento terminan sin respuesta — antes no tenía
+    // ningún avance: si nadie contestaba la primera oleada, el llamante se
+    // quedaba en la conferencia escuchando música indefinidamente.
+    const ringAttemptId = randomUUID();
 
     // Conference name for this call — used by SSE events, REST rings, and caller dial
     const conferenceName = `call-${callSid}`;
@@ -279,9 +377,11 @@ export async function POST(req: NextRequest) {
       current_ring_target_user_ids: ringTargets.map((target) => target.id),
       conference_name: conferenceName,
       incoming_conference_request: true,
-      routing_source: 'incoming_initial',
-      current_round_robin_attempt_id: roundRobinAttemptId,
-      current_round_robin_attempt_started_at: roundRobinAttemptId ? new Date().toISOString() : null,
+      routing_source: stickyOperator ? 'incoming_sticky_reconnect' : 'incoming_initial',
+      current_round_robin_attempt_id: ringAttemptId,
+      current_round_robin_attempt_started_at: new Date().toISOString(),
+      reconnect_of: stickyMatch?.previousCallSid ?? null,
+      sticky_agent_id: stickyOperator?.id ?? null,
     });
 
     if (ringTargets.length > 0) {
@@ -305,6 +405,8 @@ export async function POST(req: NextRequest) {
           rdn_user_id: target.rdn_user_id ?? null,
           conference_name: conferenceName,
           incoming_conference_request: true,
+          sticky_reconnect: Boolean(stickyOperator),
+          reconnect_of: stickyMatch?.previousCallSid ?? null,
         });
       }
     }
@@ -322,7 +424,7 @@ export async function POST(req: NextRequest) {
     const twilioClient = getTwilioClient();
     const agentConnectBase = `${baseUrl}/api/webhooks/twilio/voice/agent-connect`;
 
-    const ringPromises: Promise<{ ok: boolean; target: string }>[] = [];
+    const ringPromises: Promise<{ ok: boolean; target: string; sid?: string }>[] = [];
     for (const target of ringTargets) {
       const agentConnectUrl = new URL(agentConnectBase);
       agentConnectUrl.searchParams.set('conference', conferenceName);
@@ -332,9 +434,7 @@ export async function POST(req: NextRequest) {
       agentStatusCallbackUrl.searchParams.set('parent_call_sid', callSid);
       agentStatusCallbackUrl.searchParams.set('queue_strategy', queue.strategy);
       agentStatusCallbackUrl.searchParams.set('target_user_id', target.id);
-      if (roundRobinAttemptId) {
-        agentStatusCallbackUrl.searchParams.set('attempt_id', roundRobinAttemptId);
-      }
+      agentStatusCallbackUrl.searchParams.set('attempt_id', ringAttemptId);
 
       // Ring agent's browser Device (Twilio Client)
       ringPromises.push(
@@ -345,7 +445,7 @@ export async function POST(req: NextRequest) {
           statusCallback: agentStatusCallbackUrl.toString(),
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           timeout: queue.ring_timeout,
-        }).then(() => ({ ok: true, target: `client:${target.id}` }))
+        }).then((created) => ({ ok: true, target: `client:${target.id}`, sid: created.sid }))
           .catch((err) => {
             console.warn(`[INCOMING] Failed to ring client:${target.id}: ${err.message}`);
             return { ok: false, target: `client:${target.id}` };
@@ -362,7 +462,7 @@ export async function POST(req: NextRequest) {
             statusCallback: agentStatusCallbackUrl.toString(),
             statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
             timeout: queue.ring_timeout,
-          }).then(() => ({ ok: true, target: target.phone! }))
+          }).then((created) => ({ ok: true, target: target.phone!, sid: created.sid }))
             .catch((err) => {
               console.warn(`[INCOMING] Failed to ring phone ${target.phone}: ${err.message}`);
               return { ok: false, target: target.phone! };
@@ -381,13 +481,26 @@ export async function POST(req: NextRequest) {
       return twimlResponse(twiml);
     }
 
+    // Guardar las legs del intento: el avance de ring_all (voice/status)
+    // necesita saber cuándo TODAS han terminado sin respuesta. Solo se
+    // mergea este campo para no pisar la limpieza de ring targets que
+    // agent-connect pudiera haber hecho si alguien contesta muy rápido.
+    const createdLegSids = ringResults
+      .filter((result): result is { ok: true; target: string; sid: string } => result.ok && typeof result.sid === 'string')
+      .map((result) => result.sid);
+    if (createdLegSids.length > 0) {
+      await mergeRoutingMetadata({ current_ring_attempt_leg_sids: createdLegSids });
+    }
+
     // Advance round-robin index with an optimistic guard: only write if the
     // index is still what we read. Two calls arriving together both read the
     // same index; without the guard both write the same "next" value, losing
     // an increment and skipping agents. (Note: this prevents index skew but
     // not the rarer case where both already selected the same target above —
     // fully eliminating that needs an atomic select-and-advance DB function.)
-    if (queue.strategy !== 'ring_all') {
+    // No avanzar cuando el intento fue una reconexión pegajosa: el agente
+    // del turno normal no llegó a sonar y no debe perder su posición.
+    if (queue.strategy !== 'ring_all' && !stickyOperator) {
       const { error: rotateErr } = await supabase
         .from('queues')
         .update({

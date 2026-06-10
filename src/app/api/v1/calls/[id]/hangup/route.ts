@@ -10,10 +10,16 @@ import { createAdminClient } from '@/lib/supabase/admin';
  * POST /api/v1/calls/:id/hangup
  * Cuelga una llamada activa. Funciona para cualquier leg (agente o remoto).
  *
- * Body (opcional): { target?: 'agent' | 'remote' | 'all' }
+ * Body (opcional): { target?: 'agent' | 'remote' | 'all' | 'self' }
  * - 'all' (default): Cuelga ambas legs
  * - 'agent': Solo la leg del agente
  * - 'remote': Solo la leg remota
+ * - 'self': RECHAZO LOCAL para el agente autenticado — cancela SUS legs de
+ *   ring (softphone y teléfono) y lo retira de los targets de la llamada,
+ *   sin tocar la leg del llamante (la cola sigue sonando a otros agentes).
+ *   El softphone lo usa para llamadas que no posee; antes este valor no
+ *   existía en el endpoint y se no-opeaba en silencio devolviendo
+ *   hungup:true.
  */
 export async function POST(
   req: NextRequest,
@@ -41,6 +47,88 @@ export async function POST(
     const client = getTwilioClient();
     const supabase = createAdminClient();
     let remoteSid: string | null = null;
+
+    // ── target 'self': rechazo local del agente autenticado ────────────────
+    if (target === 'self') {
+      if (!auth.userId) {
+        return apiBadRequest("target 'self' requiere sesión de agente");
+      }
+
+      // 1. Cancelar las legs de ring dirigidas a este agente (softphone y
+      //    teléfono físico). Misma aproximación que la limpieza de
+      //    agent-connect: legs recientes en ringing/queued.
+      const { data: userRow } = await supabase
+        .from('users')
+        .select('phone')
+        .eq('id', auth.userId)
+        .maybeSingle();
+      const agentPhone = (userRow?.phone ?? '').trim();
+      const recentCutoff = new Date(Date.now() - 5 * 60 * 1000);
+      const ringDestinations = [`client:${auth.userId}`, ...(agentPhone ? [agentPhone] : [])];
+
+      for (const destination of ringDestinations) {
+        for (const legStatus of ['ringing', 'queued'] as const) {
+          try {
+            const legs = await client.calls.list({
+              to: destination,
+              status: legStatus,
+              startTimeAfter: recentCutoff,
+            });
+            for (const leg of legs) {
+              await client.calls(leg.sid).update({ status: 'canceled' }).catch(() => {});
+            }
+          } catch {
+            // best-effort
+          }
+        }
+      }
+
+      // 2. Salir de los targets de la llamada para que el snapshot deje de
+      //    mostrarla sonando a este agente.
+      const { data: recordRow } = await supabase
+        .from('call_records')
+        .select('twilio_data')
+        .eq('twilio_call_sid', callSid)
+        .maybeSingle();
+      const recordData = (
+        recordRow?.twilio_data
+        && typeof recordRow.twilio_data === 'object'
+        && !Array.isArray(recordRow.twilio_data)
+      ) ? (recordRow.twilio_data as Record<string, unknown>) : null;
+      if (recordData && Array.isArray(recordData.current_ring_target_user_ids)) {
+        const remainingTargets = (recordData.current_ring_target_user_ids as unknown[])
+          .filter((id): id is string => typeof id === 'string' && id !== auth.userId);
+        const declinedBy = Array.isArray(recordData.declined_by_user_ids)
+          ? (recordData.declined_by_user_ids as unknown[]).filter((id): id is string => typeof id === 'string')
+          : [];
+        await supabase
+          .from('call_records')
+          .update({
+            twilio_data: {
+              ...recordData,
+              current_ring_target_user_ids: remainingTargets,
+              declined_by_user_ids: [...new Set([...declinedBy, auth.userId])],
+              last_declined_at: new Date().toISOString(),
+            },
+          })
+          .eq('twilio_call_sid', callSid);
+      }
+
+      await auditLog('call.hangup', 'call_record', callSid, auth.userId, {
+        call_sid: callSid,
+        target: 'self',
+        declined_for_user: auth.userId,
+        auth_method: auth.authMethod,
+      });
+
+      return apiSuccess({
+        hungup: false,
+        declined: true,
+        callSid,
+        target: 'self',
+        declined_for_user: auth.userId,
+      });
+    }
 
     // Resolver la otra leg para colgar ambas si es necesario
     if (target === 'all' || target === 'remote') {
@@ -74,12 +162,17 @@ export async function POST(
       }
     }
 
-    if (target === 'all' || target === 'agent') {
-      await client.calls(callSid).update({ status: 'completed' });
-    }
-
+    // Orden deliberado: PRIMERO la leg remota, después la del agente. Así,
+    // cuando el participant-leave de la leg del agente llegue al
+    // room-watchdog, el llamante ya no está en la sala y el watchdog no
+    // confunde un hangup legítimo con un agente caído (ni reproduce el
+    // anuncio de "reconectando" a un llamante al que estamos colgando).
     if (remoteSid && (target === 'all' || target === 'remote')) {
       await client.calls(remoteSid).update({ status: 'completed' });
+    }
+
+    if (target === 'all' || target === 'agent') {
+      await client.calls(callSid).update({ status: 'completed' });
     }
 
     await auditLog('call.hangup', 'call_record', callSid, auth.userId, {

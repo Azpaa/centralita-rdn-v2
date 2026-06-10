@@ -59,6 +59,7 @@ export async function POST(
       await updateCallStatus(callSid, {
         status: 'canceled',
         endedAt,
+        terminalSource: 'reject_endpoint',
       });
     }
 

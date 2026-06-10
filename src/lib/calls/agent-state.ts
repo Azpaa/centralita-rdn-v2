@@ -122,6 +122,29 @@ function withClearedRingTargets(
   };
 }
 
+/**
+ * Merge `terminal_source` into twilio_data, preserving the FIRST writer's
+ * signature (later terminal refinements must not mask who killed the call).
+ * `cleared` takes precedence as the base when ring-target cleanup produced
+ * a merged object already.
+ */
+function withTerminalSource(
+  existing: Record<string, unknown> | null | undefined,
+  cleared: Record<string, unknown> | null,
+  source: string,
+): Record<string, unknown> {
+  const base = cleared
+    ?? (existing && typeof existing === 'object' && !Array.isArray(existing)
+      ? (existing as Record<string, unknown>)
+      : {});
+  if (typeof base.terminal_source === 'string') return base;
+  return {
+    ...base,
+    terminal_source: source,
+    terminal_source_at: new Date().toISOString(),
+  };
+}
+
 async function reconcileStaleActiveCalls(
   rows: MinimalCallRecordRow[],
 ): Promise<MinimalCallRecordRow[]> {
@@ -198,8 +221,12 @@ async function reconcileStaleActiveCalls(
         ended_at: endedAt,
         duration: safeDuration,
         last_verified_at: verifiedAt,
+        twilio_data: withTerminalSource(
+          row.twilio_data as Record<string, unknown> | null | undefined,
+          mergedTwilioData,
+          'agent_state_self_heal',
+        ),
       };
-      if (mergedTwilioData) healPatch.twilio_data = mergedTwilioData;
 
       const { data: updateResult } = await supabase
         .from('call_records')
@@ -258,8 +285,12 @@ async function reconcileStaleActiveCalls(
         status: 'canceled',
         ended_at: endedAt,
         last_verified_at: verifiedAt,
+        twilio_data: withTerminalSource(
+          row.twilio_data as Record<string, unknown> | null | undefined,
+          mergedTwilioData,
+          'agent_state_self_heal_twilio_404',
+        ),
       };
-      if (mergedTwilioData) cancelPatch.twilio_data = mergedTwilioData;
 
       const { data: updateResult } = await supabase
         .from('call_records')

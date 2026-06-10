@@ -141,6 +141,20 @@ export async function POST(req: NextRequest) {
             status: 'no_answer',
             endedAt: new Date().toISOString(),
             duration: 0,
+            terminalSource: 'queue_retry_max_wait',
+          });
+          // Sin este emit, los abandonos por tiempo máximo de cola jamás
+          // generaban call.missed: el record ya quedaba terminal, así que el
+          // status callback posterior hacía skip y los reconciliadores
+          // tampoco lo tocaban. RDN no se enteraba de la llamada perdida.
+          emitEvent('call.missed', {
+            call_sid: callSid,
+            direction: 'inbound',
+            from: record.from_number ?? null,
+            to: record.to_number ?? null,
+            final_status: 'no_answer',
+            queue_id: record.queue_id ?? null,
+            terminal_source: 'queue_retry_max_wait',
           });
           twiml.say(
             { language: 'es-ES', voice: 'Polly.Conchita' },
@@ -177,12 +191,36 @@ export async function POST(req: NextRequest) {
     // queueData is guaranteed to have queue and operators at this point
     const activeQueue = queue!;
     const operators = queueData.operators;
-    const ringTargets = activeQueue.strategy === 'ring_all'
+    const defaultRingTargets = activeQueue.strategy === 'ring_all'
       ? operators
       : (operators[activeQueue.current_index % operators.length]
         ? [operators[activeQueue.current_index % operators.length]]
         : []);
-    const roundRobinAttemptId = activeQueue.strategy === 'ring_all' ? null : randomUUID();
+
+    // Si el room-watchdog re-encoló esta llamada por pérdida del agente,
+    // el primer reintento intenta devolverla a ESE agente (puede haberse
+    // recuperado de un cuelgue del softphone). Solo un intento: el campo
+    // se limpia en el merge de abajo para que los siguientes pases hagan
+    // reparto normal.
+    const existingTwilioDataForRetry = (
+      record.twilio_data && typeof record.twilio_data === 'object' && !Array.isArray(record.twilio_data)
+    ) ? (record.twilio_data as Record<string, unknown>) : {};
+    const lostAgentId = typeof existingTwilioDataForRetry.room_watchdog_lost_agent_id === 'string'
+      ? existingTwilioDataForRetry.room_watchdog_lost_agent_id
+      : null;
+    const preferredOperator = lostAgentId
+      ? operators.find((op) => op.id === lostAgentId) ?? null
+      : null;
+    if (lostAgentId) {
+      console.log(
+        `[QUEUE-RETRY] Reintento tras pérdida de agente: lost_agent=${lostAgentId} eligible=${Boolean(preferredOperator)}`
+      );
+    }
+
+    const ringTargets = preferredOperator ? [preferredOperator] : defaultRingTargets;
+    // attempt id para ambas estrategias (ring_all avanza vía voice/status
+    // cuando todas las legs del intento terminan sin respuesta).
+    const ringAttemptId = randomUUID();
 
     if (ringTargets.length > 0) {
       console.log(
@@ -236,9 +274,12 @@ export async function POST(req: NextRequest) {
       current_ring_target_user_ids: ringTargets.map((target) => target.id),
       conference_name: conferenceName,
       incoming_conference_request: true,
-      routing_source: 'queue_retry',
-      current_round_robin_attempt_id: roundRobinAttemptId,
-      current_round_robin_attempt_started_at: roundRobinAttemptId ? new Date().toISOString() : null,
+      routing_source: preferredOperator ? 'queue_retry_lost_agent' : 'queue_retry',
+      current_round_robin_attempt_id: ringAttemptId,
+      current_round_robin_attempt_started_at: new Date().toISOString(),
+      // Consumir la preferencia: solo el primer reintento apunta al agente
+      // perdido; a partir de aquí, reparto normal.
+      room_watchdog_lost_agent_id: null,
     });
     // IMPORTANT: use our Twilio DID as callerId/from for re-ring attempts.
     // Using the external caller number can make Twilio reject these outbound legs.
@@ -246,7 +287,7 @@ export async function POST(req: NextRequest) {
     const twilioClient = getTwilioClient();
     const agentConnectBase = `${baseUrl}/api/webhooks/twilio/voice/agent-connect`;
 
-    const ringPromises: Promise<{ ok: boolean; target: string }>[] = [];
+    const ringPromises: Promise<{ ok: boolean; target: string; sid?: string }>[] = [];
     for (const target of ringTargets) {
       const agentConnectUrl = new URL(agentConnectBase);
       agentConnectUrl.searchParams.set('conference', conferenceName);
@@ -256,9 +297,7 @@ export async function POST(req: NextRequest) {
       agentStatusCallbackUrl.searchParams.set('parent_call_sid', callSid);
       agentStatusCallbackUrl.searchParams.set('queue_strategy', activeQueue.strategy);
       agentStatusCallbackUrl.searchParams.set('target_user_id', target.id);
-      if (roundRobinAttemptId) {
-        agentStatusCallbackUrl.searchParams.set('attempt_id', roundRobinAttemptId);
-      }
+      agentStatusCallbackUrl.searchParams.set('attempt_id', ringAttemptId);
 
       // Ring agent's browser Device
       ringPromises.push(
@@ -269,7 +308,7 @@ export async function POST(req: NextRequest) {
           statusCallback: agentStatusCallbackUrl.toString(),
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           timeout: activeQueue.ring_timeout,
-        }).then(() => ({ ok: true, target: `client:${target.id}` }))
+        }).then((created) => ({ ok: true, target: `client:${target.id}`, sid: created.sid }))
           .catch((err) => {
             console.warn(`[QUEUE-RETRY] Failed to ring client:${target.id}: ${err.message}`);
             return { ok: false, target: `client:${target.id}` };
@@ -286,7 +325,7 @@ export async function POST(req: NextRequest) {
             statusCallback: agentStatusCallbackUrl.toString(),
             statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
             timeout: activeQueue.ring_timeout,
-          }).then(() => ({ ok: true, target: target.phone! }))
+          }).then((created) => ({ ok: true, target: target.phone!, sid: created.sid }))
             .catch((err) => {
               console.warn(`[QUEUE-RETRY] Failed to ring phone ${target.phone}: ${err.message}`);
               return { ok: false, target: target.phone! };
@@ -305,8 +344,18 @@ export async function POST(req: NextRequest) {
       return twimlResponse(twiml);
     }
 
-    if (activeQueue.strategy !== 'ring_all') {
-      // Advance round-robin index
+    // Legs del intento, para que el avance de ring_all sepa cuándo han
+    // terminado todas sin respuesta (ver voice/status).
+    const createdLegSids = ringResults
+      .filter((result): result is { ok: true; target: string; sid: string } => result.ok && typeof result.sid === 'string')
+      .map((result) => result.sid);
+    if (createdLegSids.length > 0) {
+      await mergeRoutingMetadata({ current_ring_attempt_leg_sids: createdLegSids });
+    }
+
+    if (activeQueue.strategy !== 'ring_all' && !preferredOperator) {
+      // Advance round-robin index (salvo que este pase fuera dirigido al
+      // agente perdido: el turno normal no llegó a sonar).
       await supabase
         .from('queues')
         .update({
