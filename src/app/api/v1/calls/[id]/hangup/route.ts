@@ -4,6 +4,7 @@ import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response'
 import { getTwilioClient } from '@/lib/twilio/client';
 import { requireCallControlPermission } from '@/lib/calls/ownership';
 import { auditLog } from '@/lib/api/audit';
+import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
 
 /**
@@ -114,7 +115,7 @@ export async function POST(
           .eq('twilio_call_sid', callSid);
       }
 
-      await auditLog('call.hangup', 'call_record', callSid, auth.userId, {
+      void auditLog('call.hangup', 'call_record', callSid, auth.userId, {
         call_sid: callSid,
         target: 'self',
         declined_for_user: auth.userId,
@@ -175,7 +176,28 @@ export async function POST(
       await client.calls(callSid).update({ status: 'completed' });
     }
 
-    await auditLog('call.hangup', 'call_record', callSid, auth.userId, {
+    // Cierre terminal en BD SIN depender del webhook de status de Twilio.
+    // Antes, `hangup` solo colgaba en Twilio y confiaba en que el status
+    // callback cerrase el call_record; si ese webhook se perdía, la fila
+    // quedaba "activa" → el agente aparecía ocupado → entraban mal las
+    // siguientes llamadas. `reject` ya cierra así; replicamos el patrón.
+    // Solo para 'all' (el colgar normal del operador); los cierres parciales
+    // 'agent'/'remote' se dejan al webhook para no marcar terminal una
+    // llamada que puede seguir viva. updateCallStatus es idempotente y tiene
+    // guarda anti-resurrección, así que convive con el webhook sin conflicto.
+    // Fire-and-forget: no bloquea la respuesta (Twilio ya cerró la media),
+    // pero garantiza el cierre independiente del callback.
+    if (target === 'all') {
+      void updateCallStatus(callSid, {
+        status: 'completed',
+        endedAt: new Date().toISOString(),
+        terminalSource: 'hangup_endpoint',
+      }).catch((err) => {
+        console.error(`[HANGUP] updateCallStatus falló para ${callSid}:`, err);
+      });
+    }
+
+    void auditLog('call.hangup', 'call_record', callSid, auth.userId, {
       call_sid: callSid,
       remote_call_sid: remoteSid,
       target,

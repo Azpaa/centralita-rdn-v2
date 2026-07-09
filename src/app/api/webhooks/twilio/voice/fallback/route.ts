@@ -12,12 +12,21 @@ export async function POST(req: NextRequest) {
   const validation = await validateTwilioWebhookLight(req);
   if (validation !== true) return validation;
 
-  const twiml = new twilio.twiml.VoiceResponse();
-  twiml.say(
-    { language: 'es-ES', voice: 'Polly.Conchita' },
-    'Lo sentimos, estamos experimentando dificultades técnicas. Por favor, inténtelo más tarde.'
-  );
-  twiml.hangup();
+  // Este es el handler de emergencia de Twilio: pase lo que pase NUNCA debe
+  // devolver un 500 (dejaría al llamante sin TwiML y se cortaría en seco).
+  try {
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.say(
+      { language: 'es-ES', voice: 'Polly.Conchita' },
+      'Lo sentimos, estamos experimentando dificultades técnicas. Por favor, inténtelo más tarde.'
+    );
+    twiml.hangup();
 
-  return twimlResponse(twiml);
+    return twimlResponse(twiml);
+  } catch (err) {
+    console.error('[FALLBACK] Error building TwiML:', err);
+    const safe = new twilio.twiml.VoiceResponse();
+    safe.hangup();
+    return twimlResponse(safe);
+  }
 }

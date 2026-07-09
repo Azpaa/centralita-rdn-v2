@@ -24,8 +24,18 @@ export async function POST(req: NextRequest) {
 
   console.log(`[DIAL-ACTION] CallSid=${callSid} DialStatus=${dialStatus} Duration=${dialDuration}s`);
 
-  const twiml = new twilio.twiml.VoiceResponse();
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+
+  // Estado mínimo accesible desde el catch de emergencia: si una operación
+  // transitoria (Supabase/emitEvent) falla con el proceso VIVO, sin este
+  // guard el handler lanzaría un 500 y Twilio colgaría la llamada con su
+  // "application error". Preservamos al llamante entrante en cola; el resto
+  // cierra de forma elegante.
+  let directionForCatch = 'outbound';
+  let queueIdForCatch: string | null | undefined = null;
+
+  try {
+  const twiml = new twilio.twiml.VoiceResponse();
 
   // Buscar el call record para conocer la dirección, cola y tiempos
   const supabase = createAdminClient();
@@ -39,6 +49,8 @@ export async function POST(req: NextRequest) {
   const direction = record?.direction || 'outbound';
   const startedAt = record?.started_at;
   const queueId = record?.queue_id;
+  directionForCatch = direction;
+  queueIdForCatch = queueId;
   const fromNumber = record?.from_number ?? null;
   const toNumber = record?.to_number ?? null;
   const answeredByUserId = record?.answered_by_user_id ?? null;
@@ -265,4 +277,21 @@ export async function POST(req: NextRequest) {
 
   twiml.hangup();
   return twimlResponse(twiml);
+  } catch (err) {
+    console.error(
+      `[DIAL-ACTION] Error no controlado para CallSid=${callSid} — devolviendo TwiML seguro en vez de 500:`,
+      err,
+    );
+    // Un 500 aquí hace que Twilio reproduzca "an application error has
+    // occurred" y cuelgue. En su lugar: al llamante ENTRANTE en cola lo
+    // devolvemos a queue-retry (no perderlo por un fallo transitorio); el
+    // resto cierra limpio.
+    const safe = new twilio.twiml.VoiceResponse();
+    if (directionForCatch === 'inbound' && queueIdForCatch) {
+      safe.redirect({ method: 'POST' }, `${baseUrl}/api/webhooks/twilio/voice/queue-retry`);
+    } else {
+      safe.hangup();
+    }
+    return twimlResponse(safe);
+  }
 }

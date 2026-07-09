@@ -179,7 +179,7 @@ export async function POST(
       .participants(target.callSid)
       .update({ muted: false });
 
-    await auditLog('call.unmute', 'call_record', callSid, auth.userId, {
+    void auditLog('call.unmute', 'call_record', callSid, auth.userId, {
       call_sid: callSid,
       conference_name: resolvedConferenceName || resolvedConference.friendlyName,
       requested_conference_name: requestedConferenceName,

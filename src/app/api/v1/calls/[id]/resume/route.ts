@@ -243,7 +243,7 @@ async function finishResume(
     by_user_id: auth.userId ?? 'api_key',
   });
 
-  await auditLog('call.resume', 'call_record', callSid, auth.userId, {
+  void auditLog('call.resume', 'call_record', callSid, auth.userId, {
     call_sid: callSid,
     remote_call_sid: remoteSid,
     conference,

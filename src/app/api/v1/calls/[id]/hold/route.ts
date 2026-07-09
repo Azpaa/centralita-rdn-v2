@@ -110,7 +110,7 @@ export async function POST(
       by_user_id: auth.userId ?? 'api_key',
     });
 
-    await auditLog('call.hold', 'call_record', callSid, auth.userId, {
+    void auditLog('call.hold', 'call_record', callSid, auth.userId, {
       call_sid: callSid,
       remote_call_sid: ctx.remoteCallSid,
       mode,

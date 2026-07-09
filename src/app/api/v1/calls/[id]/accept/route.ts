@@ -283,7 +283,7 @@ export async function POST(
     },
   });
 
-  await auditLog('call.accept_requested', 'call_record', callSid, auth.userId, {
+  void auditLog('call.accept_requested', 'call_record', callSid, auth.userId, {
     call_sid: callSid,
     target_user_ids: targetUserIds,
     preferred_executor: preferredExecutor,

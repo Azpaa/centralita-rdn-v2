@@ -182,7 +182,7 @@ export async function POST(
     });
   }
 
-  await auditLog('call.accept_confirmed', 'call_record', callRow.id, auth.userId, {
+  void auditLog('call.accept_confirmed', 'call_record', callRow.id, auth.userId, {
     call_sid: callSid,
     command_id: parsed.data.command_id ?? null,
     engine_accepted_at: parsed.data.engine_accepted_at ?? null,

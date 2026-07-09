@@ -99,7 +99,7 @@ export async function POST(
       rejected_via: auth.authMethod,
     });
 
-    await auditLog('call.rejected', 'call_record', callSid, auth.userId, {
+    void auditLog('call.rejected', 'call_record', callSid, auth.userId, {
       call_sid: callSid,
       already_closed: alreadyClosed,
       auth_method: auth.authMethod,
