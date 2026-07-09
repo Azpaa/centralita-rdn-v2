@@ -733,13 +733,25 @@ export function useVoiceEngine(params: UseVoiceEngineParams): UseVoiceEngineResu
       // The agent-leg CallSid (local) differs from the parent (PSTN) SID.
       // We key everything by parent SID so external callers never need to
       // know or translate between them. The local SID is captured for logs
-      // only; if Twilio doesn't supply one quickly the call is still usable
-      // (disconnect/mute go through the Call reference, not the SID).
-      const localSid = await waitForRealCallSid(call, CALL_SID_RESOLUTION_TIMEOUT_MS);
-      const effectiveLocalSid = localSid ?? `pending-${parentSid}`;
-
-      wireCallLifecycle(call, parentSid, effectiveLocalSid, 'inbound', null);
+      // ONLY — disconnect/mute go through the Call reference, not the SID.
+      //
+      // Antes esperábamos aquí hasta CALL_SID_RESOLUTION_TIMEOUT_MS (3,5s) a
+      // que Twilio asignara ese SID ANTES de devolver ok. Como el llamador
+      // (App.tsx) para el ringtone y promociona la UI a "conectado" solo tras
+      // ese ok, coger una llamada arrastraba ese retardo con el tono aún
+      // sonando. Ese SID no se necesita para nada funcional en entrantes, así
+      // que cableamos la Call y devolvemos YA; el SID real se resuelve en
+      // segundo plano y solo actualiza el campo de logging. (En salientes
+      // NO se hace esto: allí el SID ES el canónico y connectOutbound sí debe
+      // esperarlo.)
+      wireCallLifecycle(call, parentSid, `pending-${parentSid}`, 'inbound', null);
       onCallStartedRef.current?.(parentSid, 'inbound', null);
+
+      void waitForRealCallSid(call, CALL_SID_RESOLUTION_TIMEOUT_MS).then((localSid) => {
+        if (!localSid) return;
+        const managed = callsRef.current.get(parentSid);
+        if (managed) managed.localSid = localSid;
+      });
 
       return { ok: true, data: { call_sid: parentSid } };
     } catch (err) {
