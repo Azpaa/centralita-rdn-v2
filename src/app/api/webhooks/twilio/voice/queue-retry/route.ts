@@ -5,6 +5,7 @@ import { getQueueWithOperators } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { emitEvent } from '@/lib/events/emitter';
+import { hasActiveDesktopStreamForUser } from '@/lib/events/client-stream';
 import { getTwilioClient } from '@/lib/twilio/client';
 import type { CallRecord, PhoneNumber, Queue } from '@/lib/types/database';
 
@@ -315,8 +316,15 @@ export async function POST(req: NextRequest) {
           })
       );
 
-      // Also ring agent's phone if configured
-      if (target.phone) {
+      // Sonar al MÓVIL del agente SOLO si NO tiene un softphone de escritorio
+      // (Tauri) vivo — mismo criterio que en `incoming`: evita la llamada
+      // fantasma del buzón que auto-contesta. El softphone es la vía; el móvil
+      // solo último recurso para agentes sin stream de escritorio.
+      const agentHasDesktopSoftphone = hasActiveDesktopStreamForUser(target.id);
+      if (target.phone && agentHasDesktopSoftphone) {
+        console.log(`[QUEUE-RETRY] Móvil omitido para operator=${target.id}: softphone de escritorio activo.`);
+      }
+      if (target.phone && !agentHasDesktopSoftphone) {
         ringPromises.push(
           twilioClient.calls.create({
             to: target.phone,

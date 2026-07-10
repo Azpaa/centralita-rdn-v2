@@ -4,6 +4,7 @@ import twilio from 'twilio';
 import { routeIncomingCall, createCallRecord } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { emitEvent } from '@/lib/events/emitter';
+import { hasActiveDesktopStreamForUser } from '@/lib/events/client-stream';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { createAdminClient } from '@/lib/supabase/admin';
 
@@ -452,8 +453,17 @@ export async function POST(req: NextRequest) {
           })
       );
 
-      // Also ring agent's phone if configured
-      if (target.phone) {
+      // Sonar al MÓVIL del agente SOLO si NO tiene un softphone de escritorio
+      // (Tauri) vivo. Un móvil cuyo buzón de voz auto-contesta "responde" la
+      // leg y crea una llamada fantasma (agente conectado en línea muerta,
+      // llamante atrapado sin nadie que hable). "Todo por Tauri": el softphone
+      // es la vía de audio; el móvil queda solo como último recurso para
+      // agentes sin stream de escritorio.
+      const agentHasDesktopSoftphone = hasActiveDesktopStreamForUser(target.id);
+      if (target.phone && agentHasDesktopSoftphone) {
+        console.log(`[INCOMING] Móvil omitido para operator=${target.id}: softphone de escritorio activo.`);
+      }
+      if (target.phone && !agentHasDesktopSoftphone) {
         ringPromises.push(
           twilioClient.calls.create({
             to: target.phone,
