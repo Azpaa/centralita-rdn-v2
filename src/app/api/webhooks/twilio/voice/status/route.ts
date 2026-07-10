@@ -32,7 +32,7 @@ const CALLBACK_STATUS_MAP: Record<string, CallStatus> = {
 
 type StatusRecord = Pick<
   CallRecord,
-  'status' | 'direction' | 'from_number' | 'to_number' | 'queue_id' | 'answered_by_user_id' | 'duration' | 'answered_at' | 'ended_at'
+  'id' | 'status' | 'direction' | 'from_number' | 'to_number' | 'queue_id' | 'answered_by_user_id' | 'duration' | 'answered_at' | 'ended_at'
 >;
 
 function uniqueNonEmpty(values: Array<string | null | undefined>): string[] {
@@ -62,7 +62,7 @@ async function resolveTrackedCallForStatus(params: {
   for (const sid of candidates) {
     const { data } = await supabase
       .from('call_records')
-      .select('status, direction, from_number, to_number, queue_id, answered_by_user_id, duration, answered_at, ended_at')
+      .select('id, status, direction, from_number, to_number, queue_id, answered_by_user_id, duration, answered_at, ended_at')
       .eq('twilio_call_sid', sid)
       .maybeSingle();
 
@@ -78,7 +78,7 @@ async function resolveTrackedCallForStatus(params: {
   for (const sid of candidates) {
     const { data } = await supabase
       .from('call_records')
-      .select('twilio_call_sid, status, direction, from_number, to_number, queue_id, answered_by_user_id, duration, answered_at, ended_at')
+      .select('id, twilio_call_sid, status, direction, from_number, to_number, queue_id, answered_by_user_id, duration, answered_at, ended_at')
       .filter('twilio_data->>agent_call_sid', 'eq', sid)
       .maybeSingle();
 
@@ -580,6 +580,7 @@ export async function POST(req: NextRequest) {
             if (currentRecord?.direction === 'inbound' && terminalStatus !== 'completed') {
               emitEvent('call.missed', {
                 call_sid: trackedCallSid,
+                call_record_id: currentRecord.id,
                 direction: currentRecord.direction,
                 from: currentRecord.from_number ?? null,
                 to: currentRecord.to_number ?? null,
@@ -590,6 +591,7 @@ export async function POST(req: NextRequest) {
             } else if (currentRecord) {
               emitEvent('call.completed', {
                 call_sid: trackedCallSid,
+                call_record_id: currentRecord.id,
                 direction: currentRecord.direction,
                 status: terminalStatus,
                 from: currentRecord.from_number ?? null,
@@ -685,6 +687,7 @@ export async function POST(req: NextRequest) {
 
       emitEvent('call.answered', {
         call_sid: trackedCallSid,
+        call_record_id: currentRecord.id,
         direction: 'outbound',
         status: 'in_progress',
         from: currentRecord.from_number ?? null,
@@ -724,6 +727,7 @@ export async function POST(req: NextRequest) {
       if (direction === 'inbound' && terminalStatus !== 'completed') {
         emitEvent('call.missed', {
           call_sid: trackedCallSid,
+          call_record_id: currentRecord.id,
           direction,
           from: currentRecord?.from_number ?? null,
           to: currentRecord?.to_number ?? null,
@@ -734,6 +738,7 @@ export async function POST(req: NextRequest) {
       } else {
         emitEvent('call.completed', {
           call_sid: trackedCallSid,
+          call_record_id: currentRecord.id,
           direction,
           status: terminalStatus,
           from: currentRecord?.from_number ?? null,
