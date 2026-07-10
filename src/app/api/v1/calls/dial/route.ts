@@ -481,6 +481,7 @@ export async function POST(req: NextRequest) {
         requested_rdn_user_id: rdn_user_id ?? null,
         resolved_agent_id: resolvedAgent.id,
         preferred_executor: preferredExecutor ?? null,
+        agent_busy: agentBusy,
         attach_mode: 'device_connect',
       });
 
