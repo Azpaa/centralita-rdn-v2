@@ -6,6 +6,7 @@ import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-a
 import { createAdminClient } from '@/lib/supabase/admin';
 import { emitEvent } from '@/lib/events/emitter';
 import { getTwilioClient } from '@/lib/twilio/client';
+import { toE164Phone } from '@/lib/twilio/phone';
 import type { CallRecord, PhoneNumber, Queue } from '@/lib/types/database';
 
 function resolveQueueWaitUrl(): string {
@@ -315,21 +316,27 @@ export async function POST(req: NextRequest) {
           })
       );
 
-      // Also ring agent's phone if configured
-      if (target.phone) {
+      // Also ring agent's phone if configured. Normalizamos a E.164 y, si el
+      // valor es basura/no válido, se salta la leg (el client: sigue sonando).
+      const agentPhone = toE164Phone(target.phone);
+      if (agentPhone) {
         ringPromises.push(
           twilioClient.calls.create({
-            to: target.phone,
+            to: agentPhone,
             from: ringCallerId,
             url: agentConnectUrl.toString(),
             statusCallback: agentStatusCallbackUrl.toString(),
             statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
             timeout: activeQueue.ring_timeout,
-          }).then((created) => ({ ok: true, target: target.phone!, sid: created.sid }))
+          }).then((created) => ({ ok: true, target: agentPhone, sid: created.sid }))
             .catch((err) => {
-              console.warn(`[QUEUE-RETRY] Failed to ring phone ${target.phone}: ${err.message}`);
-              return { ok: false, target: target.phone! };
+              console.warn(`[QUEUE-RETRY] Failed to ring phone ${agentPhone}: ${err.message}`);
+              return { ok: false, target: agentPhone };
             })
+        );
+      } else if (target.phone) {
+        console.warn(
+          `[QUEUE-RETRY] Skipping invalid agent phone for user ${target.id}: ${JSON.stringify(target.phone)}`
         );
       }
     }

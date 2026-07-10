@@ -5,6 +5,7 @@ import { routeIncomingCall, createCallRecord } from '@/lib/twilio/call-engine';
 import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-auth';
 import { emitEvent } from '@/lib/events/emitter';
 import { getTwilioClient } from '@/lib/twilio/client';
+import { toE164Phone } from '@/lib/twilio/phone';
 import { createAdminClient } from '@/lib/supabase/admin';
 
 function resolveQueueWaitUrl(): string {
@@ -452,21 +453,29 @@ export async function POST(req: NextRequest) {
           })
       );
 
-      // Also ring agent's phone if configured
-      if (target.phone) {
+      // Also ring agent's phone if configured. Normalizamos a E.164 y, si el
+      // valor es basura/no válido (p.ej. aprovisionado sucio desde RDN), se
+      // salta la leg — el client: sigue sonando igual. Evita la REST call
+      // condenada a fallar en cada entrante.
+      const agentPhone = toE164Phone(target.phone);
+      if (agentPhone) {
         ringPromises.push(
           twilioClient.calls.create({
-            to: target.phone,
+            to: agentPhone,
             from: ringCallerId,
             url: agentConnectUrl.toString(),
             statusCallback: agentStatusCallbackUrl.toString(),
             statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
             timeout: queue.ring_timeout,
-          }).then((created) => ({ ok: true, target: target.phone!, sid: created.sid }))
+          }).then((created) => ({ ok: true, target: agentPhone, sid: created.sid }))
             .catch((err) => {
-              console.warn(`[INCOMING] Failed to ring phone ${target.phone}: ${err.message}`);
-              return { ok: false, target: target.phone! };
+              console.warn(`[INCOMING] Failed to ring phone ${agentPhone}: ${err.message}`);
+              return { ok: false, target: agentPhone };
             })
+        );
+      } else if (target.phone) {
+        console.warn(
+          `[INCOMING] Skipping invalid agent phone for user ${target.id}: ${JSON.stringify(target.phone)}`
         );
       }
     }
