@@ -16,6 +16,26 @@ export interface RouteDecision {
   schedule?: Schedule & { slots: ScheduleSlot[] };
   queue?: Queue;
   operators?: (User & { priority: number })[];
+  // Subconjunto de `operators` que además tiene softphone de escritorio vivo.
+  // Es la lista que se usará cuando el reparto pase a presencia real; hasta
+  // entonces solo se registra para poder comparar. Ver `isPresenceOnlyRouting`.
+  presentOperators?: (User & { priority: number })[];
+}
+
+/**
+ * Reparto por presencia real (Fase A).
+ *
+ * Con el flag apagado (por defecto) el reparto se comporta EXACTAMENTE igual
+ * que siempre y la lista por presencia solo se calcula y se registra —
+ * "modo sombra". Con `RING_PRESENCE_ONLY=1` pasa a mandar la presencia.
+ *
+ * La lista por presencia es siempre un SUBCONJUNTO de la histórica, así que
+ * encender el flag nunca puede hacer que suene a MÁS gente; como mucho a
+ * menos. Apagarlo revierte al comportamiento anterior sin desplegar nada.
+ */
+export function isPresenceOnlyRouting(): boolean {
+  const raw = process.env.RING_PRESENCE_ONLY?.trim().toLowerCase();
+  return raw === '1' || raw === 'true';
 }
 
 // --- Buscar número por número de teléfono ---
@@ -275,6 +295,7 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
 export async function getQueueWithOperators(queueId: string): Promise<{
   queue: Queue;
   operators: (User & { priority: number })[];
+  presentOperators: (User & { priority: number })[];
 } | null> {
   const supabase = createAdminClient();
 
@@ -294,7 +315,7 @@ export async function getQueueWithOperators(queueId: string): Promise<{
     .order('priority', { ascending: true });
 
   if (!queueUsers || queueUsers.length === 0) {
-    return { queue: queue as Queue, operators: [] };
+    return { queue: queue as Queue, operators: [], presentOperators: [] };
   }
 
   // Obtener datos de los usuarios que están activos y disponibles
@@ -307,7 +328,7 @@ export async function getQueueWithOperators(queueId: string): Promise<{
     .is('deleted_at', null);
 
   if (!users) {
-    return { queue: queue as Queue, operators: [] };
+    return { queue: queue as Queue, operators: [], presentOperators: [] };
   }
 
   // Combinar con prioridad (ya no filtramos solo los que tienen teléfono,
@@ -315,19 +336,37 @@ export async function getQueueWithOperators(queueId: string): Promise<{
   // Excluir agentes que ya están en una llamada activa
   const busyAgentIds = await getBusyAgentIds();
   const priorityMap = new Map((queueUsers as QueueUser[]).map(qu => [qu.user_id, qu.priority]));
-  const operators = (users as User[])
-    .filter((u) => {
-      if (busyAgentIds.has(u.id)) return false;
-      if (u.available) return true;
-      return hasActiveDesktopStreamForUser(u.id);
-    })
-    .map(u => ({
-      ...u,
-      priority: priorityMap.get(u.id) ?? 0,
-    }))
+  const byPriority = (list: User[]) => list
+    .map(u => ({ ...u, priority: priorityMap.get(u.id) ?? 0 }))
     .sort((a, b) => a.priority - b.priority);
 
-  return { queue: queue as Queue, operators };
+  const free = (users as User[]).filter((u) => !busyAgentIds.has(u.id));
+
+  // Presencia REAL: el softphone de escritorio mantiene un stream SSE abierto.
+  const present = byPriority(free.filter((u) => hasActiveDesktopStreamForUser(u.id)));
+
+  // Regla histórica: `users.available` basta para entrar en el reparto aunque
+  // no haya softphone conectado. Ese flag lo escribe Tauri al conectar, pero
+  // NADIE lo pone a false si la app muere, se cierra la tapa o se apaga el
+  // equipo — se queda pegado a true y la llamada suena a gente que no está.
+  const legacy = byPriority(free.filter((u) => u.available || hasActiveDesktopStreamForUser(u.id)));
+
+  const presenceOnly = isPresenceOnlyRouting();
+  const operators = presenceOnly ? present : legacy;
+
+  // Modo sombra: dejar constancia de a quién se dejaría de llamar. `present`
+  // siempre está contenido en `legacy`, así que la diferencia son exactamente
+  // los agentes marcados disponibles SIN softphone vivo.
+  if (legacy.length !== present.length) {
+    const presentIds = new Set(present.map((u) => u.id));
+    const ghosts = legacy.filter((u) => !presentIds.has(u.id)).map((u) => u.id);
+    console.log(
+      `[PRESENCE] queue=${queueId} mode=${presenceOnly ? 'presence_only' : 'shadow'}`
+      + ` legacy=${legacy.length} present=${present.length} sin_softphone=[${ghosts.join(',')}]`,
+    );
+  }
+
+  return { queue: queue as Queue, operators, presentOperators: present };
 }
 
 // --- Decisión de enrutamiento completa ---
@@ -361,6 +400,7 @@ export async function routeIncomingCall(toNumber: string): Promise<RouteDecision
           schedule,
           queue: queueData?.queue,
           operators: queueData?.operators || [],
+          presentOperators: queueData?.presentOperators || [],
         };
       }
 
@@ -376,6 +416,7 @@ export async function routeIncomingCall(toNumber: string): Promise<RouteDecision
       phoneNumber,
       queue: queueData?.queue,
       operators: queueData?.operators || [],
+      presentOperators: queueData?.presentOperators || [],
     };
   }
 

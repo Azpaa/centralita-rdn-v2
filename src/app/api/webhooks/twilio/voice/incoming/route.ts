@@ -292,6 +292,10 @@ export async function POST(req: NextRequest) {
     // --- Enrutar a cola de operadores ---
     const queue = route.queue;
     const operators = route.operators ?? [];
+    // Fase A (modo sombra): a quiénes se llamaría si el reparto fuese solo por
+    // presencia real del softphone. No se usa para decidir nada todavía; se
+    // persiste para poder medir la diferencia antes de encender el flag.
+    const presentOperators = route.presentOperators ?? [];
 
     // Actualizar estado a "en cola"
     const supabase = createAdminClient();
@@ -337,6 +341,7 @@ export async function POST(req: NextRequest) {
       await mergeRoutingMetadata({
         candidate_user_ids: [],
         current_ring_target_user_ids: [],
+        presence_shadow_user_ids: [],
         incoming_conference_request: true,
         routing_source: 'incoming_waiting_no_targets',
       });
@@ -376,6 +381,9 @@ export async function POST(req: NextRequest) {
     await mergeRoutingMetadata({
       candidate_user_ids: operators.map((operator) => operator.id),
       current_ring_target_user_ids: ringTargets.map((target) => target.id),
+      presence_shadow_user_ids: presentOperators.map((operator) => operator.id),
+      // Ola nueva: cualquier reclamación de timbre previa queda sin efecto.
+      ring_claim: null,
       conference_name: conferenceName,
       incoming_conference_request: true,
       routing_source: stickyOperator ? 'incoming_sticky_reconnect' : 'incoming_initial',

@@ -172,6 +172,9 @@ async function fireRingWave(parentCallSid: string): Promise<void> {
   await mergeTwilioData(parentCallSid, {
     candidate_user_ids: operators.map((op) => op.id),
     current_ring_target_user_ids: ringTargets.map((t) => t.id),
+    presence_shadow_user_ids: (queueData?.presentOperators ?? []).map((op) => op.id),
+    // Ola nueva: cualquier reclamación de timbre previa queda sin efecto.
+    ring_claim: null,
     conference_name: conferenceName,
     incoming_conference_request: true,
     routing_source: 'ring_wave',

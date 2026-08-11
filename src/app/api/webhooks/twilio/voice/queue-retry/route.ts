@@ -171,6 +171,7 @@ export async function POST(req: NextRequest) {
       await mergeRoutingMetadata({
         candidate_user_ids: [],
         current_ring_target_user_ids: [],
+        presence_shadow_user_ids: [],
         incoming_conference_request: true,
         routing_source: 'queue_retry_waiting_no_targets',
       });
@@ -273,6 +274,9 @@ export async function POST(req: NextRequest) {
     await mergeRoutingMetadata({
       candidate_user_ids: operators.map((operator) => operator.id),
       current_ring_target_user_ids: ringTargets.map((target) => target.id),
+      presence_shadow_user_ids: (queueData.presentOperators ?? []).map((operator) => operator.id),
+      // Ola nueva: cualquier reclamación de timbre previa queda sin efecto.
+      ring_claim: null,
       conference_name: conferenceName,
       incoming_conference_request: true,
       routing_source: preferredOperator ? 'queue_retry_lost_agent' : 'queue_retry',
