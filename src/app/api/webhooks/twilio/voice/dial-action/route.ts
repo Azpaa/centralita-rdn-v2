@@ -41,7 +41,7 @@ export async function POST(req: NextRequest) {
   const supabase = createAdminClient();
   const { data: callRecord } = await supabase
     .from('call_records')
-    .select('direction, started_at, queue_id, phone_number_id, from_number, to_number, answered_by_user_id, twilio_data')
+    .select('direction, started_at, answered_at, queue_id, phone_number_id, from_number, to_number, answered_by_user_id, twilio_data')
     .eq('twilio_call_sid', callSid)
     .single();
 
@@ -95,8 +95,28 @@ export async function POST(req: NextRequest) {
   const wasAnswered = !!answeredByUserId;
   if (dialStatus === 'completed' || (wasAnswered && dialStatus !== 'no-answer' && dialStatus !== 'busy')) {
     const endedAt = new Date();
-    // answered_at = momento en que empezó la conversación (backdated)
-    const answeredAt = new Date(endedAt.getTime() - dialDuration * 1000);
+
+    // Cálculo de answered_at/duration robusto por tipo de `<Dial>`:
+    //  - SALIENTES (`<Dial><Number>`): DialCallDuration ES la conversación real
+    //    → backdate answered_at desde ella (comportamiento histórico intacto).
+    //  - ENTRANTES (`<Dial><Conference>`): Twilio reporta DialCallDuration=0,
+    //    así que el cálculo antiguo machacaba answered_at=ended_at y guardaba
+    //    duration=0 en TODAS las entrantes (bug del "tiempo se reinicia").
+    //    Conservamos el answered_at real (fijado al entrar el agente en la
+    //    sala) y derivamos la duración de answered_at → ended_at.
+    const existingAnsweredAt = record?.answered_at ? new Date(record.answered_at) : null;
+    let answeredAt: Date;
+    let duration: number;
+    if (dialDuration > 0) {
+      answeredAt = new Date(endedAt.getTime() - dialDuration * 1000);
+      duration = dialDuration;
+    } else if (existingAnsweredAt && !Number.isNaN(existingAnsweredAt.getTime())) {
+      answeredAt = existingAnsweredAt;
+      duration = Math.max(0, Math.round((endedAt.getTime() - existingAnsweredAt.getTime()) / 1000));
+    } else {
+      answeredAt = endedAt;
+      duration = 0;
+    }
 
     // wait_time = tiempo desde que empezó la llamada hasta que se contestó
     let waitTime: number | undefined;
@@ -109,7 +129,7 @@ export async function POST(req: NextRequest) {
       status: 'completed',
       answeredAt: answeredAt.toISOString(),
       endedAt: endedAt.toISOString(),
-      duration: dialDuration, // Duración REAL de conversación
+      duration, // salientes: DialCallDuration; entrantes: answered_at→ended_at
       waitTime,
       terminalSource: 'dial_action_completed',
     });
@@ -123,7 +143,7 @@ export async function POST(req: NextRequest) {
       to: toNumber,
       queue_id: queueId ?? null,
       answered_by_user_id: answeredByUserId,
-      duration: dialDuration,
+      duration,
       wait_time: waitTime ?? null,
       answered_at: answeredAt.toISOString(),
       ended_at: endedAt.toISOString(),
