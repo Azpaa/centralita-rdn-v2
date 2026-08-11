@@ -23,6 +23,28 @@ function isUuid(value: unknown): value is string {
   );
 }
 
+function readUuidArray(source: Record<string, unknown>, key: string): string[] {
+  const raw = source[key];
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(isUuid);
+}
+
+/**
+ * Corte inmediato del tono al resto de agentes del timbrado (Fase D).
+ *
+ * Sin esto, los demás dejan de sonar cuando Twilio nos devuelve la llamada
+ * por el webhook `client` y este emite `call.answered`: medido en producción,
+ * 0,87 s de mediana desde que entra el /accept. Aquí lo hacemos en cuanto
+ * sabemos que alguien la está cogiendo.
+ *
+ * Kill switch: `RING_CLAIM_FAST_STOP=0` vuelve al comportamiento anterior sin
+ * desplegar nada.
+ */
+function isFastRingStopEnabled(): boolean {
+  const raw = process.env.RING_CLAIM_FAST_STOP?.trim().toLowerCase();
+  return raw !== '0' && raw !== 'false';
+}
+
 async function resolveTargetUserIds(params: {
   callSid: string;
   requestedUserId?: string;
@@ -257,10 +279,77 @@ export async function POST(
     accept_last_requested_via: auth.authMethod,
   };
 
+  // --- Reclamación del timbrado (Fase D) ---
+  //
+  // Reducimos los destinos del timbre al agente que está cogiendo ANTES de
+  // publicar nada. Es lo que impide que el snapshot resucite la llamada en
+  // los demás: `buildAgentSnapshot` selecciona por
+  // `twilio_data.current_ring_target_user_ids`, y Tauri refresca el snapshot
+  // justo después de cada evento. Si solo apagásemos el tono por evento, el
+  // refresco lo volvería a encender.
+  //
+  // La lista completa se conserva en `ring_claim.previous_targets` para que
+  // el `call.answered` del webhook `client` siga avisando a la misma
+  // audiencia de siempre (y con ella RDN).
+  const claimingUserId = executorUserId ?? targetUserIds[0] ?? null;
+  const previousRingTargets = readUuidArray(twilioData, 'current_ring_target_user_ids');
+  const ringTargetsToSilence = claimingUserId
+    ? previousRingTargets.filter((id) => id !== claimingUserId)
+    : [];
+  const shouldClaimRing = isFastRingStopEnabled()
+    && Boolean(claimingUserId)
+    && ringTargetsToSilence.length > 0
+    // Solo reclamamos si vemos un cliente escuchando por el agente que coge.
+    // Si no hay ninguno, la aceptación no la va a ejecutar nadie y callar a
+    // los demás dejaría la llamada sin timbre hasta la siguiente ola. En
+    // multi-worker esta condición sería falsa a menudo y el corte rápido
+    // simplemente no se aplicaría — degradar al comportamiento anterior es
+    // exactamente el lado seguro.
+    && preferredExecutor !== null;
+
+  if (shouldClaimRing && claimingUserId) {
+    mergedAcceptTrace.current_ring_target_user_ids = [claimingUserId];
+    mergedAcceptTrace.ring_claim = {
+      by: claimingUserId,
+      at: requestedAt,
+      command_id: commandId,
+      previous_targets: previousRingTargets,
+    };
+  }
+
   await supabase
     .from('call_records')
     .update({ twilio_data: mergedAcceptTrace })
     .eq('twilio_call_sid', callSid);
+
+  // Aviso "ya la coge otro" al resto. Va por el canal canónico SSE, NO por
+  // `emitEvent`: no debe tocar `domain_events` ni el webhook de RDN, porque
+  // en este punto la aceptación aún puede fallar y marcar la llamada como
+  // atendida sería mentira. Se emite con `type: 'call_answered'` a propósito
+  // — es el evento que los Tauri ya instalados saben interpretar para callar
+  // el tono y soltar la llamada, así que no hace falta actualizar el cliente.
+  if (shouldClaimRing && claimingUserId) {
+    await publishCanonicalClientEvent({
+      id: crypto.randomUUID(),
+      type: 'call_answered',
+      timestamp: requestedAt,
+      call_sid: callSid,
+      agent_user_id: claimingUserId,
+      target_user_ids: ringTargetsToSilence,
+      status: 'in_progress',
+      payload: {
+        call_sid: callSid,
+        status: 'in_progress',
+        reason: 'ring_claimed',
+        provisional: true,
+        claimed_by_user_id: claimingUserId,
+        command_id: commandId,
+      },
+    });
+    console.log(
+      `[ACCEPT] ${callSid}: timbre reclamado por ${claimingUserId} — silenciados [${ringTargetsToSilence.join(',')}]`,
+    );
+  }
 
   await publishCanonicalClientEvent({
     id: commandId,

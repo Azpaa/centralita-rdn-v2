@@ -159,6 +159,23 @@ export async function POST(req: NextRequest) {
       // Guardar el SID de la leg del agente en twilio_data para lookups inversos
       // (transfer, hangup, etc. reciben el agentCallSid y necesitan encontrar el original)
       const supabase = createAdminClient();
+      // Misma regla que en el webhook `client`: si /accept reclamó el timbre
+      // (Fase D), la lista viva ya solo tiene al que cogía, así que la
+      // audiencia real del `call.answered` está en `ring_claim`.
+      const resolveRingTargets = (data: Record<string, unknown>): string[] => {
+        const asStringArray = (value: unknown): string[] => (
+          Array.isArray(value)
+            ? value.filter((id): id is string => typeof id === 'string')
+            : []
+        );
+        const claim = (
+          data.ring_claim && typeof data.ring_claim === 'object' && !Array.isArray(data.ring_claim)
+        ) ? (data.ring_claim as Record<string, unknown>) : {};
+        return [...new Set([
+          ...asStringArray(data.current_ring_target_user_ids),
+          ...asStringArray(claim.previous_targets),
+        ])];
+      };
       let ringTargetIds: string[] = [];
       let parentTwilioData: Record<string, unknown> = {};
       if (agentCallSid) {
@@ -173,14 +190,13 @@ export async function POST(req: NextRequest) {
           && !Array.isArray(existing.twilio_data)
         ) ? (existing.twilio_data as Record<string, unknown>) : {};
 
-        ringTargetIds = Array.isArray(parentTwilioData.current_ring_target_user_ids)
-          ? (parentTwilioData.current_ring_target_user_ids as string[]).filter((id): id is string => typeof id === 'string')
-          : [];
+        ringTargetIds = resolveRingTargets(parentTwilioData);
 
         const merged = {
           ...parentTwilioData,
           agent_call_sid: agentCallSid,
           current_ring_target_user_ids: [],
+          ring_claim: null,
           ring_answered_by_user_id: operatorId,
           ring_answered_at: new Date().toISOString(),
         };
@@ -200,14 +216,13 @@ export async function POST(req: NextRequest) {
           && typeof existing.twilio_data === 'object'
           && !Array.isArray(existing.twilio_data)
         ) ? (existing.twilio_data as Record<string, unknown>) : {};
-        ringTargetIds = Array.isArray(parentTwilioData.current_ring_target_user_ids)
-          ? (parentTwilioData.current_ring_target_user_ids as string[]).filter((id): id is string => typeof id === 'string')
-          : [];
+        ringTargetIds = resolveRingTargets(parentTwilioData);
 
         if (ringTargetIds.length > 0) {
           const merged = {
             ...parentTwilioData,
             current_ring_target_user_ids: [],
+            ring_claim: null,
             ring_answered_by_user_id: operatorId,
             ring_answered_at: new Date().toISOString(),
           };

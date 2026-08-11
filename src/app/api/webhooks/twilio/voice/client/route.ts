@@ -230,6 +230,16 @@ export async function POST(req: NextRequest) {
             answeredByUserId: operatorId,
           });
 
+          // El rdn_user_id solo hace falta para el payload del evento y no
+          // depende de nada de lo que viene debajo: lanzamos la consulta ya
+          // para que corra en paralelo con la lectura/limpieza de twilio_data
+          // en vez de sumar otra ida y vuelta antes de avisar a los clientes.
+          const userPromise = supabase
+            .from('users')
+            .select('id, rdn_user_id')
+            .eq('id', operatorId)
+            .single();
+
           const { data: parentRecord } = await supabase
             .from('call_records')
             .select('twilio_data')
@@ -242,9 +252,25 @@ export async function POST(req: NextRequest) {
             && !Array.isArray(parentRecord.twilio_data)
           ) ? (parentRecord.twilio_data as Record<string, unknown>) : {};
 
-          const ringTargetIds = Array.isArray(parentTwilioData.current_ring_target_user_ids)
-            ? (parentTwilioData.current_ring_target_user_ids as string[]).filter((id): id is string => typeof id === 'string')
-            : [];
+          // Audiencia del `call.answered`: los destinos del timbrado. Cuando
+          // /accept reclamó el timbre (Fase D) la lista viva ya se redujo al
+          // agente que cogía, así que recuperamos la original de `ring_claim`
+          // para que el evento —y con él RDN— siga llegando a los mismos que
+          // antes. Sin esto, los que ya silenciamos no recibirían el cierre.
+          const asStringArray = (value: unknown): string[] => (
+            Array.isArray(value)
+              ? value.filter((id): id is string => typeof id === 'string')
+              : []
+          );
+          const ringClaim = (
+            parentTwilioData.ring_claim
+            && typeof parentTwilioData.ring_claim === 'object'
+            && !Array.isArray(parentTwilioData.ring_claim)
+          ) ? (parentTwilioData.ring_claim as Record<string, unknown>) : {};
+          const ringTargetIds = [...new Set([
+            ...asStringArray(parentTwilioData.current_ring_target_user_ids),
+            ...asStringArray(ringClaim.previous_targets),
+          ])];
 
           if (ringTargetIds.length > 0) {
             await supabase
@@ -253,6 +279,9 @@ export async function POST(req: NextRequest) {
                 twilio_data: {
                   ...parentTwilioData,
                   current_ring_target_user_ids: [],
+                  // La reclamación ya cumplió su función: limpiarla para que
+                  // una ola de timbrado posterior no herede destinos viejos.
+                  ring_claim: null,
                   ring_answered_by_user_id: operatorId,
                   ring_answered_at: new Date().toISOString(),
                 },
@@ -260,12 +289,7 @@ export async function POST(req: NextRequest) {
               .eq('twilio_call_sid', parentCallSid);
           }
 
-          const { data: userData } = await supabase
-            .from('users')
-            .select('id, rdn_user_id')
-            .eq('id', operatorId)
-            .single();
-
+          const { data: userData } = await userPromise;
           const user = userData as Pick<User, 'id' | 'rdn_user_id'> | null;
 
           emitEvent('call.answered', {
