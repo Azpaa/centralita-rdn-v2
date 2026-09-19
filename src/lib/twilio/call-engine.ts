@@ -298,6 +298,29 @@ export async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<stri
     }
   }
 
+  // Transferencias "a ciegas": el agente que transfería ya colgó, así que la
+  // fila queda con answered_by_user_id=null y la consulta de arriba no la ve,
+  // pero al compañero le sigue sonando y tiene que seguir reservado.
+  let blindTransfersQuery = supabase
+    .from('call_records')
+    .select('twilio_data')
+    .eq('status', 'in_progress')
+    .is('answered_by_user_id', null)
+    .is('ended_at', null)
+    .gte('started_at', fourHoursAgo)
+    .filter('twilio_data->transfer->>state', 'in', '(ringing,joining)');
+  if (excludeCallSid) {
+    blindTransfersQuery = blindTransfersQuery.neq('twilio_call_sid', excludeCallSid);
+  }
+  const { data: blindTransfers } = await blindTransfersQuery;
+  for (const row of (blindTransfers ?? []) as Array<{ twilio_data: Record<string, unknown> | null }>) {
+    const transfer = row.twilio_data?.transfer;
+    if (transfer && typeof transfer === 'object' && !Array.isArray(transfer)) {
+      const toUserId = (transfer as Record<string, unknown>).to_user_id;
+      if (typeof toUserId === 'string' && toUserId) busyIds.add(toUserId);
+    }
+  }
+
   return busyIds;
 }
 

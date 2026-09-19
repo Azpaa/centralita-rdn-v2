@@ -6,7 +6,39 @@ import { requireCallControlPermission } from '@/lib/calls/ownership';
 import { auditLog } from '@/lib/api/audit';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { leaveTransferAsSource, rejectTransferByTarget } from '@/lib/calls/transfer';
+import {
+  leaveTransferAsSource,
+  rejectTransferByTarget,
+  shouldIgnoreHangupAfterTransfer,
+} from '@/lib/calls/transfer';
+import type { AuthResult } from '@/lib/api/auth';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Usuario de la centralita que cuelga. Con sesión, el autenticado (el body no
+ * puede suplantarlo). Con API key (RDN), el `user_id` o `rdn_user_id` que
+ * mande en el body — la misma confianza que ya da /accept a esa integración.
+ */
+async function resolveRequesterUserId(
+  auth: AuthResult,
+  body: { user_id?: unknown; rdn_user_id?: unknown },
+): Promise<string | null> {
+  if (auth.authMethod !== 'api_key') return auth.userId ?? null;
+
+  const userId = typeof body.user_id === 'string' ? body.user_id.trim() : '';
+  if (UUID_RE.test(userId)) return userId;
+
+  const rdnUserId = typeof body.rdn_user_id === 'string' ? body.rdn_user_id.trim() : '';
+  if (!rdnUserId) return null;
+  const { data } = await createAdminClient()
+    .from('users')
+    .select('id')
+    .eq('rdn_user_id', rdnUserId)
+    .is('deleted_at', null)
+    .maybeSingle();
+  return (data as { id: string } | null)?.id ?? null;
+}
 
 /**
  * POST /api/v1/calls/:id/hangup
@@ -33,17 +65,35 @@ export async function POST(
   const { id: callSid } = await params;
   if (!callSid) return apiBadRequest('callSid es requerido');
 
-  // Transferencia entre agentes: si quien cuelga es el compañero destino y aún
-  // no se ha completado, "Colgar" es "rechazo la transferencia" — el cliente
-  // vuelve con el agente original y la llamada NO se corta, venga el target
-  // que venga. Va antes del control de permisos porque el destino todavía no
-  // es dueño de la llamada; la autorización queda acotada a rechazar SU
-  // transferencia (lib/calls/transfer.ts).
-  if (auth.userId) {
+  let body: { target?: unknown; user_id?: unknown; rdn_user_id?: unknown } = {};
+  try {
+    const parsed: unknown = await req.json();
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as typeof body;
+  } catch {
+    // Body vacío es OK → target = 'all'
+  }
+
+  const target = typeof body.target === 'string' && body.target ? body.target : 'all';
+
+  // Quién cuelga. Con sesión, el agente autenticado. Con API key (RDN), la
+  // identidad que mande en el body, igual que en /accept: sin ella, durante
+  // una transferencia no se puede distinguir al agente que transfirió del
+  // compañero que la recibió.
+  const requesterUserId = await resolveRequesterUserId(auth, body);
+
+  // Transferencia entre agentes (lib/calls/transfer.ts). Durante una
+  // transferencia ningún colgado debe cortar al cliente por error:
+  //
+  // 1. El compañero destino cuelga antes de completarse = RECHAZO. El cliente
+  //    vuelve con el agente original y la llamada no se corta. Va antes del
+  //    control de permisos porque el destino todavía no es dueño de la
+  //    llamada; la autorización queda acotada a rechazar SU transferencia.
+  if (requesterUserId) {
     try {
-      if (await rejectTransferByTarget(callSid, auth.userId)) {
+      if (await rejectTransferByTarget(callSid, requesterUserId)) {
         void auditLog('call.hangup', 'call_record', callSid, auth.userId, {
           call_sid: callSid,
+          requester_user_id: requesterUserId,
           transfer_rejected: true,
           auth_method: auth.authMethod,
         });
@@ -57,34 +107,47 @@ export async function POST(
   const permissionCheck = await requireCallControlPermission(auth, callSid);
   if (permissionCheck !== true) return permissionCheck;
 
-  let body: { target?: string } = {};
-  try {
-    body = await req.json();
-  } catch {
-    // Body vacío es OK → target = 'all'
-  }
+  if (target === 'all' || target === 'agent' || target === 'remote') {
+    // 2. Transferencia pendiente y cuelga el lado del agente que transfiere
+    //    (su Tauri o RDN mandan 'all'): sale SOLO ese agente y la
+    //    transferencia sigue — es lo que hace quien transfiere y cuelga por
+    //    costumbre. 'remote' es una orden explícita de colgar al cliente y
+    //    no entra aquí.
+    if (target !== 'remote') {
+      try {
+        if (await leaveTransferAsSource(callSid, requesterUserId)) {
+          void auditLog('call.hangup', 'call_record', callSid, auth.userId, {
+            call_sid: callSid,
+            requester_user_id: requesterUserId,
+            target,
+            transfer_continues: true,
+            auth_method: auth.authMethod,
+          });
+          return apiSuccess({ hungup: true, transfer_continues: true, callSid });
+        }
+      } catch (err) {
+        console.error(`[HANGUP] Salida del agente de una transferencia falló para ${callSid}:`, err);
+      }
+    }
 
-  const target = body.target || 'all';
-
-  // Transferencia pendiente: colgar desde el lado del agente que transfiere
-  // (su Tauri manda 'all'; RDN, con API key, también) saca SOLO a ese agente.
-  // La transferencia sigue y el cliente nunca se corta: es lo que hace quien
-  // transfiere y cuelga por costumbre. 'self' es el rechazo local de una
-  // llamada ajena y 'remote' una orden explícita de colgar al cliente; esos
-  // siguen su curso.
-  if (target === 'all' || target === 'agent') {
+    // 3. Transferencia RECIÉN completada: el aviso del agente que transfirió
+    //    tarda unos segundos en desaparecer de RDN, y su Tauri puede cruzarse
+    //    con la finalización. Solo el nuevo dueño puede colgar en esa
+    //    ventana; cualquier otro colgado colgaría al cliente, que ya habla
+    //    con el compañero.
     try {
-      if (await leaveTransferAsSource(callSid, auth.userId ?? null)) {
+      if (await shouldIgnoreHangupAfterTransfer(callSid, requesterUserId)) {
         void auditLog('call.hangup', 'call_record', callSid, auth.userId, {
           call_sid: callSid,
+          requester_user_id: requesterUserId,
           target,
-          transfer_continues: true,
+          ignored: 'transfer_just_completed',
           auth_method: auth.authMethod,
         });
-        return apiSuccess({ hungup: true, transfer_continues: true, callSid });
+        return apiSuccess({ hungup: false, ignored: 'transfer_completed', callSid });
       }
     } catch (err) {
-      console.error(`[HANGUP] Salida del agente de una transferencia falló para ${callSid}:`, err);
+      console.error(`[HANGUP] Comprobación post-transferencia falló para ${callSid}:`, err);
     }
   }
 
