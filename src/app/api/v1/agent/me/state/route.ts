@@ -3,6 +3,7 @@ import { authenticate, isAuthenticated } from '@/lib/api/auth';
 import { apiBadRequest, apiForbidden, apiNotFound, apiSuccess } from '@/lib/api/response';
 import { resolveAgentRuntimeSnapshot } from '@/lib/calls/agent-state';
 import { triggerReconcileOutboxDrainInBackground } from '@/lib/events/reconcile-outbox';
+import { sweepStaleTransfers } from '@/lib/calls/transfer';
 
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -43,6 +44,13 @@ export async function GET(req: NextRequest) {
   // healed while the client was napping gets its terminal event fan out to
   // webhooks / SSE without needing a separate poller.
   triggerReconcileOutboxDrainInBackground('agent_state_poll');
+
+  // Mismo aprovechamiento para las transferencias entre agentes: si el
+  // proceso se reinició a mitad de una, su timer en memoria se perdió y el
+  // cliente seguiría en espera. El agente que transfería tiene su Tauri
+  // abierto por definición, así que este sondeo llega en ≤45 s. Debounce
+  // interno de 20 s.
+  void sweepStaleTransfers().catch(() => {});
 
   const snapshot = await resolveAgentRuntimeSnapshot(targetUserId);
   if (!snapshot) return apiNotFound('Agente');

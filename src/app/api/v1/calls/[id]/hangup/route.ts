@@ -6,6 +6,7 @@ import { requireCallControlPermission } from '@/lib/calls/ownership';
 import { auditLog } from '@/lib/api/audit';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
+import { leaveTransferAsSource, rejectTransferByTarget } from '@/lib/calls/transfer';
 
 /**
  * POST /api/v1/calls/:id/hangup
@@ -32,6 +33,27 @@ export async function POST(
   const { id: callSid } = await params;
   if (!callSid) return apiBadRequest('callSid es requerido');
 
+  // Transferencia entre agentes: si quien cuelga es el compañero destino y aún
+  // no se ha completado, "Colgar" es "rechazo la transferencia" — el cliente
+  // vuelve con el agente original y la llamada NO se corta, venga el target
+  // que venga. Va antes del control de permisos porque el destino todavía no
+  // es dueño de la llamada; la autorización queda acotada a rechazar SU
+  // transferencia (lib/calls/transfer.ts).
+  if (auth.userId) {
+    try {
+      if (await rejectTransferByTarget(callSid, auth.userId)) {
+        void auditLog('call.hangup', 'call_record', callSid, auth.userId, {
+          call_sid: callSid,
+          transfer_rejected: true,
+          auth_method: auth.authMethod,
+        });
+        return apiSuccess({ hungup: false, transfer_rejected: true, callSid });
+      }
+    } catch (err) {
+      console.error(`[HANGUP] Rechazo de transferencia falló para ${callSid}:`, err);
+    }
+  }
+
   const permissionCheck = await requireCallControlPermission(auth, callSid);
   if (permissionCheck !== true) return permissionCheck;
 
@@ -43,6 +65,28 @@ export async function POST(
   }
 
   const target = body.target || 'all';
+
+  // Transferencia pendiente: colgar desde el lado del agente que transfiere
+  // (su Tauri manda 'all'; RDN, con API key, también) saca SOLO a ese agente.
+  // La transferencia sigue y el cliente nunca se corta: es lo que hace quien
+  // transfiere y cuelga por costumbre. 'self' es el rechazo local de una
+  // llamada ajena y 'remote' una orden explícita de colgar al cliente; esos
+  // siguen su curso.
+  if (target === 'all' || target === 'agent') {
+    try {
+      if (await leaveTransferAsSource(callSid, auth.userId ?? null)) {
+        void auditLog('call.hangup', 'call_record', callSid, auth.userId, {
+          call_sid: callSid,
+          target,
+          transfer_continues: true,
+          auth_method: auth.authMethod,
+        });
+        return apiSuccess({ hungup: true, transfer_continues: true, callSid });
+      }
+    } catch (err) {
+      console.error(`[HANGUP] Salida del agente de una transferencia falló para ${callSid}:`, err);
+    }
+  }
 
   try {
     const client = getTwilioClient();

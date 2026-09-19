@@ -123,7 +123,7 @@ export async function getScheduleWithSlots(scheduleId: string): Promise<(Schedul
 
 // --- Obtener IDs de agentes que están en llamada activa ---
 
-async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
+export async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
   const supabase = createAdminClient();
   const twilioClient = getTwilioClient();
   const nowMs = Date.now();
@@ -283,6 +283,17 @@ async function getBusyAgentIds(excludeCallSid?: string): Promise<Set<string>> {
       const resolvedId = call.twilio_data.resolved_agent_id;
       if (typeof resolvedId === 'string' && resolvedId.length > 0) {
         busyIds.add(resolvedId);
+      }
+
+      // Transferencia entre agentes pendiente (lib/calls/transfer.ts): el
+      // compañero al que le suena queda reservado, para que la cola no le
+      // mande otra entrante encima — Tauri no distingue las dos filas.
+      const transfer = call.twilio_data.transfer;
+      if (transfer && typeof transfer === 'object' && !Array.isArray(transfer)) {
+        const { state, to_user_id: toUserId } = transfer as Record<string, unknown>;
+        if ((state === 'ringing' || state === 'joining') && typeof toUserId === 'string' && toUserId) {
+          busyIds.add(toUserId);
+        }
       }
     }
   }

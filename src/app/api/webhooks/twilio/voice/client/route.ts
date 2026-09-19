@@ -4,6 +4,7 @@ import { validateAndParseTwilioWebhook, twimlResponse } from '@/lib/api/twilio-a
 import { createCallRecord, updateCallStatus } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { emitEvent } from '@/lib/events/emitter';
+import { claimTransferJoin } from '@/lib/calls/transfer';
 import type { User, PhoneNumber } from '@/lib/types/database';
 
 /**
@@ -129,7 +130,26 @@ export async function POST(req: NextRequest) {
       // mata la sala entera.
       const guardRecordSid = parentCallSid
         || (conferenceRoom.startsWith('call-') ? conferenceRoom.slice('call-'.length) : '');
-      if (guardRecordSid) {
+
+      // Transferencia entre agentes (lib/calls/transfer.ts): si esta leg es
+      // el compañero destino, el guard de abajo lo rechazaría porque el agente
+      // original sigue en la sala — que es justo lo que queremos, para que el
+      // cliente no se quede solo si el compañero falla. Se le deja entrar sin
+      // tocar la propiedad: esa pasa al confirmar que está dentro.
+      let isTransferJoin = false;
+      if (guardRecordSid && operatorId && callSid) {
+        try {
+          isTransferJoin = await claimTransferJoin({
+            parentCallSid: guardRecordSid,
+            operatorId,
+            legSid: callSid,
+          });
+        } catch (claimErr) {
+          console.warn('[CLIENT-VOICE] claimTransferJoin falló (se trata como join normal):', claimErr);
+        }
+      }
+
+      if (guardRecordSid && !isTransferJoin) {
         try {
           const { data: guardRecord } = await supabase
             .from('call_records')
@@ -222,7 +242,7 @@ export async function POST(req: NextRequest) {
       }
 
       // Update call record if we have the parent call SID
-      if (parentCallSid && operatorId) {
+      if (parentCallSid && operatorId && !isTransferJoin) {
         try {
           await updateCallStatus(parentCallSid, {
             status: 'in_progress',
@@ -308,7 +328,7 @@ export async function POST(req: NextRequest) {
 
       // Guardar el SID de la leg del agente en twilio_data (igual que agent-connect)
       const parentCallSidForRecord = conferenceRoom.replace('call-', '');
-      if (parentCallSidForRecord && callSid) {
+      if (parentCallSidForRecord && callSid && !isTransferJoin) {
         const { data: existing } = await supabase
           .from('call_records')
           .select('twilio_data')

@@ -7,6 +7,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { requireCallControlPermission } from '@/lib/calls/ownership';
 import { publishCanonicalClientEvent } from '@/lib/events/client-stream';
 import { auditLog } from '@/lib/api/audit';
+import { isTransferActive, readTransfer } from '@/lib/calls/transfer';
 
 const confirmSchema = z.object({
   command_id: z.string().trim().min(1).optional(),
@@ -85,6 +86,18 @@ export async function POST(
   const previouslyConfirmedAt = typeof previousData.accept_confirmed_at === 'string'
     ? previousData.accept_confirmed_at
     : null;
+
+  // Durante una transferencia entre agentes la propiedad la gestiona
+  // lib/calls/transfer.ts con escrituras condicionales; esta reescritura de
+  // twilio_data con una lectura previa podría devolver la transferencia a un
+  // estado anterior. El confirm del compañero no aporta nada que perder.
+  if (isTransferActive(readTransfer(previousData))) {
+    return apiSuccess({
+      confirmed: true,
+      call_sid: callSid,
+      transfer_in_progress: true,
+    });
+  }
 
   if (previouslyConfirmedAt) {
     // Idempotencia: ya confirmado. No reescribimos timestamps para no falsear

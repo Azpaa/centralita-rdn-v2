@@ -391,11 +391,43 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
     .order('started_at', { ascending: false })
     .limit(25);
 
+  // Transferencia entre agentes en curso HACIA este usuario
+  // (lib/calls/transfer.ts). La llamada sigue in_progress a nombre del agente
+  // que transfiere, así que ninguna consulta de arriba la devuelve, y sin
+  // esto el Tauri del destino la purgaría a los 15 s (RINGING_PRESERVATION_MS)
+  // aunque siguiera sonando.
+  const transferTargetCallsQuery = await supabase
+    .from('call_records')
+    .select('id, twilio_call_sid, direction, status, from_number, to_number, started_at, answered_by_user_id, twilio_data, queue_id, last_webhook_at, last_verified_at')
+    .eq('status', 'in_progress')
+    .is('ended_at', null)
+    .filter('twilio_data->transfer->>to_user_id', 'eq', userId)
+    .filter('twilio_data->transfer->>state', 'in', '(ringing,joining)')
+    .order('started_at', { ascending: false })
+    .limit(5);
+
+  // Mientras timbra se le presenta como 'ringing' (Tauri solo suena y ofrece
+  // Aceptar en esa fase); en cuanto acepta ('joining') vuelve a in_progress.
+  const transferRingingIds = new Set(
+    ((transferTargetCallsQuery.data || []) as MinimalCallRecordRow[])
+      .filter((row) => {
+        const transfer = row.twilio_data?.transfer;
+        return Boolean(
+          transfer
+          && typeof transfer === 'object'
+          && !Array.isArray(transfer)
+          && (transfer as Record<string, unknown>).state === 'ringing',
+        );
+      })
+      .map((row) => row.id),
+  );
+
   const rows = [
     ...(answeredCallsQuery.data || []),
     ...(resolvedAgentCallsQuery.data || []),
     ...(initiatedCallsQuery.data || []),
     ...(targetedPendingCallsQuery.data || []),
+    ...(transferTargetCallsQuery.data || []),
   ] as MinimalCallRecordRow[];
 
   const byId = new Map<string, MinimalCallRecordRow>();
@@ -408,7 +440,13 @@ export async function resolveAgentRuntimeSnapshot(userId: string): Promise<Agent
   const activeCalls = reconciledRows
     .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime())
     .slice(0, 25)
-    .map(mapCallRecord);
+    .map(mapCallRecord)
+    .map((call) => (
+      // Solo si la reconciliación no la ha dado por terminada entretanto.
+      transferRingingIds.has(call.call_record_id) && call.status === 'in_progress'
+        ? { ...call, status: 'ringing' as CallRecord['status'] }
+        : call
+    ));
 
   const hasInProgress = activeCalls.some((call) => call.status === 'in_progress');
   const hasRinging = activeCalls.some((call) => call.status === 'ringing' || call.status === 'in_queue');

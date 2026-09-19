@@ -7,6 +7,7 @@ import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { emitEvent } from '@/lib/events/emitter';
 import { drainReconcileOutbox } from '@/lib/events/reconcile-outbox';
 import { sweepRoomWatchdog } from '@/lib/calls/room-watchdog';
+import { sweepStaleTransfers } from '@/lib/calls/transfer';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -94,6 +95,12 @@ export async function POST(req: NextRequest) {
   const watchdogChecked = await sweepRoomWatchdog({ force: true }).catch((err) => {
     console.warn('[RECONCILE] sweepRoomWatchdog falló:', err);
     return 0;
+  });
+
+  // Mismo backstop para transferencias entre agentes: sin su timer, un
+  // cliente puesto en espera para transferir no volvería con nadie.
+  await sweepStaleTransfers({ force: true }).catch((err) => {
+    console.warn('[RECONCILE] sweepStaleTransfers falló:', err);
   });
 
   if (allStuck.length === 0) {

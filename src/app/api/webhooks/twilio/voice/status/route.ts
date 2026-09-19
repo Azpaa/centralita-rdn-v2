@@ -12,6 +12,12 @@ import {
   sweepRoomWatchdog,
 } from '@/lib/calls/room-watchdog';
 import { scheduleRingWave } from '@/lib/calls/ring-wave';
+import {
+  completeTransferOnParticipantJoin,
+  isTransferActive,
+  readTransfer,
+  sweepStaleTransfers,
+} from '@/lib/calls/transfer';
 import type { CallRecord, CallStatus } from '@/lib/types/database';
 
 // Terminal states: once dial-action sets one of these, do not overwrite.
@@ -214,6 +220,8 @@ export async function POST(req: NextRequest) {
       let parentStatus: string | null = null;
       let parentEnded = false;
       let parentHasAgentLossMarker = false;
+      let parentTransferActive = false;
+      let parentHasTransfer = false;
       if (parentFromName) {
         const { data: parentRow } = await supabase
           .from('call_records')
@@ -234,6 +242,9 @@ export async function POST(req: NextRequest) {
             : null;
           parentHasAgentLossMarker = typeof parentData.agent_left_room_at === 'string'
             && parentData.agent_left_room_at.length > 0;
+          const parentTransfer = readTransfer(parentData);
+          parentHasTransfer = parentTransfer !== null;
+          parentTransferActive = isTransferActive(parentTransfer);
 
           if (rawCallSid && agentLegSid && rawCallSid === agentLegSid) {
             isAgentLeg = true;
@@ -275,7 +286,12 @@ export async function POST(req: NextRequest) {
         // cerrar ordenadamente. (Las legs de agente ya no llevan
         // endConferenceOnExit, así que la sala sobrevive y alguien tiene
         // que ocuparse del llamante.)
-        if (isAgentLeg === true && parentFromName && rawCallSid) {
+        // Con una transferencia entre agentes pendiente, del llamante se
+        // ocupa ella (lib/calls/transfer.ts): si el compañero no llega y el
+        // agente original ya no está, re-encola. Arrancar también el
+        // room-watchdog le pondría el aviso de "reconectando" encima de la
+        // música de espera y podría re-encolarlo dos veces.
+        if (isAgentLeg === true && parentFromName && rawCallSid && !parentTransferActive) {
           void handleAgentLegLeftRoom({
             parentCallSid: parentFromName,
             agentLegSid: rawCallSid,
@@ -287,25 +303,53 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // Reincorporación: cualquier participante no-llamante que entra a la
-      // sala con un marcador de pérdida pendiente lo desactiva (el caso
-      // típico es el rejoin automático del Tauri con una leg nueva).
+      // Entrada de un participante no-llamante: (1) si es el compañero de una
+      // transferencia, la completa (lib/calls/transfer.ts); (2) si había un
+      // marcador de pérdida del room-watchdog, lo desactiva (el caso típico
+      // es el rejoin automático del Tauri con una leg nueva). EN ESTE ORDEN
+      // y en secuencia: las dos reescriben twilio_data, y la limpieza del
+      // marcador lee-y-escribe el JSON entero — lanzadas a la vez, podía
+      // devolver una transferencia ya completada al estado anterior.
       if (
         conferenceEvent === 'participant-join'
         && parentFromName
-        && parentHasAgentLossMarker
         && rawCallSid
         && rawCallSid !== parentFromName
       ) {
-        void clearAgentLossMarker(parentFromName, 'participant_join').catch(() => {});
-        console.log(
-          `[ROOM-WATCHDOG] Marcador de pérdida limpiado: ${rawCallSid} se unió a ${friendlyName ?? '-'} (parent=${parentFromName}).`
-        );
+        const joinParent = parentFromName;
+        const joinLeg = rawCallSid;
+        const clearMarker = parentHasAgentLossMarker;
+        // Solo si la llamada tiene (o tuvo) transferencia: en el resto de
+        // entradas —todas las llamadas normales— no hay nada que mirar.
+        const checkTransfer = parentHasTransfer;
+        void (async () => {
+          if (checkTransfer) {
+            try {
+              await completeTransferOnParticipantJoin({
+                parentCallSid: joinParent,
+                participantCallSid: joinLeg,
+              });
+            } catch (err) {
+              console.error('[STATUS] completeTransferOnParticipantJoin falló:', err);
+            }
+          }
+          if (clearMarker) {
+            try {
+              await clearAgentLossMarker(joinParent, 'participant_join');
+              console.log(
+                `[ROOM-WATCHDOG] Marcador de pérdida limpiado: ${joinLeg} se unió a ${friendlyName ?? '-'} (parent=${joinParent}).`
+              );
+            } catch {
+              // Best-effort, como antes.
+            }
+          }
+        })();
       }
 
       // Barrido oportunista (con debounce interno): red de seguridad para
       // timers perdidos en un reinicio del proceso.
       void sweepRoomWatchdog().catch(() => {});
+      void sweepStaleTransfers().catch(() => {});
     } catch (confErr) {
       console.warn(
         `[STATUS] Failed persisting conference event raw_call_sid=${rawCallSid || '-'}:`,

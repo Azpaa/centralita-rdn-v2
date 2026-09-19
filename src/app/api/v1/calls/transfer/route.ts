@@ -1,12 +1,17 @@
 import { NextRequest } from 'next/server';
 import twilio from 'twilio';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
-import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
+import { apiSuccess, apiBadRequest, apiError, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { emitEvent } from '@/lib/events/emitter';
 import { requireCallControlPermission } from '@/lib/calls/ownership';
 import { auditLog } from '@/lib/api/audit';
 import { createAdminClient } from '@/lib/supabase/admin';
+import {
+  TRANSFER_RING_TIMEOUT_MS,
+  isAgentTransferEnabled,
+  startAgentTransfer,
+} from '@/lib/calls/transfer';
 
 type TransferCallRecordRow = {
   twilio_call_sid: string | null;
@@ -25,30 +30,116 @@ function extractAgentCallSid(value: unknown): string | null {
   return normalizeSid((value as Record<string, unknown>).agent_call_sid);
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Destino de tipo COMPAÑERO: `destination: "client:<user_id>"` (contrato
+ * actual de RDN) o, más directo, `target_user_id` / `target_rdn_user_id` —
+ * con este último RDN no necesita su tabla centralita_user_links.
+ */
+function resolveAgentTarget(body: Record<string, unknown>): { userId?: string; rdnUserId?: string } | null {
+  // El body viene del cliente: nada de .trim() sobre algo que no sea texto
+  // (daba un 500), y un id que no es UUID se trata como destino inválido en
+  // vez de acabar en un 404 engañoso contra la columna uuid.
+  const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
+
+  const userId = text(body.target_user_id);
+  if (userId) return UUID_RE.test(userId) ? { userId } : { userId: '' };
+
+  const rdnUserId = text(body.target_rdn_user_id);
+  if (rdnUserId) return { rdnUserId };
+
+  const destination = text(body.destination);
+  if (destination.startsWith('client:')) {
+    const identity = destination.slice('client:'.length);
+    return UUID_RE.test(identity) ? { userId: identity } : { userId: '' };
+  }
+  return null;
+}
+
 /**
  * POST /api/v1/calls/transfer
- * Transferencia en frio (blind transfer).
  *
- * Body: { callSid: string, destination: string, callerId?: string }
+ * - A un NÚMERO externo: transferencia en frío — el llamante sale de la sala
+ *   hacia un `<Dial><Number>`.
+ * - A un COMPAÑERO: transferencia dentro de la sala (lib/calls/transfer.ts).
+ *   El cliente espera con música, al compañero le suena su Tauri y, si no
+ *   contesta, el cliente vuelve con quien transfería. Responde 200 con
+ *   `pending: true` en cuanto empieza a sonar; el resultado llega por eventos
+ *   (`call.answered` + `call.transferred` si se completa).
+ *
+ * Body: { callSid: string, destination?: string, callerId?: string,
+ *         target_user_id?: string, target_rdn_user_id?: string }
  */
 export async function POST(req: NextRequest) {
   const auth = await authenticate(req);
   if (!isAuthenticated(auth)) return auth;
 
-  let body: { callSid?: string; destination?: string; callerId?: string };
+  let body: Record<string, unknown>;
   try {
-    body = await req.json();
+    const parsed: unknown = await req.json();
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return apiBadRequest('Body JSON invalido');
+    }
+    body = parsed as Record<string, unknown>;
   } catch {
     return apiBadRequest('Body JSON invalido');
   }
 
-  const { callSid, destination, callerId } = body;
-  if (!callSid || !destination) {
+  const callSid = typeof body.callSid === 'string' ? body.callSid.trim() : '';
+  const destination = typeof body.destination === 'string' ? body.destination.trim() : '';
+  const callerId = typeof body.callerId === 'string' ? body.callerId : undefined;
+  const agentTarget = resolveAgentTarget(body);
+  if (!callSid || (!destination && !agentTarget)) {
     return apiBadRequest('callSid y destination son requeridos');
   }
 
   const permissionCheck = await requireCallControlPermission(auth, callSid);
   if (permissionCheck !== true) return permissionCheck;
+
+  // ── Transferencia a un compañero: siempre dentro de la sala. ────────────
+  // El camino antiguo (`<Dial><Client>`) no puede llegar a un Tauri, que no
+  // registra Device en Twilio: colgaba al cliente. No se vuelve a él ni con
+  // el flag apagado.
+  if (agentTarget) {
+    if (!isAgentTransferEnabled()) {
+      return apiError(
+        409,
+        'agent_transfer_disabled',
+        'La transferencia entre compañeros está desactivada temporalmente.',
+      );
+    }
+    try {
+      const result = await startAgentTransfer({
+        callSid,
+        target: agentTarget,
+        requestedByUserId: auth.userId ?? null,
+        authMethod: auth.authMethod,
+      });
+      if (!result.ok) {
+        return apiError(result.status, result.code, result.message);
+      }
+      return apiSuccess({
+        transferred: false,
+        pending: true,
+        mode: 'in_room',
+        transfer_id: result.transfer.id,
+        state: result.transfer.state,
+        callSid: result.transfer.caller_call_sid,
+        destination: `client:${result.target.id}`,
+        target_user_id: result.target.id,
+        target_name: result.target.name,
+        ring_timeout_seconds: Math.round(TRANSFER_RING_TIMEOUT_MS / 1000),
+      });
+    } catch (err) {
+      console.error('[TRANSFER] Error iniciando transferencia a compañero:', err);
+      return apiInternalError('Error al transferir la llamada');
+    }
+  }
+
+  if (!destination) {
+    return apiBadRequest('callSid y destination son requeridos');
+  }
 
   try {
     const client = getTwilioClient();
@@ -243,11 +334,9 @@ export async function POST(req: NextRequest) {
       timeout: 30,
     });
 
-    if (destination.startsWith('client:')) {
-      dial.client(destination.replace('client:', ''));
-    } else {
-      dial.number(destination);
-    }
+    // Los destinos `client:` (compañeros) ya salieron arriba por el flujo en
+    // sala; aquí solo llegan números externos.
+    dial.number(destination);
 
     twimlBuilder.say(
       { language: 'es-ES', voice: 'Polly.Conchita' },

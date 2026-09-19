@@ -12,6 +12,7 @@ import {
   mergeTwilioData,
   normalizeSid,
 } from '@/lib/calls/leg-resolution';
+import { cancelTransferOnResume } from '@/lib/calls/transfer';
 
 type TwilioClient = ReturnType<typeof getTwilioClient>;
 
@@ -47,6 +48,15 @@ export async function POST(
 
     const { recordSid, twilioData } = await loadCallRecord(callSid);
     const recSid = recordSid ?? callSid;
+
+    // Reanudar con una transferencia entre agentes sonando = el agente recupera
+    // al cliente: se cancela (el compañero deja de sonar). Luego la reanudación
+    // sigue su curso; quitar el hold de conferencia es idempotente.
+    try {
+      await cancelTransferOnResume(recSid);
+    } catch (err) {
+      console.error(`[RESUME] No se pudo cancelar la transferencia de ${recSid}:`, err);
+    }
 
     const hold =
       twilioData.hold && typeof twilioData.hold === 'object' && !Array.isArray(twilioData.hold)

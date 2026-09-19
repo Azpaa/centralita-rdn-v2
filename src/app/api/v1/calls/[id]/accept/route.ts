@@ -10,6 +10,7 @@ import {
   publishCanonicalClientEvent,
 } from '@/lib/events/client-stream';
 import { auditLog } from '@/lib/api/audit';
+import { readTransfer } from '@/lib/calls/transfer';
 
 const acceptSchema = z.object({
   user_id: z.string().uuid().optional(),
@@ -195,7 +196,14 @@ export async function POST(
     ? twilioData.accept_confirmed_at
     : null;
 
-  if (confirmedAt) {
+  // Transferencia entre agentes: la llamada ya está confirmada por el agente
+  // que transfiere, pero al compañero destino SÍ hay que mandarle la orden de
+  // aceptar — si no, aceptar desde RDN no haría nada.
+  const activeTransfer = readTransfer(twilioData);
+  const isTransferTargetAccept = activeTransfer?.state === 'ringing'
+    && targetUserIds.includes(activeTransfer.to_user_id);
+
+  if (confirmedAt && !isTransferTargetAccept) {
     const lastCommandId = typeof twilioData.accept_last_command_id === 'string'
       ? twilioData.accept_last_command_id
       : null;

@@ -1050,16 +1050,31 @@ export function CallWidget() {
     }
 
     try {
-      await api.post('/calls/transfer', {
+      // api.post no lanza en 4xx/5xx: hay que mirar `ok`. Antes se ignoraba y
+      // se soltaba nuestra leg igualmente, aunque la transferencia hubiera
+      // fallado — el cliente se quedaba solo.
+      const res = await api.post<{ pending?: boolean }>('/calls/transfer', {
         callSid: slot.callSid,
         destination: target.destination,
         callerId: fromNumber,
       });
+      if (!res.ok) {
+        setError(res.error || 'Error al transferir la llamada');
+        return;
+      }
 
-      // El servidor ya redirigió la llamada remota y completó nuestra leg
-      // vía REST API. Desconectamos también el objeto Call del SDK para
-      // limpiar el estado local de forma inmediata (el evento 'disconnect'
-      // eliminará el slot del widget).
+      // A un compañero la transferencia queda pendiente: el cliente espera con
+      // música y NO hay que soltar nuestra leg. La centralita la termina al
+      // completarse, o nos devuelve al cliente si el compañero no contesta.
+      if (res.data?.pending) {
+        setOverlay('none');
+        return;
+      }
+
+      // A un número externo el servidor ya redirigió la llamada remota y
+      // completó nuestra leg vía REST API. Desconectamos también el objeto
+      // Call del SDK para limpiar el estado local de forma inmediata (el
+      // evento 'disconnect' eliminará el slot del widget).
       try {
         slot.call.disconnect();
       } catch {
