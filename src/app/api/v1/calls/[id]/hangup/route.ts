@@ -1,12 +1,13 @@
 import { NextRequest } from 'next/server';
 import { authenticate, isAuthenticated } from '@/lib/api/auth';
-import { apiSuccess, apiBadRequest, apiInternalError } from '@/lib/api/response';
+import { apiSuccess, apiBadRequest, apiError, apiInternalError } from '@/lib/api/response';
 import { getTwilioClient } from '@/lib/twilio/client';
 import { requireCallControlPermission } from '@/lib/calls/ownership';
 import { auditLog } from '@/lib/api/audit';
 import { updateCallStatus } from '@/lib/twilio/call-engine';
 import { createAdminClient } from '@/lib/supabase/admin';
 import {
+  hasTransferRecord,
   leaveTransferAsSource,
   rejectTransferByTarget,
   shouldIgnoreHangupAfterTransfer,
@@ -81,6 +82,22 @@ export async function POST(
   // compañero que la recibió.
   const requesterUserId = await resolveRequesterUserId(auth, body);
 
+  // ¿Esta llamada tiene algo que ver con una transferencia? Una sola lectura
+  // para las tres comprobaciones de abajo; un colgado normal no paga más.
+  // Si la lectura falla NO se sigue: dar por hecho que no hay transferencia
+  // podría cortar a un cliente en mitad de una.
+  let transferSeen: boolean;
+  try {
+    transferSeen = await hasTransferRecord(callSid);
+  } catch (err) {
+    console.error(`[HANGUP] No se pudo comprobar la transferencia de ${callSid}:`, err);
+    return apiError(
+      503,
+      'transfer_check_failed',
+      'No se pudo comprobar el estado de la llamada. Inténtalo de nuevo.',
+    );
+  }
+
   // Transferencia entre agentes (lib/calls/transfer.ts). Durante una
   // transferencia ningún colgado debe cortar al cliente por error:
   //
@@ -88,7 +105,7 @@ export async function POST(
   //    vuelve con el agente original y la llamada no se corta. Va antes del
   //    control de permisos porque el destino todavía no es dueño de la
   //    llamada; la autorización queda acotada a rechazar SU transferencia.
-  if (requesterUserId) {
+  if (requesterUserId && transferSeen) {
     try {
       if (await rejectTransferByTarget(callSid, requesterUserId)) {
         void auditLog('call.hangup', 'call_record', callSid, auth.userId, {
@@ -101,13 +118,14 @@ export async function POST(
       }
     } catch (err) {
       console.error(`[HANGUP] Rechazo de transferencia falló para ${callSid}:`, err);
+      return apiError(503, 'transfer_check_failed', 'No se pudo comprobar el estado de la llamada. Inténtalo de nuevo.');
     }
   }
 
   const permissionCheck = await requireCallControlPermission(auth, callSid);
   if (permissionCheck !== true) return permissionCheck;
 
-  if (target === 'all' || target === 'agent' || target === 'remote') {
+  if (transferSeen && (target === 'all' || target === 'agent' || target === 'remote')) {
     // 2. Transferencia pendiente y cuelga el lado del agente que transfiere
     //    (su Tauri o RDN mandan 'all'): sale SOLO ese agente y la
     //    transferencia sigue — es lo que hace quien transfiere y cuelga por
@@ -115,7 +133,8 @@ export async function POST(
     //    no entra aquí.
     if (target !== 'remote') {
       try {
-        if (await leaveTransferAsSource(callSid, requesterUserId)) {
+        const leave = await leaveTransferAsSource(callSid, requesterUserId);
+        if (leave === 'left') {
           void auditLog('call.hangup', 'call_record', callSid, auth.userId, {
             call_sid: callSid,
             requester_user_id: requesterUserId,
@@ -125,8 +144,18 @@ export async function POST(
           });
           return apiSuccess({ hungup: true, transfer_continues: true, callSid });
         }
+        if (leave === 'not_source') {
+          // Un clic viejo de alguien que ya no lleva esta llamada: no puede
+          // sacar de la sala a quien la está transfiriendo ahora.
+          return apiError(
+            409,
+            'transfer_in_progress',
+            'Hay una transferencia en curso en esta llamada y ya no es tuya.',
+          );
+        }
       } catch (err) {
         console.error(`[HANGUP] Salida del agente de una transferencia falló para ${callSid}:`, err);
+        return apiError(503, 'transfer_check_failed', 'No se pudo comprobar el estado de la llamada. Inténtalo de nuevo.');
       }
     }
 
@@ -148,6 +177,7 @@ export async function POST(
       }
     } catch (err) {
       console.error(`[HANGUP] Comprobación post-transferencia falló para ${callSid}:`, err);
+      return apiError(503, 'transfer_check_failed', 'No se pudo comprobar el estado de la llamada. Inténtalo de nuevo.');
     }
   }
 

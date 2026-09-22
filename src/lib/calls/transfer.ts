@@ -70,8 +70,12 @@ const WATCH_INTERVAL_MS = 3_000;
 const SWEEP_MIN_INTERVAL_MS = 20_000;
 const SWEEP_BATCH_LIMIT = 20;
 const UNHOLD_ATTEMPTS = 3;
-/** Comprobación de que el cliente no se ha quedado solo tras cancelar. */
-const ALONE_CHECK_DELAYS_MS = [8_000, 20_000];
+/**
+ * Comprobación de que el cliente no se ha quedado solo tras cancelar. Hacen
+ * falta dos lecturas seguidas de "solo en la sala" para actuar, así que la
+ * vuelta a la cola no llega antes de ~20 s.
+ */
+const ALONE_CHECK_DELAYS_MS = [8_000, 12_000, 15_000];
 
 export type TransferState = 'ringing' | 'joining' | 'completed' | 'cancelled';
 
@@ -355,10 +359,17 @@ async function requeueCaller(row: CallRow, transfer: AgentTransfer, reason: stri
  * Si el cliente sigue solo, se re-encola; si eso falla, se reintenta una vez
  * más. En memoria: un reinicio justo en esos segundos la pierde.
  */
-function scheduleAloneCheck(parentCallSid: string, transfer: AgentTransfer, attempt = 0): void {
+function scheduleAloneCheck(
+  parentCallSid: string,
+  transfer: AgentTransfer,
+  attempt = 0,
+  aloneReadings = 0,
+): void {
   const delay = ALONE_CHECK_DELAYS_MS[attempt];
   if (delay === undefined) {
-    console.error(`[TRANSFER] ${parentCallSid}: el cliente podría seguir solo tras cancelar; sin más reintentos.`);
+    if (aloneReadings > 0) {
+      console.error(`[TRANSFER] ${parentCallSid}: el cliente podría seguir solo tras cancelar; sin más reintentos.`);
+    }
     return;
   }
   const timer = setTimeout(() => {
@@ -367,21 +378,34 @@ function scheduleAloneCheck(parentCallSid: string, transfer: AgentTransfer, atte
       // Terminada, ya re-encolada o con otra transferencia en marcha: nada.
       if (!row || !isLive(row) || isTransferActive(readTransfer(row.twilio_data))) return;
 
+      // El room-watchdog ya se ha hecho cargo (la leg del agente se cayó y
+      // está en su gracia de 45 s para que el softphone vuelva). Re-encolar
+      // ahora le quitaría al agente la llamada que está recuperando.
+      const agentLeftAt = asRecord(row.twilio_data).agent_left_room_at;
+      if (typeof agentLeftAt === 'string' && agentLeftAt) return;
+
       let participants;
       try {
         participants = await getTwilioClient()
           .conferences(transfer.conference_sid)
           .participants.list();
       } catch {
-        scheduleAloneCheck(parentCallSid, transfer, attempt + 1);
+        scheduleAloneCheck(parentCallSid, transfer, attempt + 1, aloneReadings);
         return;
       }
       if (!participants.some((p) => p.callSid === transfer.caller_call_sid)) return;
       if (participants.some((p) => p.callSid !== transfer.caller_call_sid)) return;
 
-      console.warn(`[TRANSFER] ${parentCallSid}: el cliente está solo en la sala tras cancelar; se re-encola.`);
+      // Dos lecturas seguidas: una sola puede caer en el hueco en el que un
+      // agente está entrando en la sala o reincorporándose.
+      if (aloneReadings + 1 < 2) {
+        scheduleAloneCheck(parentCallSid, transfer, attempt + 1, aloneReadings + 1);
+        return;
+      }
+
+      console.warn(`[TRANSFER] ${parentCallSid}: el cliente sigue solo en la sala tras cancelar; se re-encola.`);
       if (!(await requeueCaller(row, transfer, 'alone_after_cancel'))) {
-        scheduleAloneCheck(parentCallSid, transfer, attempt + 1);
+        scheduleAloneCheck(parentCallSid, transfer, attempt + 1, aloneReadings + 1);
       }
     })().catch((err) => {
       console.error(`[TRANSFER] Comprobación de cliente solo en ${parentCallSid} falló:`, err);
@@ -711,7 +735,16 @@ async function finalizeTransfer(row: CallRow, transfer: AgentTransfer): Promise<
   // que otros hayan escrito entretanto.
   const fresh = await loadCall(row.twilio_call_sid);
   const freshTransfer = readTransfer(fresh?.twilio_data);
-  if (!fresh || !freshTransfer || freshTransfer.id !== transfer.id || freshTransfer.state !== 'joining') {
+  if (
+    !fresh
+    || !freshTransfer
+    || freshTransfer.id !== transfer.id
+    || freshTransfer.state !== 'joining'
+    // El compañero puede haber reintentado la entrada con otra leg mientras
+    // se quitaba la espera: completar con la vieja dejaría apuntada una leg
+    // que no lleva su audio, y el room-watchdog vigilaría la equivocada.
+    || freshTransfer.to_agent_call_sid !== transfer.to_agent_call_sid
+  ) {
     return false;
   }
 
@@ -904,19 +937,37 @@ export async function cancelAgentTransfer(
  * en conferencias), la leg del agente original o la del compañero.
  */
 async function loadCallByAnySid(callSid: string): Promise<CallRow | null> {
-  let row = await loadCall(callSid);
+  const supabase = createAdminClient();
+  // A diferencia de loadCall, aquí un fallo de lectura NO se traga: quien
+  // decide si colgar o no debe enterarse, en vez de creer que no hay
+  // transferencia y cortar a un cliente que estaba en mitad de una.
+  const direct = await supabase
+    .from('call_records')
+    .select(CALL_COLUMNS)
+    .eq('twilio_call_sid', callSid)
+    .maybeSingle();
+  if (direct.error) {
+    throw new Error(`[TRANSFER] lectura fallida de ${callSid}: ${direct.error.message}`);
+  }
+  let row = (direct.data as CallRow | null) ?? null;
+
   for (const path of [
     'twilio_data->>agent_call_sid',
     'twilio_data->transfer->>from_agent_call_sid',
     'twilio_data->transfer->>to_agent_call_sid',
   ]) {
     if (row) break;
-    const { data } = await createAdminClient()
+    const { data, error } = await supabase
       .from('call_records')
       .select(CALL_COLUMNS)
       .filter(path, 'eq', callSid)
       .eq('status', 'in_progress')
+      .order('started_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
+    if (error) {
+      throw new Error(`[TRANSFER] lectura fallida de ${callSid} por ${path}: ${error.message}`);
+    }
     row = (data as CallRow | null) ?? null;
   }
   return row;
@@ -948,11 +999,23 @@ export async function shouldIgnoreHangupAfterTransfer(
   if (!row || !isLive(row)) return false;
   const transfer = readTransfer(row.twilio_data);
   if (!transfer || transfer.state !== 'completed' || !transfer.finished_at) return false;
-  if (Date.now() - Date.parse(transfer.finished_at) > TRANSFER_HANGUP_GRACE_MS) return false;
   if (requesterUserId && requesterUserId === transfer.to_user_id) return false;
 
+  const ageMs = Date.now() - Date.parse(transfer.finished_at);
+  // Quien transfirió no cuelga una llamada que ya no es suya, por tarde que
+  // llegue su clic: su panel puede seguir enseñándosela mucho más de 15 s si
+  // falló la entrega del webhook a RDN o el compañero no tiene rdn_user_id.
+  const staleSourceHangup = Boolean(
+    requesterUserId
+    && requesterUserId === transfer.from_user_id
+    && row.answered_by_user_id !== requesterUserId,
+  );
+  // Sin identidad no se puede distinguir quién cuelga, así que se ignora solo
+  // durante la ventana en la que el panel del anterior sigue mostrándola.
+  if (!staleSourceHangup && ageMs > TRANSFER_HANGUP_GRACE_MS) return false;
+
   console.warn(
-    `[TRANSFER] ${row.twilio_call_sid}: colgado ignorado ${requesterUserId ?? 'sin identidad'} tras transferencia completada hace ${Date.now() - Date.parse(transfer.finished_at)} ms.`,
+    `[TRANSFER] ${row.twilio_call_sid}: colgado ignorado (${requesterUserId ?? 'sin identidad'}) tras transferencia completada hace ${ageMs} ms.`,
   );
   return true;
 }
@@ -983,15 +1046,22 @@ export async function rejectTransferByTarget(callSid: string, userId: string): P
  * Devuelve true si había una transferencia pendiente (y el colgado se ha
  * resuelto así); false si no la había y el colgado debe seguir su curso.
  */
-export async function leaveTransferAsSource(callSid: string, requesterUserId: string | null): Promise<boolean> {
+export async function leaveTransferAsSource(
+  callSid: string,
+  requesterUserId: string | null,
+): Promise<'left' | 'none' | 'not_source'> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const found = await loadActiveTransferRow(callSid);
-    if (!found) return false;
+    if (!found) return 'none';
     const { row, transfer } = found;
-    if (requesterUserId && requesterUserId === transfer.to_user_id) return false;
+    if (requesterUserId && requesterUserId === transfer.to_user_id) return 'none';
+    // Identificado y NO es quien transfiere: no puede sacar a nadie de esta
+    // llamada. Pasa cuando un clic viejo del agente anterior llega mientras
+    // el nuevo dueño ya está transfiriéndola a un tercero.
+    if (requesterUserId && requesterUserId !== transfer.from_user_id) return 'not_source';
     // Llamada ya terminada: el colgado normal no hace daño, y aquí se
     // borraría answered_by de un registro cerrado.
-    if (!isLive(row)) return false;
+    if (!isLive(row)) return 'none';
 
     const currentAgentLeg = asSid(asRecord(row.twilio_data).agent_call_sid);
     const now = new Date().toISOString();
@@ -1016,21 +1086,32 @@ export async function leaveTransferAsSource(callSid: string, requesterUserId: st
     console.log(
       `[TRANSFER] ${row.twilio_call_sid}: el agente ${transfer.from_user_id} colgó con la transferencia pendiente; sigue a ciegas.`,
     );
-    return true;
+    return 'left';
   }
   // Dos carreras seguidas sin poder anotar la salida: si la transferencia
   // sigue pendiente, el agente sale igualmente (sin tocar al cliente);
   // cancelAgentTransfer verá la sala sin él y re-encolará si hace falta.
   const found = await loadActiveTransferRow(callSid);
-  if (!found || !isLive(found.row) || (requesterUserId && requesterUserId === found.transfer.to_user_id)) {
-    return false;
-  }
+  if (!found || !isLive(found.row)) return 'none';
+  if (requesterUserId && requesterUserId === found.transfer.to_user_id) return 'none';
+  if (requesterUserId && requesterUserId !== found.transfer.from_user_id) return 'not_source';
   await endLeg(found.transfer.from_agent_call_sid);
   const currentAgentLeg = asSid(asRecord(found.row.twilio_data).agent_call_sid);
   if (currentAgentLeg && currentAgentLeg !== found.transfer.from_agent_call_sid) {
     await endLeg(currentAgentLeg);
   }
-  return true;
+  return 'left';
+}
+
+/**
+ * ¿Esta llamada tiene (o tuvo) una transferencia? Atajo para que un colgado
+ * normal no repita la misma lectura en las tres comprobaciones de /hangup.
+ * Lanza si la lectura falla, para que quien lo use no dé por hecho que no la
+ * hay y acabe colgando a un cliente que estaba en mitad de una.
+ */
+export async function hasTransferRecord(callSid: string): Promise<boolean> {
+  const row = await loadCallByAnySid(callSid);
+  return readTransfer(row?.twilio_data) !== null;
 }
 
 /**
